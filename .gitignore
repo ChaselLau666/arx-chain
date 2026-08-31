@@ -109,6 +109,9 @@ CMakeUserPresets.json
 realsense/install/
 log/
 build/
+custom_sdk/**/build/
+custom_sdk/**/install/
+custom_sdk/**/log/
 
 # Ignore generated docs
 *.dox

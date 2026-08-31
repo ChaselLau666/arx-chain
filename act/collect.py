@@ -23,6 +23,7 @@ import threading
 import pyttsx3
 
 import numpy as np
+from std_srvs.srv import SetBool
 
 from copy import deepcopy
 
@@ -50,6 +51,27 @@ def load_yaml(yaml_file):
         print(f"Error: Failed to parse YAML file - {e}")
 
         return None
+
+
+def lock_lift_height(node, timeout=5.0):
+    """Freeze the body controller's most recent height command before recording."""
+    client = node.create_client(SetBool, '/lift_height_lock')
+    if not client.wait_for_service(timeout_sec=timeout):
+        raise RuntimeError('/lift_height_lock service is unavailable; collection refused')
+
+    request = SetBool.Request()
+    request.data = True
+    future = client.call_async(request)
+    deadline = time.monotonic() + timeout
+    while not future.done() and rclpy.ok() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    if not future.done():
+        raise RuntimeError('Timed out while locking the preset lift height')
+    response = future.result()
+    if response is None or not response.success:
+        message = response.message if response is not None else 'no response'
+        raise RuntimeError(f'Failed to lock the preset lift height: {message}')
+    print(f'Lift height lock enabled: {response.message}')
 
 
 def voice_process(voice_engine, line):
@@ -360,6 +382,9 @@ def main(args):
     spin_thread = threading.Thread(target=_spin_loop, args=(ros_operator,), daemon=True)
     spin_thread.start()
 
+    if not args.allow_vr_height:
+        lock_lift_height(ros_operator)
+
     datasets_dir = args.datasets if sys.stdin.isatty() else Path.joinpath(ROOT, args.datasets)
 
     num_episodes = 1000 if args.episode_idx == -1 else 1
@@ -432,6 +457,8 @@ def parse_arguments(known=False):
 
     # 数据采集选项
     parser.add_argument('--key_collect', action='store_true', help='use key collect')
+    parser.add_argument('--allow_vr_height', action='store_true',
+                        help='do not lock the pre-set lift height before collection')
 
     parser.add_argument('--task', type=str, default='', help='task name')
 

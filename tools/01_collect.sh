@@ -1,6 +1,7 @@
 #!/bin/bash
 
 workspace=$(pwd)
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 shell_type=${SHELL##*/}
 shell_exec="exec $shell_type"
@@ -14,7 +15,7 @@ gnome-terminal -t "can5" -x bash -c "cd ${workspace}; cd ../../LIFT/ARX_CAN/arx_
 sleep 0.3
 
 # Body
-gnome-terminal --title="body" -x $shell_type -i -c "cd ../../LIFT/body/ROS2; source install/setup.bash; ros2 launch arx_lift_controller lift.launch.py; $shell_exec"
+gnome-terminal --title="body" -x $shell_type -i -c "cd ${repo_root}/custom_sdk/LIFT/body/ROS2; source install/setup.bash; ros2 launch arx_lift_controller lift.launch.py; $shell_exec"
 sleep 1
 
 # Lift
