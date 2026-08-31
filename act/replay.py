@@ -95,9 +95,9 @@ def init_robot(ros_operator, use_base):
     init1 = [0, 0, 0, 0, 0, 0, 0]
 
     ros_operator.follow_arm_publish_continuous(init0, init0)
-    ros_operator.robot_base_shutdown()
 
     if use_base:
+        ros_operator.robot_base_shutdown()
         input("Enter any key to continue :")
 
         ros_operator.start_base_control_thread()
@@ -107,9 +107,10 @@ def init_robot(ros_operator, use_base):
 def signal_handler(signal, frame, ros_operator):
     print('Caught Ctrl+C / SIGINT signal')
 
-    # 底盘给零
-    ros_operator.robot_base_shutdown()
-    ros_operator.base_control_thread.join()
+    if ros_operator.args.use_base:
+        ros_operator.robot_base_shutdown()
+        if ros_operator.base_control_thread is not None:
+            ros_operator.base_control_thread.join()
 
     sys.exit(0)
 

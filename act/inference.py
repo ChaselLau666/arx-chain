@@ -284,10 +284,11 @@ def init_robot(ros_operator, use_base, connected_event, start_event):
 def signal_handler(signal, frame, ros_operator):
     print('Caught Ctrl+C / SIGINT signal')
 
-    # 底盘给零
     ros_operator.base_enable = False
-    ros_operator.robot_base_shutdown()
-    ros_operator.base_control_thread.join()
+    if ros_operator.args.use_base:
+        ros_operator.robot_base_shutdown()
+        if ros_operator.base_control_thread is not None:
+            ros_operator.base_control_thread.join()
 
     sys.exit(0)
 

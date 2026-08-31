@@ -1,0 +1,5 @@
+---
+float64 current_height
+float64 commanded_height
+bool locked
+string message

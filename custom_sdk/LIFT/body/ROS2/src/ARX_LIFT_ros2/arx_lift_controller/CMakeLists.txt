@@ -13,12 +13,19 @@ find_package(arm_control REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
 find_package(tf2 REQUIRED)
+find_package(rosidl_default_generators REQUIRED)
+
+rosidl_generate_interfaces(${PROJECT_NAME}
+        "srv/LiftHeightStatus.srv"
+        "srv/SetLiftHeight.srv")
 
 link_directories(${CMAKE_CURRENT_SOURCE_DIR}/lib/arx_hardware_interface ${CMAKE_CURRENT_SOURCE_DIR}/lib/arx_lift_src)
 add_executable(lift_controller src/lift_controller.cpp)
 target_include_directories(lift_controller PUBLIC
         lib/arx_hardware_interface/include lib/arx_lift_src/include)
 ament_target_dependencies(lift_controller rclcpp arm_control sensor_msgs std_srvs tf2)
+rosidl_get_typesupport_target(cpp_typesupport_target ${PROJECT_NAME} "rosidl_typesupport_cpp")
+target_link_libraries(lift_controller ${cpp_typesupport_target})
 
 install(TARGETS
         lift_controller

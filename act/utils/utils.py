@@ -71,11 +71,15 @@ class EpisodicDataset(torch.utils.data.Dataset):
             max_action_len = original_action_shape[0]  # max_episode
             start_ts = np.random.choice(max_action_len)  # 随机抽取一个索引
 
-            states2action_step = 1
-            actions = actions[states2action_step:]  # 错开了一帧 # ,
-            last_action = actions[-1]
-            last_action = np.tile(last_action[np.newaxis, :], (states2action_step, 1))
-            actions = np.append(actions, last_action, axis=0)  # actions[-1][np.newaxis, :]
+            # Legacy files stored state(t) in /action and required a one-frame
+            # shift. HDF5 v2 already stores state(t+1), so shifting again would
+            # silently turn the label into state(t+2).
+            states2action_step = 0 if root.attrs.get('schema_version') == 'arx_hdf5_v2' else 1
+            if states2action_step:
+                actions = actions[states2action_step:]
+                last_action = actions[-1]
+                last_action = np.tile(last_action[np.newaxis, :], (states2action_step, 1))
+                actions = np.append(actions, last_action, axis=0)
 
             if self.add_action_output:
                 action_zero_addition = np.zeros(original_action_shape)

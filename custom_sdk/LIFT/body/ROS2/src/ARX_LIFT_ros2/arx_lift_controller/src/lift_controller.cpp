@@ -9,10 +9,14 @@
 #include <sensor_msgs/msg/joy.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <std_srvs/srv/set_bool.hpp>
+#include <arx_lift_controller/srv/lift_height_status.hpp>
+#include <arx_lift_controller/srv/set_lift_height.hpp>
 #include <csignal>
+#include <cmath>
 
 std::shared_ptr<LiftHeadControlLoop> control_loop;
 void signalHandler(int signum) {
+  (void)signum;
   control_loop.reset();
   rclcpp::shutdown();
 }
@@ -49,6 +53,39 @@ int main(int argc, char **argv) {
                                       std::to_string(locked_height_command)
                                 : "VR lift height unlocked";
         RCLCPP_WARN(node->get_logger(), "%s", response->message.c_str());
+      });
+  auto height_status_service = node->create_service<arx_lift_controller::srv::LiftHeightStatus>(
+      "/lift_height_status",
+      [&](const std::shared_ptr<arx_lift_controller::srv::LiftHeightStatus::Request>,
+          std::shared_ptr<arx_lift_controller::srv::LiftHeightStatus::Response> response) {
+        response->current_height = control_loop->getHeight();
+        response->commanded_height = height_locked ? locked_height_command : last_height_command;
+        response->locked = height_locked;
+        response->message = height_locked ? "height locked" : "height unlocked";
+      });
+  auto height_set_service = node->create_service<arx_lift_controller::srv::SetLiftHeight>(
+      "/lift_height_set",
+      [&](const std::shared_ptr<arx_lift_controller::srv::SetLiftHeight::Request> request,
+          std::shared_ptr<arx_lift_controller::srv::SetLiftHeight::Response> response) {
+        constexpr double kMinHeight = 0.0;
+        constexpr double kMaxHeight = 20.0;
+        response->current_height = control_loop->getHeight();
+        response->accepted_target = height_locked ? locked_height_command : last_height_command;
+        if (!std::isfinite(request->target_height) || request->target_height < kMinHeight ||
+            request->target_height > kMaxHeight) {
+          response->success = false;
+          response->message = "target must be finite and within [0, 20]";
+          return;
+        }
+        last_height_command = request->target_height;
+        if (height_locked) {
+          locked_height_command = request->target_height;
+        }
+        control_loop->setHeight(request->target_height);
+        response->success = true;
+        response->accepted_target = request->target_height;
+        response->message = "height target accepted without changing other body axes";
+        RCLCPP_WARN(node->get_logger(), "Explicit height target accepted: %.6f", request->target_height);
       });
   auto sub = node->create_subscription<arm_control::msg::PosCmd>("/ARX_VR_L", 1,
                                                                  [&](const arm_control::msg::PosCmd &msg) {

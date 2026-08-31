@@ -3,6 +3,12 @@
 This branch is the integrated working branch for the delivered LIFT2s system.
 The official `main` branch remains an unchanged comparison point.
 
+The maintained operator manual for the custom collection, training, conversion,
+and remote-inference chain is available in both editable and release forms:
+
+- `docs/ARX_LIFT2S_CUSTOM_PIPELINE.md`
+- `docs/ARX_LIFT2S_CUSTOM_PIPELINE.pdf`
+
 ## Tracked customizations
 
 - `realsense/realsense.sh` contains the verified head, left-wrist, and

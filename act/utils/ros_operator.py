@@ -183,11 +183,13 @@ class RosOperator(Node):
                 self.config['arm_config']['follow_arm_right_cmd_topic'],
                 10
             )
-            self.base_actuator_publisher = self.create_publisher(
-                self.pos_cmd,
-                self.config['robot_base_config']['robot_base_cmd_topic'],
-                10
-            )
+            self.base_actuator_publisher = None
+            if self.args.use_base:
+                self.base_actuator_publisher = self.create_publisher(
+                    self.pos_cmd,
+                    self.config['robot_base_config']['robot_base_cmd_topic'],
+                    10
+                )
 
     # 推理
     def follow_arm_publish(self, left, right):
@@ -272,6 +274,8 @@ class RosOperator(Node):
         plt.close()
 
     def robot_base_shutdown(self):
+        if not self.args.use_base or self.base_actuator_publisher is None:
+            return
         rate = self.create_rate(self.args.frame_rate)
 
         shutdown_control = self.pos_cmd()

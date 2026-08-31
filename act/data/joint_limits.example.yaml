@@ -1,0 +1,5 @@
+# Copy this file, replace every value with reviewed LIFT2s limits, and pass the
+# reviewed copy to remote_inference_client.py. This example intentionally does
+# not contain permissive defaults and must not be used for --execute.
+minimum: []
+maximum: []

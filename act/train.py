@@ -27,6 +27,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from utils.utils import load_data, compute_dict_mean, set_seed, detach_dict
 from utils.policy import ACTPolicy, CNNMLPPolicy, DiffusionPolicy
+from pipeline_contract import validate_dataset_contract
 
 import numpy as np
 
@@ -130,6 +131,13 @@ def train(args):
     dataset_dir = task_config['dataset_dir']
     ckpt_dir = task_config['ckpt_dir']
     print(f'{args.camera_names=}')
+    data_contract = validate_dataset_contract(
+        dataset_dir,
+        expected_action_dim=args.expected_action_dim,
+        expected_action_semantics=args.expected_action_semantics,
+        expected_fps=args.expected_fps,
+    )
+    print(f'Dataset contract: {data_contract}')
 
     # 自适应获取数据集数量
     if args.num_episodes == -1:
@@ -198,6 +206,8 @@ def train(args):
     args_dict.pop('ckpt_stats_name', None)
     with open(args_save_path, 'w') as f:
         yaml.dump(args_dict, f)
+    with open(os.path.join(ckpt_dir, 'data_contract.yaml'), 'w') as f:
+        yaml.safe_dump(data_contract, f, sort_keys=False)
 
     # 开始训练
     best_ckpt_info = train_process(train_dataloader, val_dataloader, config, stats)
@@ -461,6 +471,9 @@ def parse_args(known=False):
                         help='ckpt stats name')
     parser.add_argument('--reload_datasets_reval', type=int, default=0,
                         help='Reload datasets; 0 for no reshuffle, otherwise interval value')
+    parser.add_argument('--expected_action_dim', type=int, default=14)
+    parser.add_argument('--expected_action_semantics', type=str, default='state_t_plus_1')
+    parser.add_argument('--expected_fps', type=int, default=30)
 
     # 训练设置
     parser.add_argument('--num_episodes', type=int, default=50, help='episodes number')
