@@ -98,12 +98,26 @@ def inspect_episode(path: Path) -> dict:
         }
 
 
-def validate_selection(paths: list[Path], fps: int, task: str) -> dict:
-    if fps <= 0:
-        raise ValueError("fps must be positive")
+def temporal_stride(source_fps: int, output_fps: int) -> int:
+    if source_fps <= 0 or output_fps <= 0:
+        raise ValueError("source/output fps must be positive")
+    if output_fps > source_fps or source_fps % output_fps != 0:
+        raise ValueError("output fps must be an integer divisor of source fps")
+    return source_fps // output_fps
+
+
+def selected_frame_indices(frames: int, stride: int) -> range:
+    return range(0, frames, stride)
+
+
+def validate_selection(paths: list[Path], source_fps: int, fps: int, task: str) -> dict:
+    stride = temporal_stride(source_fps, fps)
     if not task.strip():
         raise ValueError("--task is required because official HDF5 task is empty")
     episodes = [inspect_episode(path) for path in paths]
+    for info in episodes:
+        info["source_frames"] = info.pop("frames")
+        info["output_frames"] = len(selected_frame_indices(info["source_frames"], stride))
     shapes = {tuple(info["image_shapes"][camera]) for info in episodes for camera in CAMERA_NAMES}
     if len(shapes) != 1:
         raise ValueError(f"camera decoded shapes disagree: {sorted(shapes)}")
@@ -111,7 +125,10 @@ def validate_selection(paths: list[Path], fps: int, task: str) -> dict:
         "source_format": "official_ros2_lift_play_hdf5",
         "lerobot_version": "0.4.3",
         "lerobot_format": "v3",
+        "source_fps": source_fps,
         "fps": fps,
+        "temporal_stride": stride,
+        "downsample_method": "uniform_stride_no_interpolation",
         "timestamps_available": False,
         "action_dim": ACTION_DIM,
         "action_semantics": ACTION_SEMANTICS,
@@ -119,14 +136,15 @@ def validate_selection(paths: list[Path], fps: int, task: str) -> dict:
         "camera_names": list(CAMERA_NAMES),
         "task": task,
         "total_episodes": len(episodes),
-        "total_frames": sum(info["frames"] for info in episodes),
+        "total_source_frames": sum(info["source_frames"] for info in episodes),
+        "total_frames": sum(info["output_frames"] for info in episodes),
         "episodes": episodes,
     }
 
 
 def convert(args) -> dict:
     paths = selected_paths(args.input, args.start, args.end)
-    manifest = validate_selection(paths, args.fps, args.task)
+    manifest = validate_selection(paths, args.source_fps, args.fps, args.task)
     if args.validate_only:
         return manifest
     if args.output.exists():
@@ -166,17 +184,20 @@ def convert(args) -> dict:
     )
     for path in paths:
         with h5py.File(path, "r") as root:
-            frames = len(root["action"])
-            for index in range(frames):
+            source_frames = len(root["action"])
+            indices = selected_frame_indices(source_frames, manifest["temporal_stride"])
+            for output_index, source_index in enumerate(indices):
                 frame = {
-                    "observation.state": np.asarray(root["observations/qpos"][index], dtype=np.float32),
-                    "action": np.asarray(root["action"][index], dtype=np.float32),
-                    "timestamp": float(index / args.fps),
+                    "observation.state": np.asarray(
+                        root["observations/qpos"][source_index], dtype=np.float32
+                    ),
+                    "action": np.asarray(root["action"][source_index], dtype=np.float32),
+                    "timestamp": float(output_index / args.fps),
                     "task": args.task,
                 }
                 for camera in CAMERA_NAMES:
                     frame[f"observation.images.{camera}"] = decode_rgb(
-                        root[f"observations/images/{camera}"][index]
+                        root[f"observations/images/{camera}"][source_index]
                     )
                 dataset.add_frame(frame)
             dataset.save_episode()
@@ -193,7 +214,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--start", type=int, required=True)
     parser.add_argument("--end", type=int, required=True)
-    parser.add_argument("--fps", type=int, default=60)
+    parser.add_argument("--source-fps", type=int, default=60)
+    parser.add_argument("--fps", type=int, default=60, help="output fps; must divide source-fps")
     parser.add_argument("--task", required=True)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--repo-id")
