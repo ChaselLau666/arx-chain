@@ -193,13 +193,12 @@ def convert(args) -> dict:
         with h5py.File(path, "r") as root:
             source_frames = len(root["action"])
             indices = selected_frame_indices(source_frames, manifest["temporal_stride"])
-            for output_index, source_index in enumerate(indices):
+            for source_index in indices:
                 frame = {
                     "observation.state": np.asarray(
                         root["observations/qpos"][source_index], dtype=np.float32
                     ),
                     "action": np.asarray(root["action"][source_index], dtype=np.float32),
-                    "timestamp": float(output_index / args.fps),
                     "task": args.task,
                 }
                 for camera in CAMERA_NAMES:
