@@ -90,6 +90,7 @@ class RosOperator(Node):
         self.robot_base_origin = deque()
         self.robot_base_deque = deque()
         self.base_velocity_deque = deque()
+        self.height_feedback_deque = deque(maxlen=2000)
 
         self.follow_arm_publish_lock = threading.Lock()
         self.follow_arm_publish_lock.acquire()
@@ -171,6 +172,11 @@ class RosOperator(Node):
                                          self.config['robot_base_config']['robot_base_topic'],
                                          self.base_velocity_callback,
                                          2)
+        elif getattr(self.args, 'height', None) is not None:
+            self.create_subscription(self.pos_cmd,
+                                     self.config['robot_base_config']['robot_base_topic'],
+                                     self.height_feedback_callback,
+                                     10)
         # 推理模式相关发布
         if not self.in_collect:
             self.follow_arm_left_publisher = self.create_publisher(
@@ -707,6 +713,9 @@ class RosOperator(Node):
         velocity = msg.temp_float_data[1:5]
 
         self.base_velocity_deque.append(velocity)
+
+    def height_feedback_callback(self, msg):
+        self.height_feedback_deque.append((time.monotonic(), float(msg.height)))
 
     def _update_arm_position(self, target, arm, symbol, steps_length):
         diff = [abs(target[i] - arm[i]) for i in range(len(target))]
