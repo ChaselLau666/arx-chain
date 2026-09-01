@@ -32,8 +32,10 @@ int main(int argc, char **argv) {
   control_loop = std::make_shared<LiftHeadControlLoop>("can5", static_cast<LiftHeadControlLoop::RobotType>(robot_type));
   int running_state = 2;
   double lift_height = 0;
-  double last_height_command = control_loop->getHeight();
-  double locked_height_command = last_height_command;
+  double last_height_command = 0.0;
+  double locked_height_command = 0.0;
+  bool height_command_initialized = false;
+  const rclcpp::Time startup_time = rclcpp::Clock().now();
   bool height_locked = false;
   bool collect = false;
   auto pub = node->create_publisher<arm_control::msg::PosCmd>("/body_information", 1);
@@ -43,6 +45,16 @@ int main(int argc, char **argv) {
       [&](const std::shared_ptr<std_srvs::srv::SetBool::Request> request,
           std::shared_ptr<std_srvs::srv::SetBool::Response> response) {
         if (request->data && !height_locked) {
+          if (!height_command_initialized) {
+            const double current_height = control_loop->getHeight();
+            if (!std::isfinite(current_height) || current_height < 0.0 || current_height > 20.0) {
+              response->success = false;
+              response->message = "current height is not initialized; lock refused";
+              return;
+            }
+            last_height_command = current_height;
+            height_command_initialized = true;
+          }
           locked_height_command = last_height_command;
           control_loop->setHeight(locked_height_command);
         }
@@ -59,9 +71,13 @@ int main(int argc, char **argv) {
       [&](const std::shared_ptr<arx_lift_controller::srv::LiftHeightStatus::Request>,
           std::shared_ptr<arx_lift_controller::srv::LiftHeightStatus::Response> response) {
         response->current_height = control_loop->getHeight();
-        response->commanded_height = height_locked ? locked_height_command : last_height_command;
+        response->commanded_height = height_command_initialized
+                                         ? (height_locked ? locked_height_command : last_height_command)
+                                         : response->current_height;
         response->locked = height_locked;
-        response->message = height_locked ? "height locked" : "height unlocked";
+        response->message = !height_command_initialized
+                                ? "height target initializing"
+                                : (height_locked ? "height locked" : "height unlocked");
       });
   auto height_set_service = node->create_service<arx_lift_controller::srv::SetLiftHeight>(
       "/lift_height_set",
@@ -78,6 +94,7 @@ int main(int argc, char **argv) {
           return;
         }
         last_height_command = request->target_height;
+        height_command_initialized = true;
         if (height_locked) {
           locked_height_command = request->target_height;
         }
@@ -92,6 +109,7 @@ int main(int argc, char **argv) {
                                                                    collect = true;
                                                                    if (!height_locked) {
                                                                      last_height_command = msg.height;
+                                                                     height_command_initialized = true;
                                                                    }
                                                                    control_loop->setHeight(
                                                                        height_locked ? locked_height_command
@@ -116,6 +134,7 @@ int main(int argc, char **argv) {
     collect = false;
     last_cb_time = rclcpp::Clock().now();
     last_height_command = msg.height;
+    height_command_initialized = true;
     if (height_locked) {
       locked_height_command = last_height_command;
     }
@@ -145,6 +164,7 @@ int main(int argc, char **argv) {
       running_state = 2;
     if (!height_locked) {
       last_height_command = lift_height;
+      height_command_initialized = true;
     }
     control_loop->setHeight(height_locked ? locked_height_command : last_height_command);
     control_loop->setChassisCmd(msg.axes[4] * 2, msg.axes[3] * 2,
@@ -153,6 +173,16 @@ int main(int argc, char **argv) {
   rclcpp::Rate loop_rate(400);
   while (rclcpp::ok()) {
     control_loop->loop();
+    if (!height_command_initialized && (rclcpp::Clock().now() - startup_time).seconds() >= 5.0) {
+      const double current_height = control_loop->getHeight();
+      if (std::isfinite(current_height) && current_height >= 0.0 && current_height <= 20.0) {
+        last_height_command = current_height;
+        locked_height_command = current_height;
+        height_command_initialized = true;
+        RCLCPP_INFO(node->get_logger(), "Height target initialized from calibrated feedback: %.6f",
+                    current_height);
+      }
+    }
     if ((rclcpp::Clock().now() - last_cb_time).seconds() > 0.3 && !collect) {
       control_loop->setChassisCmd(0, 0, 0, 2);
       control_loop->setWheelVel(0, 0, 0, 0);

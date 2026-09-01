@@ -1,6 +1,6 @@
 # ARX LIFT2s 自有采集、训练与远程推理手册
 
-版本：0.1.0
+版本：0.1.1
 适用分支：`acceptance/official-chain`
 数据格式：`arx_hdf5_v2`
 HTTP 协议：`arx_http_v1`
@@ -38,6 +38,7 @@ HTTP 协议：`arx_http_v1`
 ```bash
 source /opt/ros/jazzy/setup.bash
 source /home/arx/ROS2_LIFT_Play/custom_sdk/LIFT/body/ROS2/install/setup.bash
+export ROS_DOMAIN_ID=62
 ros2 service list | grep lift_height
 ```
 
@@ -50,6 +51,8 @@ ros2 service list | grep lift_height
 ```
 
 服务不存在时，采集和推理直接拒绝启动。不要在平台高位临时重启 body。
+
+重启后的非交互 shell 可能没有加载 `~/.bashrc`。启动 body、相机、VR、双臂或检查话题时均应显式设置 `ROS_DOMAIN_ID=62`，不能依赖 shell 默认值。
 
 ## 3. 显式高度操作
 
@@ -67,6 +70,8 @@ conda activate act
 ```bash
 python lift_height.py status
 ```
+
+body 校准完成后，`current_height` 与 `commanded_height` 必须都是 `[0,20]` 内的有限值。工具显示 `height target initializing` 时等待校准完成后重试；禁止在目标尚未初始化时直接设高。
 
 预演设高，不会运动：
 
@@ -294,4 +299,5 @@ SDK 工程师提供只读 joint-target 话题后：
 
 - 2026-08-31：官方链路完成三条 random smoke；仅证明旧 HDF5、ACT 和 GPU 可运行，不得部署。
 - 2026-09-01：自有 HDF5 v2、HTTP、转换与文档开始实施；离线测试和新 body 编译结果以仓库测试报告为准。
+- 2026-09-01：重启后完成正式 body 编译；现场发现并修复 service client 未 spin、启动 domain 未显式设置以及校准前高度目标未初始化问题。
 - 待执行：安全低位部署新 body 服务、三条 pilot、主动丢弃测试、机身移动拒绝测试、HTTP dry-run 和真实 tau-0 adapter 验收。

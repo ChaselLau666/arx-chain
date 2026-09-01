@@ -19,10 +19,10 @@ if str(ROOT) not in sys.path:
 from utils.setup_loader import setup_loader
 
 
-def wait_future(future, timeout: float):
-    deadline = time.monotonic() + timeout
-    while not future.done() and time.monotonic() < deadline:
-        time.sleep(0.02)
+def wait_future(node, future, timeout: float):
+    import rclpy
+
+    rclpy.spin_until_future_complete(node, future, timeout_sec=timeout)
     if not future.done() or future.result() is None:
         raise RuntimeError("service call timed out")
     return future.result()
@@ -44,7 +44,7 @@ def main(args) -> None:
             raise RuntimeError("body is not running or /lift_height_status is unavailable")
 
         def status():
-            response = wait_future(status_client.call_async(LiftHeightStatus.Request()), args.timeout)
+            response = wait_future(node, status_client.call_async(LiftHeightStatus.Request()), args.timeout)
             print(
                 f"Current height: {response.current_height:.6f}\n"
                 f"Commanded height: {response.commanded_height:.6f}\n"
@@ -61,7 +61,7 @@ def main(args) -> None:
                 raise RuntimeError("/lift_height_lock unavailable")
             request = SetBool.Request()
             request.data = args.command == "lock"
-            response = wait_future(client.call_async(request), args.timeout)
+            response = wait_future(node, client.call_async(request), args.timeout)
             if not response.success:
                 raise RuntimeError(response.message)
             print(response.message)
@@ -83,7 +83,7 @@ def main(args) -> None:
             raise RuntimeError("/lift_height_set unavailable")
         request = SetLiftHeight.Request()
         request.target_height = target
-        response = wait_future(client.call_async(request), args.timeout)
+        response = wait_future(node, client.call_async(request), args.timeout)
         if not response.success:
             raise RuntimeError(response.message)
         print(response.message)
