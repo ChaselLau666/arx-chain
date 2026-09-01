@@ -123,7 +123,8 @@ def validate_selection(paths: list[Path], source_fps: int, fps: int, task: str) 
         raise ValueError(f"camera decoded shapes disagree: {sorted(shapes)}")
     return {
         "source_format": "official_ros2_lift_play_hdf5",
-        "lerobot_version": "0.4.3",
+        "lerobot_version": None,
+        "compatible_lerobot_api": "0.4.x",
         "lerobot_format": "v3",
         "source_fps": source_fps,
         "fps": fps,
@@ -172,7 +173,13 @@ def convert(args) -> dict:
         },
     }
 
+    import lerobot
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    lerobot_version = str(getattr(lerobot, "__version__", "unknown"))
+    if not lerobot_version.startswith("0.4."):
+        raise RuntimeError(f"expected LeRobot 0.4.x, found {lerobot_version}")
+    manifest["lerobot_version"] = lerobot_version
 
     dataset = LeRobotDataset.create(
         repo_id=args.repo_id,
