@@ -61,7 +61,14 @@ def prompt_start_decision(episode, read_key_fn):
     )
 
 
-def prompt_episode_decision(read_key_fn):
+def prompt_episode_decision(read_key_fn, allow_save=True):
+    if not allow_save:
+        print('Episode has no valid synchronized frames and cannot be saved.')
+        return _prompt_choice(
+            'Invalid episode: [d]iscard, [q]discard and quit: ',
+            {'d', 'q'},
+            read_key_fn,
+        )
     return _prompt_choice(
         'Episode ended: [s]ave, [d]iscard, [q]discard and quit: ',
         {'s', 'd', 'q'},
