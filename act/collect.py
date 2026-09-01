@@ -66,7 +66,7 @@ def configure_fixed_height(node, height, timeout=60.0):
         raise ValueError('--height must be within [0, 20], or omitted to follow VR')
 
     client = AsyncParameterClient(node, '/lift')
-    if not client.wait_for_service(timeout_sec=5.0):
+    if not client.wait_for_services(timeout_sec=5.0):
         raise RuntimeError('/lift parameter service unavailable; body must already be running')
     future = client.set_parameters([Parameter('fixed_height', Parameter.Type.DOUBLE, target)])
     deadline = time.monotonic() + 5.0
@@ -422,7 +422,13 @@ def main(args):
     spin_thread = threading.Thread(target=_spin_loop, args=(ros_operator,), daemon=True)
     spin_thread.start()
 
-    settled_height = configure_fixed_height(ros_operator, args.height)
+    try:
+        settled_height = configure_fixed_height(ros_operator, args.height)
+    except Exception:
+        ros_operator.destroy_node()
+        rclpy.shutdown()
+        spin_thread.join(timeout=2.0)
+        raise
     if settled_height is not None:
         print(f'Fixed lift ready: command={args.height:.6f}, feedback={settled_height:.6f}')
 
