@@ -240,6 +240,14 @@ CONFIRM LOW
 
 它会设置 `fixed_height=0.0`，同时发送一次不依赖 VR 的 `/body_control` 低位命令；只有反馈连续 2 秒稳定且不高于 1.0，并经过操作者肉眼确认后，才按 collector、VR、相机、双臂、body、CAN watchdog 顺序停止程序。底层 CAN 接口和 `slcand` 保持 UP，供下一次启动复用。
 
+如果控制栈已经不完整，且 `/lift` 和 body 进程都不在，脚本无法读取或驱动高度。此时必须先肉眼确认平台已经处于安全低位，再输入：
+
+```text
+CONFIRM ALREADY LOW
+```
+
+脚本随后只清理仍在运行的采集、VR、相机、双臂和 CAN watchdog。如果仍存在 body 进程但 `/lift` 在当前 `ROS_DOMAIN_ID` 中不可见，脚本会拒绝关停；先检查 domain 和 body 日志，禁止盲目停止不可观测的 body。
+
 对应的手动流程如下。首先保持 body 和 VR 运行，明确：
 
 ```text

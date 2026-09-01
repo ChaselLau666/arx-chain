@@ -9,43 +9,58 @@ source /opt/ros/jazzy/setup.bash
 source /home/arx/LIFT/body/ROS2/install/setup.bash
 set -u
 
-if ! ros2 node list 2>/dev/null | grep -qx '/lift'; then
-  echo "Refused: /lift body node is not running; cannot verify or lower the platform." >&2
-  exit 1
-fi
+if ros2 node list 2>/dev/null | grep -qx '/lift'; then
+  current_height=$(timeout 4 ros2 topic echo --once /body_information 2>/dev/null \
+    | awk '/^height:/{print $2; exit}')
+  if [[ -z "${current_height}" ]]; then
+    echo "Refused: /lift is running but /body_information feedback is unavailable." >&2
+    echo "Keep body running and diagnose its feedback; it is unsafe to stop an unobservable body." >&2
+    exit 1
+  fi
 
-current_height=$(timeout 4 ros2 topic echo --once /body_information 2>/dev/null \
-  | awk '/^height:/{print $2; exit}')
-if [[ -z "${current_height}" ]]; then
-  echo "Refused: no /body_information feedback." >&2
-  exit 1
-fi
+  echo "Current feedback height: ${current_height}"
+  echo "Target command: 0.0"
+  echo "Direction: DOWN (or HOLD if already low)"
+  echo "Expected behavior: platform reaches a stable feedback <= 1.0 before body is stopped."
+  echo "WARNING: any unsaved in-memory episode will be discarded."
+  read -r -p 'Type LOWER AND SHUTDOWN to continue: ' confirmation
+  if [[ "${confirmation}" != "LOWER AND SHUTDOWN" ]]; then
+    echo "Cancelled; no command or signal sent."
+    exit 1
+  fi
 
-echo "Current feedback height: ${current_height}"
-echo "Target command: 0.0"
-echo "Direction: DOWN (or HOLD if already low)"
-echo "Expected behavior: platform reaches a stable feedback <= 1.0 before body is stopped."
-echo "WARNING: any unsaved in-memory episode will be discarded."
-read -r -p 'Type LOWER AND SHUTDOWN to continue: ' confirmation
-if [[ "${confirmation}" != "LOWER AND SHUTDOWN" ]]; then
-  echo "Cancelled; no command or signal sent."
-  exit 1
-fi
+  ros2 param set /lift fixed_height 0.0
+  # Fallback for an older already-running binary whose fixed_height was applied
+  # only from VR/joy callbacks. This command also requests zero wheel/body motion.
+  ros2 topic pub --once /body_control arm_control/msg/PosCmd '{height: 0.0, mode1: 2}'
 
-ros2 param set /lift fixed_height 0.0
-# Fallback for an older already-running binary whose fixed_height was applied
-# only from VR/joy callbacks. This command also requests zero wheel/body motion.
-ros2 topic pub --once /body_control arm_control/msg/PosCmd '{height: 0.0, mode1: 2}'
+  /home/arx/miniconda3/envs/act/bin/python \
+    "${repo_root}/act/wait_for_safe_height.py" \
+    --safe-max 1.0 --tolerance 0.02 --window 2.0 --timeout 90.0
 
-/home/arx/miniconda3/envs/act/bin/python \
-  "${repo_root}/act/wait_for_safe_height.py" \
-  --safe-max 1.0 --tolerance 0.02 --window 2.0 --timeout 90.0
+  echo "Feedback is low and stable. Visually inspect the platform now."
+  read -r -p 'Type CONFIRM LOW to stop all control programs: ' low_confirmation
+  if [[ "${low_confirmation}" != "CONFIRM LOW" ]]; then
+    echo "Refused: body remains running at low target; no processes were stopped."
+    exit 1
+  fi
+else
+  if pgrep -f '/arx_lift_controller/lift_controller' >/dev/null; then
+    echo "Refused: a body process exists but /lift is not visible in ROS_DOMAIN_ID=${ROS_DOMAIN_ID}." >&2
+    echo "Do not stop it while its height is unobservable. Check ROS_DOMAIN_ID and body logs." >&2
+    exit 1
+  fi
 
-echo "Feedback is low and stable. Visually inspect the platform now."
-read -r -p 'Type CONFIRM LOW to stop all control programs: ' low_confirmation
-if [[ "${low_confirmation}" != "CONFIRM LOW" ]]; then
-  echo "Refused: body remains running at low target; no processes were stopped."
-  exit 1
+  echo "INCOMPLETE STACK: /lift and its body process are not running."
+  echo "The script cannot read height or lower the platform in this state."
+  echo "Required physical state: platform is already at a safe low position."
+  echo "Expected behavior: only remaining collector, VR, cameras, arms, and CAN watchdogs will stop."
+  echo "WARNING: any unsaved in-memory episode will be discarded."
+  read -r -p 'After visually confirming the platform is low, type CONFIRM ALREADY LOW: ' low_confirmation
+  if [[ "${low_confirmation}" != "CONFIRM ALREADY LOW" ]]; then
+    echo "Cancelled; no command or signal sent."
+    exit 1
+  fi
 fi
 
 stop_pattern() {
