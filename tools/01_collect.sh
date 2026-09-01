@@ -2,7 +2,9 @@
 
 workspace=$(pwd)
 : "${LIFT_HEIGHT:?Set LIFT_HEIGHT to the desired lift command in [0, 20]}"
+: "${TASK_NAME:?Set TASK_NAME, for example pickplace_right_to_bowl}"
 lift_height_q=$(printf '%q' "${LIFT_HEIGHT}")
+task_name_q=$(printf '%q' "${TASK_NAME}")
 
 shell_type=${SHELL##*/}
 shell_exec="exec $shell_type"
@@ -49,4 +51,4 @@ gnome-terminal --title="vr" -x $shell_type -i -c "cd ../../LIFT/ARX_VR_SDK/ROS2;
 sleep 1
 
 # Collect
-gnome-terminal --title="collect" -x $shell_type -i -c "cd ${workspace}; cd ../act; conda activate act; python collect.py --episode_idx -1 --height ${lift_height_q}; $shell_exec"
+gnome-terminal --title="collect" -x $shell_type -i -c "cd ${workspace}; cd ../act; conda activate act; python collect.py --episode_idx -1 --height ${lift_height_q} --task ${task_name_q}; $shell_exec"

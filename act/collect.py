@@ -28,6 +28,7 @@ from copy import deepcopy
 
 from utils.ros_operator import Rate, RosOperator
 from utils.setup_loader import setup_loader
+from collection_ui import prompt_episode_decision, prompt_next_decision
 
 np.set_printoptions(linewidth=200)
 
@@ -462,15 +463,31 @@ def main(args):
         timesteps, actions, actions_eef, action_bases, action_velocities = collect_information(args, ros_operator,
                                                                                                voice_engine)
 
+        decision = prompt_episode_decision()
+        if decision == 'd':
+            voice_process(voice_engine, 'Discard')
+            print(f'Episode {current_episode} discarded; the number will be reused.')
+            if prompt_next_decision(current_episode) == 'q':
+                print('Collection stopped before retry.')
+                break
+            continue
+        if decision == 'q':
+            voice_process(voice_engine, 'Discard and quit')
+            print(f'Episode {current_episode} discarded; collection stopped.')
+            break
+
         if not os.path.exists(datasets_dir):
             os.makedirs(datasets_dir)
 
         dataset_path = os.path.join(datasets_dir, "episode_" + str(current_episode))
-        threading.Thread(target=save_data, args=(args, timesteps, actions, actions_eef, action_bases, action_velocities,
-                                                 ros_operator, dataset_path,)).start()
+        save_data(args, timesteps, actions, actions_eef, action_bases, action_velocities,
+                  ros_operator, dataset_path)
 
         episode_num = episode_num + 1
         current_episode = current_episode + 1
+        if prompt_next_decision(current_episode) == 'q':
+            print('Collection stopped after save.')
+            break
 
     ros_operator.destroy_node()
     rclpy.shutdown()
