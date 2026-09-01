@@ -28,7 +28,7 @@ from copy import deepcopy
 
 from utils.ros_operator import Rate, RosOperator
 from utils.setup_loader import setup_loader
-from collection_ui import prompt_episode_decision, prompt_next_decision
+from collection_ui import TerminalKeyReader, prompt_episode_decision, prompt_start_decision
 
 np.set_printoptions(linewidth=200)
 
@@ -123,93 +123,7 @@ def voice_process(voice_engine, line):
     return
 
 
-# 根据动作和编码范围更新ready_flag
-def update_ready_flag(ready_flag, action, gripper_idx, encode_ranges):
-    for idx in gripper_idx:
-        if ready_flag % 2 == 1 and abs(action[idx]) < abs(encode_ranges['close']):
-            ready_flag += 1
-
-            print(f'{ready_flag=}: {action[idx]=}')
-        elif ready_flag % 2 == 0 and abs(encode_ranges['middle']) < abs(action[idx]) < abs(encode_ranges['max']):
-            ready_flag += 1
-
-            print(f'{ready_flag=}: {action[idx]=}')
-
-    return ready_flag
-
-
-def collect_detect(args, start_episode, voice_engine, ros_operator):
-    rate = Rate(args.frame_rate)
-    print(f"Preparing to record episode {start_episode}")
-
-    # 倒计时
-    for i in range(3, -1, -1):
-        print(f"\rwaiting {i} to start recording", end='')
-
-        time.sleep(0.3)
-
-    print(f"\nStart recording program...")
-
-    # 键盘触发录制
-    if args.key_collect:
-        input("Enter any key to record :")
-    else:
-        init_done = False
-
-        while not init_done and rclpy.ok():
-            obs_dict = ros_operator.get_observation()
-            if obs_dict == None:
-                print("synchronization frame")
-                rate.sleep()
-
-                continue
-
-            # action = obs_dict['eef']
-            action = obs_dict['qpos']
-
-            # 减少不必要的循环
-            init_done = all(val <= 0.035 for val in action)
-
-            if init_done:
-                voice_process(voice_engine, f"{start_episode % 100}")
-            rate.sleep()
-
-        # 机械臂准备阶段
-        ready_flag = 0
-        gripper_idx = [6, 13]
-        # encode_ranges = {
-        #     'close': 0.1,
-        #     'middle': 1.0,
-        #     'max': 5.0
-        # }
-        encode_ranges = {
-            'close': -0.1,
-            'middle': -2.1,
-            'max': -3.5
-        }
-
-
-        while ready_flag < 2 and rclpy.ok():
-            obs_dict = ros_operator.get_observation()
-            if obs_dict == None:
-                print("synchronization frame")
-                rate.sleep()
-
-                continue
-
-            action = obs_dict['qpos']
-
-            ready_flag = update_ready_flag(ready_flag, action, gripper_idx, encode_ranges)
-
-            if ready_flag == 2:
-                voice_process(voice_engine, "go")
-
-            rate.sleep()
-
-        return True
-
-
-def collect_information(args, ros_operator, voice_engine):
+def collect_information(args, ros_operator, voice_engine, key_reader):
     timesteps = []
     actions = []
     actions_eef = []
@@ -225,7 +139,18 @@ def collect_information(args, ros_operator, voice_engine):
     # gripper_close = 3
     gripper_close = -2.1
 
+    print('RECORDING: press [e] to end and review this episode.')
     while (count < args.max_timesteps) and rclpy.ok():
+        key = key_reader.poll_key()
+        if key == 'e':
+            if count == 0:
+                print('\n[e] ignored because no frame has been recorded yet.')
+                continue
+            print('\n[e] received; recording stopped for review.')
+            break
+        if key is not None:
+            print(f"\nIgnored key '{key}' while recording; press [e] to end.")
+
         obs_dict = ros_operator.get_observation(ts=count)
         action_dict = ros_operator.get_action()
 
@@ -248,11 +173,6 @@ def collect_information(args, ros_operator, voice_engine):
         action_eef[6] = 0 if action_eef[6] > gripper_close else action_eef[6]
         action_eef[13] = 0 if action_eef[13] > gripper_close else action_eef[13]
 
-        # 检查是否超过100帧，并判断是否应该停止
-        if count > 100:
-            if all(abs(val) <= 0.035 for val in action):
-                break
-
         # 收集数据
         timesteps.append(obs_dict)
         actions.append(action)
@@ -267,6 +187,9 @@ def collect_information(args, ros_operator, voice_engine):
             exit(-1)
 
         rate.sleep()
+
+    if count >= args.max_timesteps:
+        print(f'Hard limit reached at {args.max_timesteps} frames; entering review.')
 
     print(f"\nlen(timesteps): {len(timesteps)}")
     print(f"len(actions)  : {len(actions)}")
@@ -455,39 +378,37 @@ def main(args):
         current_episode = max_episode + 1
 
     episode_num = 0
-    while episode_num < num_episodes and rclpy.ok():
-        print(f'Episode {episode_num}')
-        collect_detect(args, current_episode, voice_engine, ros_operator)
-
-        print(f"Start to record episode {current_episode}")
-        timesteps, actions, actions_eef, action_bases, action_velocities = collect_information(args, ros_operator,
-                                                                                               voice_engine)
-
-        decision = prompt_episode_decision()
-        if decision == 'd':
-            voice_process(voice_engine, 'Discard')
-            print(f'Episode {current_episode} discarded; the number will be reused.')
-            if prompt_next_decision(current_episode) == 'q':
-                print('Collection stopped before retry.')
+    with TerminalKeyReader() as key_reader:
+        while episode_num < num_episodes and rclpy.ok():
+            start_decision = prompt_start_decision(current_episode, key_reader.read_key)
+            if start_decision == 'q':
+                print('Collection stopped while idle; no episode was recorded.')
                 break
-            continue
-        if decision == 'q':
-            voice_process(voice_engine, 'Discard and quit')
-            print(f'Episode {current_episode} discarded; collection stopped.')
-            break
 
-        if not os.path.exists(datasets_dir):
-            os.makedirs(datasets_dir)
+            print(f"Start recording episode {current_episode}")
+            timesteps, actions, actions_eef, action_bases, action_velocities = collect_information(
+                args, ros_operator, voice_engine, key_reader
+            )
 
-        dataset_path = os.path.join(datasets_dir, "episode_" + str(current_episode))
-        save_data(args, timesteps, actions, actions_eef, action_bases, action_velocities,
-                  ros_operator, dataset_path)
+            decision = prompt_episode_decision(key_reader.read_key)
+            if decision == 'd':
+                voice_process(voice_engine, 'Discard')
+                print(f'Episode {current_episode} discarded; the number will be reused.')
+                continue
+            if decision == 'q':
+                voice_process(voice_engine, 'Discard and quit')
+                print(f'Episode {current_episode} discarded; collection stopped.')
+                break
 
-        episode_num = episode_num + 1
-        current_episode = current_episode + 1
-        if prompt_next_decision(current_episode) == 'q':
-            print('Collection stopped after save.')
-            break
+            if not os.path.exists(datasets_dir):
+                os.makedirs(datasets_dir)
+
+            dataset_path = os.path.join(datasets_dir, "episode_" + str(current_episode))
+            save_data(args, timesteps, actions, actions_eef, action_bases, action_velocities,
+                      ros_operator, dataset_path)
+
+            episode_num = episode_num + 1
+            current_episode = current_episode + 1
 
     ros_operator.destroy_node()
     rclpy.shutdown()
@@ -521,7 +442,8 @@ def parse_arguments(known=False):
                         help='record data')
 
     # 数据采集选项
-    parser.add_argument('--key_collect', action='store_true', help='use key collect')
+    parser.add_argument('--key_collect', action='store_true',
+                        help='deprecated compatibility flag; single-key collection is always enabled')
     parser.add_argument('--height', type=float, default=None,
                         help='fixed lift command in [0, 20]; omitted means follow VR height')
 
