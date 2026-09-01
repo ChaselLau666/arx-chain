@@ -1,6 +1,6 @@
 # ARX LIFT2s 自有采集、训练与远程推理手册
 
-版本：0.1.2
+版本：0.1.3
 适用分支：`acceptance/official-chain`
 数据格式：`arx_hdf5_v2`
 HTTP 协议：`arx_http_v1`
@@ -33,7 +33,18 @@ HTTP 协议：`arx_http_v1`
 
 如果需要部署新的 custom body：先人工缓慢降到安全低位，确认平台已经处于低位，再编译并重启 body。平台高位时保持现有 body 持续运行。
 
-### 2.2 检查 body 是否已运行
+### 2.2 重启后安全配置 CAN
+
+交付的 `arx_can1.sh`、`arx_can3.sh`、`arx_can5.sh` 在接口掉线时会全局结束所有 `slcand`，不得在 body 或双臂运行期间分别启动。重启后、启动任何控制节点前统一执行：
+
+```bash
+cd /home/arx/ROS2_LIFT_Play/tools
+./configure_can_interfaces.sh
+```
+
+该工具逐个配置 can1、can3、can5，不会结束其他接口进程。采集和推理脚本只检查三个接口均为 UP，不再负责配置 CAN。
+
+### 2.3 检查 body 是否已运行
 
 ```bash
 source /opt/ros/jazzy/setup.bash
@@ -305,4 +316,5 @@ SDK 工程师提供只读 joint-target 话题后：
 - 2026-09-01：自有 HDF5 v2、HTTP、转换与文档开始实施；离线测试和新 body 编译结果以仓库测试报告为准。
 - 2026-09-01：重启后完成正式 body 编译；现场发现并修复 service client 未 spin、启动 domain 未显式设置以及校准前高度目标未初始化问题。
 - 2026-09-01：低位实测确认命令高度与反馈高度存在校准偏差；设高验收改为“命令更新且反馈稳定”，采集以锁定时实际反馈作为稳定基线。
+- 2026-09-01：确认交付 CAN watchdog 会全局结束 `slcand`；新增一次性逐接口配置工具，采集和推理改为只读 CAN preflight。
 - 待执行：安全低位部署新 body 服务、三条 pilot、主动丢弃测试、机身移动拒绝测试、HTTP dry-run 和真实 tau-0 adapter 验收。

@@ -27,6 +27,7 @@ class DocumentationContractTests(unittest.TestCase):
             "GET  /v1/schema",
             "POST /v1/reset",
             "POST /v1/infer",
+            "configure_can_interfaces.sh",
         ):
             self.assertIn(value, manual)
 

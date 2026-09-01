@@ -10,11 +10,12 @@ model_server_url_q=$(printf '%q' "${MODEL_SERVER_URL}")
 shell_type=${SHELL##*/}
 shell_exec="exec $shell_type"
 
-# CAN
-gnome-terminal -t "can1" -x bash -c "cd ${workspace}; cd ../../LIFT/ARX_CAN/arx_can; ./arx_can1.sh; exec bash;"
-sleep 0.3
-gnome-terminal -t "can3" -x bash -c "cd ${workspace}; cd ../../LIFT/ARX_CAN/arx_can; ./arx_can3.sh; exec bash;"
-sleep 0.3
+for interface in can1 can3 can5; do
+  if ! ip link show "${interface}" 2>/dev/null | grep -q "UP"; then
+    echo "Refused: ${interface} is not UP. Run tools/configure_can_interfaces.sh before starting body/arms."
+    exit 1
+  fi
+done
 # Never restart body from inference. This check is read-only.
 source /opt/ros/jazzy/setup.bash
 source "${repo_root}/custom_sdk/LIFT/body/ROS2/install/setup.bash"
