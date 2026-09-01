@@ -143,9 +143,6 @@ def collect_information(args, ros_operator, voice_engine, key_reader):
     while (count < args.max_timesteps) and rclpy.ok():
         key = key_reader.poll_key()
         if key == 'e':
-            if count == 0:
-                print('\n[e] ignored because no frame has been recorded yet.')
-                continue
             print('\n[e] received; recording stopped for review.')
             break
         if key is not None:
@@ -390,7 +387,10 @@ def main(args):
                 args, ros_operator, voice_engine, key_reader
             )
 
-            decision = prompt_episode_decision(key_reader.read_key)
+            decision = prompt_episode_decision(
+                key_reader.read_key,
+                allow_save=bool(timesteps),
+            )
             if decision == 'd':
                 voice_process(voice_engine, 'Discard')
                 print(f'Episode {current_episode} discarded; the number will be reused.')

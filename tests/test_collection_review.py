@@ -23,6 +23,13 @@ class CollectionReviewTests(unittest.TestCase):
         self.assertEqual(prompt_episode_decision(lambda _: 'd'), 'd')
         self.assertEqual(prompt_episode_decision(lambda _: 'q'), 'q')
 
+    def test_empty_episode_cannot_be_saved(self):
+        answers = iter(['s', 'D'])
+        self.assertEqual(
+            prompt_episode_decision(lambda _: next(answers), allow_save=False),
+            'd',
+        )
+
     def test_start_requires_explicit_r_or_q(self):
         answers = iter(['x', 'R'])
         self.assertEqual(prompt_start_decision(9, lambda _: next(answers)), 'r')
