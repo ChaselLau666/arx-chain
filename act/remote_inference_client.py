@@ -97,8 +97,7 @@ def main(args) -> None:
         height = node.height_status()
         if not height["locked"]:
             raise RuntimeError("height must be locked before inference")
-        expected_height = height["commanded_height"] if args.expected_height is None else args.expected_height
-        if abs(height["current_height"] - expected_height) > args.height_tolerance:
+        if args.expected_height is not None and abs(height["current_height"] - args.expected_height) > args.height_tolerance:
             raise RuntimeError("current height does not match expected height")
         print(f"Height preflight PASS: {height}")
 
@@ -112,7 +111,7 @@ def main(args) -> None:
         pending = None
         action_buffer = collections.deque()
         request_id = 0
-        baseline_height = expected_height
+        baseline_height = height["current_height"]
         period = 1.0 / FPS
         deadline = time.monotonic()
         gate_initialized = False

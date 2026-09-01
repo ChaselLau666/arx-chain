@@ -6,6 +6,8 @@ This tool never starts or restarts the body controller.
 from __future__ import annotations
 
 import argparse
+import collections
+import math
 import os
 import sys
 import time
@@ -17,6 +19,10 @@ if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 
 from utils.setup_loader import setup_loader
+
+
+def feedback_is_stable(values, tolerance: float) -> bool:
+    return len(values) >= 2 and max(values) - min(values) <= tolerance
 
 
 def wait_future(node, future, timeout: float):
@@ -70,8 +76,13 @@ def main(args) -> None:
 
         before = status()
         target = float(args.target)
-        direction = "UP" if target > before.current_height else "DOWN" if target < before.current_height else "HOLD"
-        print(f"Target height: {target:.6f}\nDirection: {direction}\nExpected motion: platform moves {direction}")
+        direction = (
+            "UP" if target > before.commanded_height else "DOWN" if target < before.commanded_height else "HOLD"
+        )
+        print(
+            f"Target command: {target:.6f}\nDirection: {direction}\n"
+            f"Expected motion: platform moves {direction}; feedback may use a calibrated offset"
+        )
         if not args.execute:
             print("Dry run only. Re-run with --execute to permit motion.")
             return
@@ -88,13 +99,26 @@ def main(args) -> None:
             raise RuntimeError(response.message)
         print(response.message)
         deadline = time.monotonic() + args.motion_timeout
+        sample_count = max(2, math.ceil(args.settle_window / args.poll_interval) + 1)
+        recent_heights = collections.deque(maxlen=sample_count)
         while time.monotonic() < deadline:
             current = status()
-            if abs(current.current_height - target) <= args.tolerance:
-                print("Height reached target tolerance.")
+            recent_heights.append(float(current.current_height))
+            command_matches = abs(current.commanded_height - target) <= 1e-6
+            stable = len(recent_heights) == sample_count and feedback_is_stable(
+                recent_heights, args.stability_tolerance
+            )
+            expected_matches = args.expected_feedback is None or abs(
+                current.current_height - args.expected_feedback
+            ) <= args.feedback_tolerance
+            if command_matches and stable and expected_matches:
+                print(
+                    f"Height feedback settled at {current.current_height:.6f} "
+                    f"for command {target:.6f}."
+                )
                 return
-            time.sleep(0.5)
-        raise RuntimeError("height did not reach target before timeout; body remains running")
+            time.sleep(args.poll_interval)
+        raise RuntimeError("height feedback did not settle before timeout; body remains running")
     finally:
         node.destroy_node()
         rclpy.shutdown()
@@ -107,7 +131,11 @@ def parse_args():
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--timeout", type=float, default=5.0)
     parser.add_argument("--motion-timeout", type=float, default=60.0)
-    parser.add_argument("--tolerance", type=float, default=0.05)
+    parser.add_argument("--settle-window", type=float, default=2.0)
+    parser.add_argument("--poll-interval", type=float, default=0.5)
+    parser.add_argument("--stability-tolerance", type=float, default=0.01)
+    parser.add_argument("--expected-feedback", type=float, default=None)
+    parser.add_argument("--feedback-tolerance", type=float, default=0.05)
     args = parser.parse_args()
     if args.command == "set" and args.target is None:
         parser.error("set requires a target height")

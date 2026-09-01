@@ -20,6 +20,8 @@ from pipeline_contract import ACTION_DIM, ACTION_SEMANTICS, FPS, validate_datase
 from model_server.policy_adapter import MockPolicy
 from model_server.lerobot_contract import validate_arx_lerobot
 from http_protocol import HttpInferenceClient
+from lift_height import feedback_is_stable
+from collect import preflight_height
 
 
 def jpeg_bytes(value: int) -> bytes:
@@ -98,6 +100,26 @@ class PipelineV2Tests(unittest.TestCase):
         actions = policy.infer(state, {"head": b"jpeg"}, "task")
         self.assertEqual(actions.shape, (3, ACTION_DIM))
         np.testing.assert_array_equal(actions[0], state)
+
+    def test_height_feedback_stability_uses_feedback_window(self):
+        self.assertTrue(feedback_is_stable([0.284, 0.285, 0.2845], 0.01))
+        self.assertFalse(feedback_is_stable([0.13, 0.20, 0.28], 0.01))
+
+    def test_collection_uses_locked_feedback_as_default_baseline(self):
+        class Node:
+            @staticmethod
+            def height_status():
+                return {
+                    "current_height": 0.284,
+                    "commanded_height": 0.133,
+                    "locked": True,
+                    "message": "height locked",
+                }
+
+        status = preflight_height(Node(), expected_height=None, tolerance=0.05)
+        self.assertEqual(status["current_height"], 0.284)
+        with self.assertRaisesRegex(RuntimeError, "current feedback"):
+            preflight_height(Node(), expected_height=0.5, tolerance=0.05)
 
     def test_http_client_validates_schema_and_action_chunk(self):
         class Response:

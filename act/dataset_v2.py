@@ -64,6 +64,7 @@ class EpisodeWriter:
         task_instruction: str,
         expected_height: float,
         repo_root: str | Path,
+        commanded_height: float | None = None,
     ) -> None:
         if not task_name.strip() or not task_instruction.strip():
             raise ValueError("task_name and task_instruction are required")
@@ -76,9 +77,16 @@ class EpisodeWriter:
         self._closed = False
         self._attempted_ticks = 0
         self._dropped_ticks = 0
-        self._create(task_name, task_instruction, expected_height, Path(repo_root))
+        self._create(task_name, task_instruction, expected_height, commanded_height, Path(repo_root))
 
-    def _create(self, task_name: str, task_instruction: str, expected_height: float, repo_root: Path) -> None:
+    def _create(
+        self,
+        task_name: str,
+        task_instruction: str,
+        expected_height: float,
+        commanded_height: float | None,
+        repo_root: Path,
+    ) -> None:
         root = self._root
         root.attrs.update(
             {
@@ -98,7 +106,9 @@ class EpisodeWriter:
                 "camera_storage": "ros_compressed_jpeg_bytes",
                 "robot_type": "ARX_LIFT2s",
                 "git_commit": _git_commit(repo_root),
-                "height_target": float(expected_height),
+                "height_target": float(commanded_height if commanded_height is not None else expected_height),
+                "height_command": float(commanded_height if commanded_height is not None else expected_height),
+                "height_feedback_baseline": float(expected_height),
                 "height_locked": True,
             }
         )

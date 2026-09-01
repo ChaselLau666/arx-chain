@@ -61,7 +61,7 @@ def spin_node(node):
         rclpy.spin_once(node, timeout_sec=0.01)
 
 
-def preflight_height(node, expected_height: float | None, tolerance: float) -> float:
+def preflight_height(node, expected_height: float | None, tolerance: float) -> dict:
     status = node.height_status()
     print(
         f"Body height: current={status['current_height']:.6f}, "
@@ -69,20 +69,20 @@ def preflight_height(node, expected_height: float | None, tolerance: float) -> f
     )
     if not status["locked"]:
         raise RuntimeError("height is not locked; use lift_height.py lock before collection")
-    target = status["commanded_height"] if expected_height is None else expected_height
-    if abs(status["current_height"] - target) > tolerance:
+    if expected_height is not None and abs(status["current_height"] - expected_height) > tolerance:
         raise RuntimeError(
-            f"current height differs from expected {target:.6f} by more than {tolerance:.3f}"
+            f"current feedback differs from expected {expected_height:.6f} by more than {tolerance:.3f}"
         )
-    return float(target)
+    return status
 
 
-def record_episode(args, node, keys: TerminalKeys, expected_height: float):
+def record_episode(args, node, keys: TerminalKeys, height_status: dict):
     writer = EpisodeWriter(
         dataset_dir=args.datasets,
         task_name=args.task,
         task_instruction=args.task_instruction,
-        expected_height=expected_height,
+        expected_height=height_status["current_height"],
+        commanded_height=height_status["commanded_height"],
         repo_root=REPO_ROOT,
     )
     print(f"Recording to pending file {writer.path.name}; press E to end")
@@ -159,7 +159,7 @@ def run(args) -> None:
     spin_thread = threading.Thread(target=spin_node, args=(node,), daemon=True)
     spin_thread.start()
     try:
-        expected_height = preflight_height(node, args.expected_height, args.height_tolerance)
+        height_status = preflight_height(node, args.expected_height, args.height_tolerance)
         Path(args.datasets).mkdir(parents=True, exist_ok=True)
         print("Ready: R record | Q quit")
         with TerminalKeys() as keys:
@@ -167,7 +167,7 @@ def run(args) -> None:
                 key = keys.wait_for({"r", "q"})
                 if key == "q":
                     return
-                writer, summary, error = record_episode(args, node, keys, expected_height)
+                writer, summary, error = record_episode(args, node, keys, height_status)
                 print(f"Review PASS: {summary}" if error is None else f"Review FAILED: {error}")
                 print("S save | D discard | Q quit (failed episodes cannot be saved)")
                 while True:

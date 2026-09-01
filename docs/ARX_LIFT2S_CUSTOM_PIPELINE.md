@@ -1,6 +1,6 @@
 # ARX LIFT2s 自有采集、训练与远程推理手册
 
-版本：0.1.1
+版本：0.1.2
 适用分支：`acceptance/official-chain`
 数据格式：`arx_hdf5_v2`
 HTTP 协议：`arx_http_v1`
@@ -71,7 +71,7 @@ conda activate act
 python lift_height.py status
 ```
 
-body 校准完成后，`current_height` 与 `commanded_height` 必须都是 `[0,20]` 内的有限值。工具显示 `height target initializing` 时等待校准完成后重试；禁止在目标尚未初始化时直接设高。
+body 校准完成后，`current_height` 与 `commanded_height` 必须都是有限值。两者属于不同基准，允许存在稳定偏差；例如低位可能出现 command 约 0.13、feedback 约 0.28。工具显示 `height target initializing` 时等待校准完成后重试；禁止在目标尚未初始化时直接设高。
 
 预演设高，不会运动：
 
@@ -85,7 +85,9 @@ python lift_height.py set 15.65
 python lift_height.py set 15.65 --execute
 ```
 
-工具会显示当前高度、目标高度、UP/DOWN/HOLD 和预期动作，并要求输入完整确认文本。目标范围为 SDK 的 `[0,20]`。设高只修改升降目标，不修改底盘、腰部或头部。
+工具会显示当前反馈、当前命令、目标命令、UP/DOWN/HOLD 和预期动作，并要求输入完整确认文本。命令范围为 SDK 的 `[0,20]`。设高只修改升降目标，不修改底盘、腰部或头部。
+
+默认验收条件是：命令值正确更新，且实际反馈在连续 2 秒内稳定到波动不超过 0.01。默认不要求反馈数值等于命令数值；只有已知某个工作位的实际反馈时，才额外使用 `--expected-feedback` 校验。
 
 锁定或解锁：
 
@@ -132,6 +134,8 @@ cd /home/arx/ROS2_LIFT_Play/tools
 - `Q`：在非录制状态退出。
 
 录制内容先写到 `act/datasets/.pending/*.hdf5.partial`。只有按 `S` 后才原子移动为 `episode_N.hdf5` 并占用编号。失败 episode 无法按 `S` 保存。
+
+采集启动时只要求高度已经锁定。默认把当时的实际反馈记录为 episode 基线，同时单独记录命令高度；不要求两者数值相等。若使用 `--expected_height`，该参数表示期望的实际反馈值。
 
 ### 5.2 自动拒绝条件
 
@@ -300,4 +304,5 @@ SDK 工程师提供只读 joint-target 话题后：
 - 2026-08-31：官方链路完成三条 random smoke；仅证明旧 HDF5、ACT 和 GPU 可运行，不得部署。
 - 2026-09-01：自有 HDF5 v2、HTTP、转换与文档开始实施；离线测试和新 body 编译结果以仓库测试报告为准。
 - 2026-09-01：重启后完成正式 body 编译；现场发现并修复 service client 未 spin、启动 domain 未显式设置以及校准前高度目标未初始化问题。
+- 2026-09-01：低位实测确认命令高度与反馈高度存在校准偏差；设高验收改为“命令更新且反馈稳定”，采集以锁定时实际反馈作为稳定基线。
 - 待执行：安全低位部署新 body 服务、三条 pilot、主动丢弃测试、机身移动拒绝测试、HTTP dry-run 和真实 tau-0 adapter 验收。
