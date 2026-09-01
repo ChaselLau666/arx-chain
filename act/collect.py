@@ -74,7 +74,8 @@ def configure_fixed_height(node, height, timeout=60.0):
         time.sleep(0.02)
     if not future.done() or future.result() is None:
         raise RuntimeError('timed out setting /lift fixed_height')
-    results = future.result()
+    response = future.result()
+    results = getattr(response, 'results', response)
     if not results or not all(result.successful for result in results):
         reason = '; '.join(result.reason for result in results if not result.successful)
         raise RuntimeError(f'failed to set /lift fixed_height: {reason}')
