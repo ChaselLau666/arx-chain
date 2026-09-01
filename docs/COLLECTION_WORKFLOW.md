@@ -224,7 +224,23 @@ collector 会从当前最大 HDF5 编号加一继续。
 
 ### 10.2 完整关闭所有控制程序
 
-平台高位时禁止直接关闭 body。首先保持 body 和 VR 运行，明确：
+平台高位时禁止直接关闭 body。推荐使用一键安全关闭脚本：
+
+```bash
+cd /home/arx/ROS2_LIFT_Play/tools
+./04_safe_shutdown.sh
+```
+
+脚本需要依次输入两个完整确认文本：
+
+```text
+LOWER AND SHUTDOWN
+CONFIRM LOW
+```
+
+它会设置 `fixed_height=0.0`，同时发送一次不依赖 VR 的 `/body_control` 低位命令；只有反馈连续 2 秒稳定且不高于 1.0，并经过操作者肉眼确认后，才按 collector、VR、相机、双臂、body、CAN watchdog 顺序停止程序。底层 CAN 接口和 `slcand` 保持 UP，供下一次启动复用。
+
+对应的手动流程如下。首先保持 body 和 VR 运行，明确：
 
 ```text
 当前高度：工作高位
