@@ -76,7 +76,9 @@ stop_pattern() {
   kill -INT ${pids} 2>/dev/null || true
   for _ in $(seq 1 30); do
     sleep 0.2
-    pgrep -f "${pattern}" >/dev/null || return
+    if ! pgrep -f "${pattern}" >/dev/null; then
+      return 0
+    fi
   done
   pids=$(pgrep -f "${pattern}" || true)
   if [[ -n "${pids}" ]]; then
