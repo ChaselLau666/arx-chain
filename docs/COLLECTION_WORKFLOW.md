@@ -199,3 +199,83 @@ datasets/episode_9_action_velocity.png
 - 当前仍是官方 action 逻辑：12 个手臂关节 action 等于当前 qpos，夹爪经过官方阈值处理；不是真实 joint command。
 - HDF5 没有真实时间戳，60 FPS 是采集器配置值。
 - 转换到 30 FPS LeRobot 时按索引 `0,2,4,...` 同步抽取图像、state 和 action。
+
+## 10. 一批采集结束后的安全处理
+
+### 10.1 很快继续下一批：推荐保持硬件链路运行
+
+如果平台仍在工作高位并且稍后还要继续采集，不要关闭或重启 body。先在 collector 的提示中输入 `q` 并回车，使 collector 正常退出；body、双臂、相机、VR 和 CAN 保持运行。
+
+下一批只启动 collector，不重复执行 `01_collect.sh`：
+
+```bash
+cd /home/arx/ROS2_LIFT_Play/act
+source /opt/ros/jazzy/setup.bash
+source /home/arx/LIFT/body/ROS2/install/setup.bash
+conda activate act
+
+python collect.py \
+  --episode_idx -1 \
+  --height 15.04 \
+  --task pickplace_right_to_bowl
+```
+
+collector 会从当前最大 HDF5 编号加一继续。
+
+### 10.2 完整关闭所有控制程序
+
+平台高位时禁止直接关闭 body。首先保持 body 和 VR 运行，明确：
+
+```text
+当前高度：工作高位
+目标命令：0.0
+运动方向：DOWN
+预期行为：平台下降并稳定在安全低位
+```
+
+在新终端执行：
+
+```bash
+export ROS_DOMAIN_ID=62
+source /opt/ros/jazzy/setup.bash
+source /home/arx/LIFT/body/ROS2/install/setup.bash
+
+ros2 param set /lift fixed_height 0.0
+ros2 topic echo /body_information
+```
+
+观察 `height` 持续下降。反馈稳定后按 `Ctrl+C` 退出 echo，并肉眼确认平台已经到达安全低位。
+
+然后在各启动终端按以下顺序执行 `Ctrl+C`，等待对应进程退出：
+
+1. collector（如果尚未通过 `q` 退出）；
+2. VR serial node 及 VR echo/hz 终端；
+3. 三个 RealSense 相机终端；
+4. 双臂 `v2_pos_control` 终端；
+5. body 终端，必须最后关闭；
+6. CAN watchdog 终端。
+
+关闭后确认：
+
+```bash
+ps -eo pid,args | grep -E \
+  '(lift_controller|X5Controller|serial_port_node|realsense2_camera_node|collect.py)' \
+  | grep -v grep
+```
+
+没有输出表示 ROS 控制程序已退出。
+
+默认建议保留 can1、can3、can5 的 `slcand` 和接口为 `UP`，这样同一次开机内再次执行 `01_collect.sh` 时，官方 CAN watchdog 不会进入全局 `pkill slcand` 分支。
+
+### 10.3 完整关闭后再次开始
+
+再次确认平台处于安全低位、工作区清空、急停可触达，然后：
+
+```bash
+export ROS_DOMAIN_ID=62
+export LIFT_HEIGHT=15.04
+export TASK_NAME=pickplace_right_to_bowl
+
+cd /home/arx/ROS2_LIFT_Play/tools
+./01_collect.sh
+```
