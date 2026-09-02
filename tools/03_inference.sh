@@ -24,14 +24,50 @@ for interface in can1 can3 can5; do
   fi
 done
 
+publisher_count() {
+  local topic=$1
+  local info
+  info=$(ros2 topic info "${topic}" 2>/dev/null || true)
+  awk '/^Publisher count:/{print $3; found=1} END{if (!found) print 0}' <<<"${info}"
+}
+
+has_publisher() {
+  local count
+  count=$(publisher_count "$1")
+  [[ "${count}" =~ ^[0-9]+$ ]] && (( count > 0 ))
+}
+
+wait_for_publishers() {
+  local label=$1
+  shift
+  local topic all_ready
+  for _ in $(seq 1 30); do
+    all_ready=true
+    for topic in "$@"; do
+      if ! has_publisher "${topic}"; then
+        all_ready=false
+        break
+      fi
+    done
+    if [[ "${all_ready}" == true ]]; then
+      echo "${label}: all publishers are live."
+      return 0
+    fi
+    sleep 1
+  done
+  echo "Refused: ${label} publishers did not become live within 30 seconds." >&2
+  return 1
+}
+
+arm_feedback_topics=(/arm_slave_l_status /arm_slave_r_status)
 arm_topics=0
-for topic in /arm_slave_l_status /arm_slave_r_status; do
-  ros2 topic list 2>/dev/null | grep -qx "${topic}" && arm_topics=$((arm_topics + 1))
+for topic in "${arm_feedback_topics[@]}"; do
+  has_publisher "${topic}" && arm_topics=$((arm_topics + 1))
 done
 if [[ ${arm_topics} -eq 0 ]]; then
   gnome-terminal --title="inference-arms" -- bash -ic \
     "cd /home/arx/LIFT/ARX_X5/ROS2/X5_ws; source install/setup.bash; ros2 launch arx_x5_controller open_double_arm.launch.py; exec bash"
-  sleep 2
+  wait_for_publishers "inference arms" "${arm_feedback_topics[@]}"
 elif [[ ${arm_topics} -ne 2 ]]; then
   echo "Refused: inference arm stack is partial (${arm_topics}/2 feedback topics)." >&2
   exit 1
@@ -39,15 +75,18 @@ else
   echo "Reusing running inference arm stack."
 fi
 
-camera_topics=0
+camera_image_topics=()
 for camera in camera_h camera_l camera_r; do
-  topic="/camera/${camera}/color/image_rect_raw/compressed"
-  ros2 topic list 2>/dev/null | grep -qx "${topic}" && camera_topics=$((camera_topics + 1))
+  camera_image_topics+=("/camera/${camera}/color/image_rect_raw/compressed")
+done
+camera_topics=0
+for topic in "${camera_image_topics[@]}"; do
+  has_publisher "${topic}" && camera_topics=$((camera_topics + 1))
 done
 if [[ ${camera_topics} -eq 0 ]]; then
   gnome-terminal --title="inference-cameras" -- bash -ic \
     "cd ${repo_root}/realsense; ./realsense.sh; exec bash"
-  sleep 4
+  wait_for_publishers "cameras" "${camera_image_topics[@]}"
 elif [[ ${camera_topics} -ne 3 ]]; then
   echo "Refused: camera stack is partial (${camera_topics}/3 image topics)." >&2
   exit 1
