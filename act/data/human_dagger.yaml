@@ -1,0 +1,54 @@
+schema_version: 2
+recorder_queue_size: 32
+
+ros:
+  node_name: human_dagger
+  state_topic: /human_dagger/state
+  hold_service: /human_dagger/request_hold
+  body_feedback_topic: /body_information
+  left:
+    vr_topic: /human_dagger/vr/left_raw
+    status_topic: /human_dagger/arm/left/status
+    command_topic: /human_dagger/arm/left/command
+  right:
+    vr_topic: /human_dagger/vr/right_raw
+    status_topic: /human_dagger/arm/right/status
+    command_topic: /human_dagger/arm/right/command
+
+cameras:
+  names: [camera_h, camera_l, camera_r]
+  topics:
+    camera_h: /camera/camera_h/color/image_rect_raw/compressed
+    camera_l: /camera/camera_l/color/image_rect_raw/compressed
+    camera_r: /camera/camera_r/color/image_rect_raw/compressed
+
+control:
+  rate_hz: 60
+  joint_mode: 5
+  eef_mode: 4
+  feedback_timeout_ms: 100
+  vr_timeout_ms: 100
+  camera_timeout_ms: 250
+  policy_timeout_ms: 250
+  handoff_timeout_s: 2.0
+  policy_slew_duration_s: 2.0
+  # Maximum joint/gripper change emitted per 60 Hz tick while resuming policy.
+  policy_slew_step_per_arm: [0.05, 0.05, 0.03, 0.05, 0.05, 0.05, 0.2]
+  future_timestamp_tolerance_ms: 5
+  gripper_delta_scale: -0.68
+
+episode:
+  max_timesteps: 800
+  auto_save_without_intervention: true
+  dataset_dir: dagger_datasets
+  quarantine_dir: dagger_datasets/quarantine
+  writer_flush_frames: 60
+
+keys:
+  start: r
+  takeover: space
+  resume_policy: p
+  end: e
+  save: s
+  discard: d
+  quit: q
