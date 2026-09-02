@@ -10,6 +10,7 @@ import IPython
 e = IPython.embed
 import cv2
 from scipy.spatial.transform import Rotation as R  # eef:ZXY
+from act_contract import effective_actions
 
 FILTER_MISTAKES = False  # Filter out mistakes from the dataset even if not use_language
 
@@ -61,26 +62,15 @@ class EpisodicDataset(torch.utils.data.Dataset):
         with h5py.File(dataset_path, 'r') as root:
             is_sim = root.attrs['sim']
 
-            actions = root['action']
+            actions = np.asarray(root['action'])
 
             if self.use_base:
                 actions = np.concatenate((actions, np.array(root['action_base'])), axis=1)
                 actions = np.concatenate((actions, np.array(root['action_velocity'])), axis=1)
 
-            original_action_shape = actions.shape  # [:,:7]
-            max_action_len = original_action_shape[0]  # max_episode
-            start_ts = np.random.choice(max_action_len)  # 随机抽取一个索引
-
-            states2action_step = 1
-            actions = actions[states2action_step:]  # 错开了一帧 # ,
-            last_action = actions[-1]
-            last_action = np.tile(last_action[np.newaxis, :], (states2action_step, 1))
-            actions = np.append(actions, last_action, axis=0)  # actions[-1][np.newaxis, :]
-
-            if self.add_action_output:
-                action_zero_addition = np.zeros(original_action_shape)
-                actions = np.concatenate((actions, action_zero_addition), axis=1)  # 14 -> 28 # robot base 19 -> 38
-            additional_action_shape = actions.shape
+            max_action_len = len(actions)
+            actions = effective_actions(actions, add_auxiliary=self.add_action_output)
+            start_ts = np.random.choice(max_action_len - 1)
 
             qpos = root['/observations/qpos'][start_ts]
             eef = root['/observations/eef'][start_ts]
@@ -125,21 +115,19 @@ class EpisodicDataset(torch.utils.data.Dataset):
                     decoded_image = root[f'/observations/images/{cam_name}'][start_ts]
                     image_depth_dict[cam_name] = cv2.imdecode(decoded_image, 1)
 
-            start_action = min(start_ts, max_action_len - 1)
-
-            index = max(0, start_action - self.arm_delay_time)
+            index = max(0, start_ts - self.arm_delay_time)
             action = actions[index:]  # hack, to make timesteps more aligned
 
             # if self.use_robot_base:
             #     action = np.concatenate((action, root['/action_base'][index:]), axis=1)
-            action_len = max_action_len - index  # hack, to make timesteps more aligned
+            action_len = len(action)
 
         self.is_sim = is_sim
-        padded_action = np.zeros(additional_action_shape, dtype=np.float32)
-        # print(f'{action.shape=}')
+        padded_length = max(max_action_len, self.chunk_size)
+        padded_action = np.zeros((padded_length, actions.shape[1]), dtype=np.float32)
         padded_action[:action_len] = action
-        is_pad_action = np.zeros(max_action_len)
-        is_pad_action[action_len:] = 1
+        is_pad_action = np.ones(padded_length)
+        is_pad_action[:action_len] = 0
         padded_action = padded_action[:self.chunk_size]
         is_pad_action = is_pad_action[:self.chunk_size]
 
@@ -194,15 +182,17 @@ class EpisodicDataset(torch.utils.data.Dataset):
                 base_velocity_data, action_data, is_pad_action)
 
 
-def get_IO_for_norm(qpos, eef, qvel, effort, action, policy_config):
+def get_IO_for_norm(qpos, eef, qvel, effort, action, policy_config, add_action_output=None):
     if policy_config['policy_class'] == "ACT":
         use_qvel = policy_config['use_qvel']
         use_effort = policy_config['use_effort']
-        add_action_output = True
+        if add_action_output is None:
+            add_action_output = True
     else:
         use_qvel = False
         use_effort = False
-        add_action_output = False
+        if add_action_output is None:
+            add_action_output = False
 
     joints_dim = 7
 
@@ -272,7 +262,13 @@ def get_norm_stats(dataset_dir, num_episodes, policy_config):
         except OSError as e:
             print(f"OS error when accessing file {dataset_path}: {e}")
 
-        left_states, right_states, action = get_IO_for_norm(qpos, eef, qvel, effort, action, policy_config)
+        action = effective_actions(
+            action,
+            add_auxiliary=policy_config['policy_class'] == "ACT",
+        )
+        left_states, right_states, action = get_IO_for_norm(
+            qpos, eef, qvel, effort, action, policy_config, add_action_output=False
+        )
 
         all_left_states_data.append(torch.from_numpy(left_states))
         all_right_states_data.append(torch.from_numpy(right_states))
@@ -281,61 +277,30 @@ def get_norm_stats(dataset_dir, num_episodes, policy_config):
         all_robot_head_data.append(torch.from_numpy(robot_base[:, 3:6]))
         all_robot_velocity_data.append(torch.from_numpy(base_velocity))
 
-    # 以最少的为准，多的就才减掉后面的
-    episode_len_min = min(arr.shape[0] for arr in all_left_states_data)
-    episode_len_max = max(arr.shape[0] for arr in all_left_states_data)
-    target_demo_len = episode_len_max
-
-    # print(f'{episode_len_min=}, {episode_len_max=}, {target_demo_len=}')
-    for idx in range(len(all_left_states_data)):
-        pad_left_states = torch.zeros((target_demo_len, all_left_states_data[idx].shape[1]))
-        pad_left_states[:all_left_states_data[idx].shape[0]] = all_left_states_data[idx]
-        all_left_states_data[idx] = pad_left_states
-
-        pad_right_states = torch.zeros((target_demo_len, all_right_states_data[idx].shape[1]))
-        pad_right_states[:all_right_states_data[idx].shape[0]] = all_right_states_data[idx]
-        all_right_states_data[idx] = pad_right_states
-
-        pad_action = torch.zeros((target_demo_len, all_action_data[idx].shape[1]))
-        pad_action[:all_action_data[idx].shape[0]] = all_action_data[idx]
-        all_action_data[idx] = pad_action
-
-        pad_action_base = torch.zeros((target_demo_len, all_robot_base_data[idx].shape[1]))
-        pad_action_base[:all_robot_base_data[idx].shape[0]] = all_robot_base_data[idx]
-        all_robot_base_data[idx] = pad_action_base
-
-        pad_action_head = torch.zeros((target_demo_len, all_robot_head_data[idx].shape[1]))
-        pad_action_head[:all_robot_head_data[idx].shape[0]] = all_robot_head_data[idx]
-        all_robot_head_data[idx] = pad_action_head
-
-        pad_action_velocity = torch.zeros((target_demo_len, all_robot_velocity_data[idx].shape[1]))
-        pad_action_velocity[:all_robot_velocity_data[idx].shape[0]] = all_robot_velocity_data[idx]
-        all_robot_velocity_data[idx] = pad_action_velocity
-
-    all_left_states_data = torch.stack(all_left_states_data)  # (50, 600, 14)
-    all_right_states_data = torch.stack(all_right_states_data)  # (50, 600, 14)
-    all_robot_base_data = torch.stack(all_robot_base_data)
-    all_robot_head_data = torch.stack(all_robot_head_data)
-    all_robot_velocity_data = torch.stack(all_robot_velocity_data)
-    all_action_data = torch.stack(all_action_data)  # (50, 600, 14)
+    all_left_states_data = torch.cat(all_left_states_data, dim=0)
+    all_right_states_data = torch.cat(all_right_states_data, dim=0)
+    all_robot_base_data = torch.cat(all_robot_base_data, dim=0)
+    all_robot_head_data = torch.cat(all_robot_head_data, dim=0)
+    all_robot_velocity_data = torch.cat(all_robot_velocity_data, dim=0)
+    all_action_data = torch.cat(all_action_data, dim=0)
 
     # normalize action data
-    action_mean = all_action_data.mean(dim=[0, 1], keepdim=True)
-    action_std = all_action_data.std(dim=[0, 1], keepdim=True)
+    action_mean = all_action_data.mean(dim=0, keepdim=True)
+    action_std = all_action_data.std(dim=0, keepdim=True)
     action_std = torch.clip(action_std, 1e-2, np.inf)  # clipping
 
-    left_states_mean = all_left_states_data.mean(dim=[0, 1], keepdim=True)  # [1, 1, states_dim]
-    left_states_std = all_left_states_data.std(dim=[0, 1], keepdim=True)  # [1, 1, states_dim]
-    right_states_mean = all_right_states_data.mean(dim=[0, 1], keepdim=True)  # [1, 1, states_dim]
-    right_states_std = all_right_states_data.std(dim=[0, 1], keepdim=True)  # [1, 1, states_dim]
-    robot_head_mean = all_robot_head_data.mean(dim=[0, 1, 2], keepdim=True)  # [1, 1, states_dim]
-    robot_head_std = all_robot_head_data.std(dim=[0, 1, 2], keepdim=True)  # [1, 1, states_dim]
+    left_states_mean = all_left_states_data.mean(dim=0, keepdim=True)
+    left_states_std = all_left_states_data.std(dim=0, keepdim=True)
+    right_states_mean = all_right_states_data.mean(dim=0, keepdim=True)
+    right_states_std = all_right_states_data.std(dim=0, keepdim=True)
+    robot_head_mean = all_robot_head_data.mean(dim=0, keepdim=True)
+    robot_head_std = all_robot_head_data.std(dim=0, keepdim=True)
 
     # pilts proces
-    robot_base_mean = all_robot_base_data.mean(dim=[0, 1], keepdim=True)  # [1, 1, states_dim]
-    robot_base_std = all_robot_base_data.std(dim=[0, 1], keepdim=True)  # [1, 1, states_dim]
-    base_velocity_mean = all_robot_velocity_data.mean(dim=[0, 1], keepdim=True)
-    base_velocity_std = all_robot_velocity_data.std(dim=[0, 1], keepdim=True)
+    robot_base_mean = all_robot_base_data.mean(dim=0, keepdim=True)
+    robot_base_std = all_robot_base_data.std(dim=0, keepdim=True)
+    base_velocity_mean = all_robot_velocity_data.mean(dim=0, keepdim=True)
+    base_velocity_std = all_robot_velocity_data.std(dim=0, keepdim=True)
 
     left_states_std = torch.clip(left_states_std, 1e-2, np.inf)  # clipping，
     right_states_std = torch.clip(right_states_std, 1e-2, np.inf)  # clipping，

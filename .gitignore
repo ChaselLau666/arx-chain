@@ -138,4 +138,7 @@ AMENT_IGNORE
 
 **/datasets
 **/weights
+**/runs
+**/dataset_views
+**/data_review
 **/test

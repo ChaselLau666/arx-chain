@@ -36,7 +36,7 @@ ip -br link show can5
 
 ```bash
 export ROS_DOMAIN_ID=62
-export LIFT_HEIGHT=15.04
+export LIFT_HEIGHT=15.5
 export TASK_NAME=pickplace_right_to_bowl
 ```
 
@@ -49,7 +49,7 @@ export TASK_NAME=pickplace_right_to_bowl
 ```bash
 python collect.py \
   --episode_idx -1 \
-  --height 15.04 \
+  --height 15.5 \
   --task pickplace_right_to_bowl
 ```
 
@@ -80,9 +80,9 @@ cd /home/arx/ROS2_LIFT_Play/tools
 正常输出包括：
 
 ```text
-/lift fixed_height set to 15.040000
-Lift feedback settled at ... for command 15.040000
-Fixed lift ready: command=15.040000, feedback=...
+/lift fixed_height set to 15.500000
+Lift feedback settled at ... for command 15.500000
+Fixed lift ready: command=15.500000, feedback=...
 ```
 
 ## 4. 开始一条 episode
@@ -224,7 +224,7 @@ conda activate act
 
 python collect.py \
   --episode_idx -1 \
-  --height 15.04 \
+  --height 15.5 \
   --task pickplace_right_to_bowl
 ```
 
@@ -305,9 +305,11 @@ ps -eo pid,args | grep -E \
 
 ```bash
 export ROS_DOMAIN_ID=62
-export LIFT_HEIGHT=15.04
+export LIFT_HEIGHT=15.5
 export TASK_NAME=pickplace_right_to_bowl
 
 cd /home/arx/ROS2_LIFT_Play/tools
 ./01_collect.sh
 ```
+
+官方 ACT 的范围训练、4090 环境、`episode_50` 开环回放和安全 dry-run 见 [ACT_RANGE_TRAINING.md](ACT_RANGE_TRAINING.md)。
