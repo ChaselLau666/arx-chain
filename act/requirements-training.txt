@@ -10,3 +10,5 @@ einops==0.8.2
 PyYAML==6.0.3
 tqdm==4.70.0
 nvidia-ml-py
+termcolor
+imageio
