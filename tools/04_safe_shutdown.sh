@@ -79,6 +79,7 @@ manifest_has_live_label() {
 
 tracked_session=false
 tracked_arm_running=false
+tracked_commander_running=false
 resolved_manifest=''
 if [[ -e "$active_manifest" || -L "$active_manifest" ]]; then
   resolved_manifest=$(readlink "$active_manifest" 2>/dev/null || printf '%s' "$active_manifest")
@@ -89,6 +90,11 @@ if [[ -e "$active_manifest" || -L "$active_manifest" ]]; then
       || manifest_has_live_label "$resolved_manifest" arm_right; then
       tracked_arm_running=true
     fi
+    for commander in frontend coordinator policy; do
+      if manifest_has_live_label "$resolved_manifest" "$commander"; then
+        tracked_commander_running=true
+      fi
+    done
   fi
 fi
 
@@ -131,14 +137,18 @@ if timeout 3 ros2 service list 2>/dev/null | grep -qx '/human_dagger/request_hol
     exit 1
   fi
   echo "Human DAgger HOLD acknowledged."
-elif [[ "$dagger_process_running" == true || "$tracked_arm_running" == true ]]; then
-  if [[ "$tracked_arm_running" == true ]]; then
-    echo "Refused: a verified tracked arm is still running, but /human_dagger/request_hold is unavailable." >&2
-  else
-    echo "Refused: human_dagger.py is running but /human_dagger/request_hold is unavailable." >&2
-  fi
+elif [[ "$dagger_process_running" == true ]]; then
+  echo "Refused: human_dagger.py is running but /human_dagger/request_hold is unavailable." >&2
   echo "Use the physical emergency stop if arm motion is not already stopped." >&2
   exit 1
+elif [[ "$tracked_arm_running" == true && "$tracked_commander_running" == true ]]; then
+  echo "Refused: a verified tracked arm is still running, but /human_dagger/request_hold is unavailable." >&2
+  echo "Use the physical emergency stop if arm motion is not already stopped." >&2
+  exit 1
+elif [[ "$tracked_arm_running" == true ]]; then
+  echo "Tracked arms are running, but every command source (frontend/coordinator/policy)"
+  echo "in this session manifest has exited: the arms are idle with no commander."
+  echo "Proceeding with the crash-recovery shutdown of this session."
 else
   echo "Human DAgger service is not active; continuing with legacy-stack shutdown checks."
 fi

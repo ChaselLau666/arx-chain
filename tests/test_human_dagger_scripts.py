@@ -155,12 +155,12 @@ class HumanDaggerScriptTests(unittest.TestCase):
         self.assertIn('Human DAgger HOLD acknowledged', self.shutdown)
         self.assertIn('human_dagger.py', self.shutdown)
 
-    def test_live_tracked_arm_requires_hold_service_even_without_frontend(self):
+    def test_live_tracked_arm_requires_hold_service_while_commanded(self):
         arm_check = self.shutdown.index(
             'manifest_has_live_label "$resolved_manifest" arm_left'
         )
         missing_service_guard = self.shutdown.index(
-            '|| "$tracked_arm_running" == true'
+            '"$tracked_arm_running" == true && "$tracked_commander_running" == true'
         )
         lower = self.shutdown.index('ros2 param set /lift fixed_height 0.0')
         self.assertLess(arm_check, missing_service_guard)
@@ -172,6 +172,12 @@ class HumanDaggerScriptTests(unittest.TestCase):
         self.assertIn(
             'a verified tracked arm is still running', self.shutdown
         )
+        # A commander (frontend/coordinator/policy) that is still alive must
+        # keep the hard refusal; only a fully commander-less session may take
+        # the crash-recovery path.
+        for commander in ("frontend", "coordinator", "policy"):
+            self.assertIn(commander, self.shutdown)
+        self.assertIn('crash-recovery shutdown', self.shutdown)
 
     def test_hold_service_can_receive_post_publish_feedback(self):
         self.assertIn('ReentrantCallbackGroup', self.entrypoint)
