@@ -140,6 +140,6 @@ ros2 topic info /camera/camera_l/color/image_rect_raw/compressed
 ros2 topic info /camera/camera_r/color/image_rect_raw/compressed
 ```
 
-每路必须显示 `Publisher count: 1`。默认 dry-run 下机器人不运动是正确行为；只有日志持续打印 `DRY-RUN action[0:14]` 才表示模型链路已经运行。
+每路必须显示 `Publisher count: 1`。启动脚本不能用 ROS graph 中可能残留的 topic/publisher 判断是否复用硬件栈；双臂必须同时存在两个加载 `v2_joint_control.yaml` 的 X5Controller 实际进程，相机必须存在零个或三个实际进程。默认 dry-run 下机器人不运动是正确行为；只有日志持续打印 `DRY-RUN action[0:14]` 才表示模型链路已经运行。
 
 真机执行必须额外提供经过审核的 14 维关节限位 YAML，并显式使用 `--execute --joint-limits ...`。当前没有审核过的限位文件，因此禁止真机执行。

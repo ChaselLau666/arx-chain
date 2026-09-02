@@ -60,37 +60,38 @@ wait_for_publishers() {
 }
 
 arm_feedback_topics=(/arm_slave_l_status /arm_slave_r_status)
-arm_topics=0
-for topic in "${arm_feedback_topics[@]}"; do
-  has_publisher "${topic}" && arm_topics=$((arm_topics + 1))
-done
-if [[ ${arm_topics} -eq 0 ]]; then
+arm_pids=$(pgrep -f '/arx_x5_controller/[X]5Controller' || true)
+arm_processes=$(wc -w <<<"${arm_pids}")
+v2_arm_pids=$(pgrep -f '/arx_x5_controller/[X]5Controller.*v2_joint_control.yaml' || true)
+v2_arm_processes=$(wc -w <<<"${v2_arm_pids}")
+if [[ ${arm_processes} -eq 0 ]]; then
   gnome-terminal --title="inference-arms" -- bash -ic \
     "cd /home/arx/LIFT/ARX_X5/ROS2/X5_ws; source install/setup.bash; ros2 launch arx_x5_controller v2_joint_control.launch.py; exec bash"
   wait_for_publishers "inference arms" "${arm_feedback_topics[@]}"
-elif [[ ${arm_topics} -ne 2 ]]; then
-  echo "Refused: inference arm stack is partial (${arm_topics}/2 feedback topics)." >&2
+elif [[ ${arm_processes} -ne 2 || ${v2_arm_processes} -ne 2 ]]; then
+  echo "Refused: expected exactly two v2_joint_control X5Controller processes; " \
+       "found ${arm_processes} arm processes (${v2_arm_processes} v2)." >&2
   exit 1
 else
-  echo "Reusing running inference arm stack."
+  wait_for_publishers "running inference arms" "${arm_feedback_topics[@]}"
+  echo "Reusing two running v2 inference arm controllers."
 fi
 
 camera_image_topics=()
 for camera in camera_h camera_l camera_r; do
   camera_image_topics+=("/camera/${camera}/color/image_rect_raw/compressed")
 done
-camera_topics=0
-for topic in "${camera_image_topics[@]}"; do
-  has_publisher "${topic}" && camera_topics=$((camera_topics + 1))
-done
-if [[ ${camera_topics} -eq 0 ]]; then
+camera_pids=$(pgrep -f '/realsense2_camera/[r]ealsense2_camera_node' || true)
+camera_processes=$(wc -w <<<"${camera_pids}")
+if [[ ${camera_processes} -eq 0 ]]; then
   gnome-terminal --title="inference-cameras" -- bash -ic \
     "cd ${repo_root}/realsense; ./realsense.sh; exec bash"
   wait_for_publishers "cameras" "${camera_image_topics[@]}"
-elif [[ ${camera_topics} -ne 3 ]]; then
-  echo "Refused: camera stack is partial (${camera_topics}/3 image topics)." >&2
+elif [[ ${camera_processes} -ne 3 ]]; then
+  echo "Refused: expected zero or three RealSense processes; found ${camera_processes}." >&2
   exit 1
 else
+  wait_for_publishers "running cameras" "${camera_image_topics[@]}"
   echo "Reusing three running cameras."
 fi
 
