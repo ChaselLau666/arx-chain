@@ -137,6 +137,7 @@ COLCON_IGNORE
 AMENT_IGNORE
 
 **/datasets
+**/dagger_datasets
 **/weights
 **/runs
 **/dataset_views
