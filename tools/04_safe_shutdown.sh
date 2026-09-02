@@ -94,7 +94,7 @@ stop_pattern "VR serial launcher" '/opt/ros/jazzy/bin/ros2 run serial_port seria
 stop_pattern "VR serial node" '/serial_port_node$'
 stop_pattern "RealSense launchers" '/opt/ros/jazzy/bin/ros2 launch realsense2_camera rs_launch.py'
 stop_pattern "RealSense nodes" '/realsense2_camera_node'
-stop_pattern "arm launcher" '/opt/ros/jazzy/bin/ros2 launch arx_x5_controller (v2_pos_control|open_double_arm).launch.py'
+stop_pattern "arm launcher" '/opt/ros/jazzy/bin/ros2 launch arx_x5_controller (v2_pos_control|v2_joint_control|open_double_arm).launch.py'
 stop_pattern "arm nodes" '/arx_x5_controller/X5Controller'
 stop_pattern "body launcher" '/opt/ros/jazzy/bin/ros2 launch arx_lift_controller lift.launch.py'
 stop_pattern "body node" '/arx_lift_controller/lift_controller'

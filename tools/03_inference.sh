@@ -66,7 +66,7 @@ for topic in "${arm_feedback_topics[@]}"; do
 done
 if [[ ${arm_topics} -eq 0 ]]; then
   gnome-terminal --title="inference-arms" -- bash -ic \
-    "cd /home/arx/LIFT/ARX_X5/ROS2/X5_ws; source install/setup.bash; ros2 launch arx_x5_controller open_double_arm.launch.py; exec bash"
+    "cd /home/arx/LIFT/ARX_X5/ROS2/X5_ws; source install/setup.bash; ros2 launch arx_x5_controller v2_joint_control.launch.py; exec bash"
   wait_for_publishers "inference arms" "${arm_feedback_topics[@]}"
 elif [[ ${arm_topics} -ne 2 ]]; then
   echo "Refused: inference arm stack is partial (${arm_topics}/2 feedback topics)." >&2
