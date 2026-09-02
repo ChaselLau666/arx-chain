@@ -130,4 +130,14 @@ cd /home/arx/ROS2_LIFT_Play/tools
 
 dry-run 不创建双臂或 `/body_control` publisher，只打印模型 action。checkpoint 契约、相机顺序、14/28 维关系、action semantics 或高度不一致时直接拒绝。
 
+如果出现 `there is no head queue`（或 left/right wrist queue），表示推理订阅存在但对应图像没有实时 publisher。`03_inference.sh` 必须按 `Publisher count > 0` 判断双臂和三相机是否在线，并在启动后等待全部 publisher 就绪；不能仅凭 ROS daemon 中残留的 topic 名复用旧栈。检查命令：
+
+```bash
+ros2 topic info /camera/camera_h/color/image_rect_raw/compressed
+ros2 topic info /camera/camera_l/color/image_rect_raw/compressed
+ros2 topic info /camera/camera_r/color/image_rect_raw/compressed
+```
+
+每路必须显示 `Publisher count: 1`。默认 dry-run 下机器人不运动是正确行为；只有日志持续打印 `DRY-RUN action[0:14]` 才表示模型链路已经运行。
+
 真机执行必须额外提供经过审核的 14 维关节限位 YAML，并显式使用 `--execute --joint-limits ...`。当前没有审核过的限位文件，因此禁止真机执行。
