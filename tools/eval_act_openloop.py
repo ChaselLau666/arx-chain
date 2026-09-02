@@ -96,7 +96,9 @@ def official_temporal_action(
     return np.sum(candidates * weights[:, None], axis=0)
 
 
-def evaluate_run(label: str, run_dir: Path, episode: dict, output_root: Path) -> dict:
+def evaluate_run(
+    label: str, run_dir: Path, episode: dict, episode_name: str, output_root: Path
+) -> dict:
     contract_path = run_dir / "data_contract.yaml"
     stats_path = run_dir / "dataset_stats.pkl"
     checkpoint_path = run_dir / "policy_best.ckpt"
@@ -132,11 +134,11 @@ def evaluate_run(label: str, run_dir: Path, episode: dict, output_root: Path) ->
         raise FileExistsError(f"refused to overwrite evaluation output: {run_output}")
     run_output.mkdir(parents=True)
     writer = cv2.VideoWriter(
-        str(run_output / "episode_50_openloop.mp4"),
+        str(run_output / f"{episode_name}_openloop.mp4"),
         cv2.VideoWriter_fourcc(*"mp4v"), SOURCE_FPS, (960, 240),
     )
     if not writer.isOpened():
-        raise RuntimeError("failed to open episode_50_openloop.mp4")
+        raise RuntimeError(f"failed to open {episode_name}_openloop.mp4")
 
     with torch.inference_mode():
         for timestep in range(timesteps):
@@ -157,7 +159,7 @@ def evaluate_run(label: str, run_dir: Path, episode: dict, output_root: Path) ->
             cv2.rectangle(frame, (0, 0), (960, 28), (0, 0, 0), -1)
             cv2.putText(
                 frame,
-                f"{label} episode_50 frame {timestep}/{timesteps - 1}",
+                f"{label} {episode_name} frame {timestep}/{timesteps - 1}",
                 (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA,
             )
             writer.write(frame)
@@ -174,7 +176,7 @@ def evaluate_run(label: str, run_dir: Path, episode: dict, output_root: Path) ->
         axis.grid(True)
     axes.flat[0].legend()
     fig.tight_layout()
-    fig.savefig(run_output / "episode_50_joint_overlay.png", dpi=160)
+    fig.savefig(run_output / f"{episode_name}_joint_overlay.png", dpi=160)
     plt.close(fig)
 
     fig, axes = plt.subplots(2, 1, figsize=(12, 7), sharex=True)
@@ -186,7 +188,7 @@ def evaluate_run(label: str, run_dir: Path, episode: dict, output_root: Path) ->
         axis.grid(True)
         axis.legend()
     fig.tight_layout()
-    fig.savefig(run_output / "episode_50_gripper_overlay.png", dpi=160)
+    fig.savefig(run_output / f"{episode_name}_gripper_overlay.png", dpi=160)
     plt.close(fig)
 
     gripper_accuracy = {
@@ -198,6 +200,7 @@ def evaluate_run(label: str, run_dir: Path, episode: dict, output_root: Path) ->
     }
     metrics = {
         "label": label,
+        "episode": episode_name,
         "frames": timesteps,
         "source_fps": SOURCE_FPS,
         "joint_mae": {JOINT_NAMES[i]: float(np.mean(np.abs(error[:, i]))) for i in JOINT_INDICES},
@@ -215,14 +218,14 @@ def evaluate_run(label: str, run_dir: Path, episode: dict, output_root: Path) ->
         "model_action_dim": model_dim,
         "effective_action_semantics": EFFECTIVE_ACTION_SEMANTICS,
     }
-    (run_output / "episode_50_error.json").write_text(
+    (run_output / f"{episode_name}_error.json").write_text(
         json.dumps(metrics, indent=2), encoding="utf-8"
     )
 
     return metrics
 
 
-def comparison_plot(metrics: list[dict], output_root: Path) -> None:
+def comparison_plot(metrics: list[dict], episode_name: str, output_root: Path) -> None:
     labels = [item["label"] for item in metrics]
     joint_mae = [float(np.mean(list(item["joint_mae"].values()))) for item in metrics]
     gripper_accuracy = [
@@ -230,14 +233,14 @@ def comparison_plot(metrics: list[dict], output_root: Path) -> None:
     ]
     fig, axes = plt.subplots(1, 2, figsize=(11, 4))
     axes[0].bar(labels, joint_mae)
-    axes[0].set_title("episode_50 mean joint MAE")
+    axes[0].set_title(f"{episode_name} mean joint MAE")
     axes[0].grid(True, axis="y")
     axes[1].bar(labels, gripper_accuracy)
     axes[1].set_ylim(0, 1)
-    axes[1].set_title("episode_50 mean gripper accuracy")
+    axes[1].set_title(f"{episode_name} mean gripper accuracy")
     axes[1].grid(True, axis="y")
     fig.tight_layout()
-    fig.savefig(output_root / "episode_50_model_comparison.png", dpi=160)
+    fig.savefig(output_root / f"{episode_name}_model_comparison.png", dpi=160)
     plt.close(fig)
 
 
@@ -251,9 +254,14 @@ def main() -> int:
     if output_root.exists():
         raise FileExistsError(f"refused to overwrite output directory: {output_root}")
     output_root.mkdir(parents=True)
-    episode = load_episode(args.episode.resolve())
-    metrics = [evaluate_run(label, path, episode, output_root) for label, path in args.run]
-    comparison_plot(metrics, output_root)
+    episode_path = args.episode.resolve()
+    episode_name = episode_path.stem
+    episode = load_episode(episode_path)
+    metrics = [
+        evaluate_run(label, path, episode, episode_name, output_root)
+        for label, path in args.run
+    ]
+    comparison_plot(metrics, episode_name, output_root)
     (output_root / "summary.json").write_text(
         json.dumps(metrics, indent=2), encoding="utf-8"
     )
