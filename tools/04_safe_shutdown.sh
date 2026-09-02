@@ -2,7 +2,8 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-export ROS_DOMAIN_ID=62
+# Domain must come from the machine (/etc/environment); see 05_human_dagger.sh.
+: "${ROS_DOMAIN_ID:?ROS_DOMAIN_ID is not set. The robot identity lives in /etc/environment (ark-1=62, ark-2=63); refusing to guess which robot to talk to}"
 
 set +u
 source /opt/ros/jazzy/setup.bash
@@ -42,6 +43,30 @@ manifest_has_live_processes() {
   return 1
 }
 
+manifest_matches_this_machine() {
+  # A manifest created on another robot, or under another ROS domain, must
+  # never drive shutdown here: /lift in that graph is a different machine.
+  local candidate=$1 recorded_host recorded_domain
+  [[ -f "$candidate" ]] || return 1
+  recorded_host=$(sed -n 's/^# hostname=//p' "$candidate" | head -n1)
+  recorded_domain=$(sed -n 's/^# ros_domain_id=//p' "$candidate" | head -n1)
+  if [[ -z "$recorded_host" || -z "$recorded_domain" ]]; then
+    echo "Refused: session manifest lacks hostname/ros_domain_id provenance: ${candidate}" >&2
+    echo "It predates cross-robot guarding; verify the stack by hand and use" >&2
+    echo "HUMAN_DAGGER_ALLOW_LEGACY_SHUTDOWN=1 for the legacy path instead." >&2
+    return 1
+  fi
+  if [[ "$recorded_host" != "$(hostname)" ]]; then
+    echo "Refused: manifest was created on ${recorded_host}; this machine is $(hostname)." >&2
+    return 1
+  fi
+  if [[ "$recorded_domain" != "$ROS_DOMAIN_ID" ]]; then
+    echo "Refused: manifest ROS_DOMAIN_ID=${recorded_domain} != current ${ROS_DOMAIN_ID}." >&2
+    return 1
+  fi
+  return 0
+}
+
 manifest_has_live_label() {
   local candidate=$1 wanted=$2 label pid ticks
   [[ -f "$candidate" ]] || return 1
@@ -57,7 +82,8 @@ tracked_arm_running=false
 resolved_manifest=''
 if [[ -e "$active_manifest" || -L "$active_manifest" ]]; then
   resolved_manifest=$(readlink "$active_manifest" 2>/dev/null || printf '%s' "$active_manifest")
-  if manifest_has_live_processes "$resolved_manifest"; then
+  if manifest_has_live_processes "$resolved_manifest" \
+    && manifest_matches_this_machine "$resolved_manifest"; then
     tracked_session=true
     if manifest_has_live_label "$resolved_manifest" arm_left \
       || manifest_has_live_label "$resolved_manifest" arm_right; then

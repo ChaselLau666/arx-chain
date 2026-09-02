@@ -50,7 +50,11 @@ class HumanDaggerScriptTests(unittest.TestCase):
     def test_start_uses_script_location_and_dedicated_domain(self):
         self.assertIn('dirname "${BASH_SOURCE[0]}"', self.start)
         self.assertIn('repo_root="$(cd "${script_dir}/.." && pwd)"', self.start)
-        self.assertIn('export ROS_DOMAIN_ID=62', self.start)
+        # The domain is the machine identity and must never be hardcoded in the
+        # repo: both robots share one LAN, and a wrong domain drives the other
+        # robot. The script must refuse to run without an externally set value.
+        self.assertIn('${ROS_DOMAIN_ID:?', self.start)
+        self.assertNotIn('export ROS_DOMAIN_ID=62', self.start)
         self.assertNotIn('workspace=$(pwd)', self.start)
 
     def test_known_arm_owners_are_rejected(self):
@@ -142,7 +146,12 @@ class HumanDaggerScriptTests(unittest.TestCase):
         hold = self.shutdown.index('/human_dagger/request_hold')
         lower = self.shutdown.index('ros2 param set /lift fixed_height 0.0')
         self.assertLess(hold, lower)
-        self.assertIn('export ROS_DOMAIN_ID=62', self.shutdown)
+        self.assertIn('${ROS_DOMAIN_ID:?', self.shutdown)
+        self.assertNotIn('export ROS_DOMAIN_ID=62', self.shutdown)
+        # Shutdown must refuse a manifest recorded on another machine or domain.
+        self.assertIn('manifest_matches_this_machine', self.shutdown)
+        self.assertIn('# hostname=', self.shutdown)
+        self.assertIn('# ros_domain_id=', self.shutdown)
         self.assertIn('Human DAgger HOLD acknowledged', self.shutdown)
         self.assertIn('human_dagger.py', self.shutdown)
 

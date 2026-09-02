@@ -2,7 +2,9 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-export ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-62}
+# Domain must come from the machine (/etc/environment); a default would let
+# this script silently join another robot's graph on a shared LAN.
+: "${ROS_DOMAIN_ID:?ROS_DOMAIN_ID is not set. The robot identity lives in /etc/environment (ark-1=62, ark-2=63); refusing to guess which robot to talk to}"
 : "${CKPT_DIR:?Set CKPT_DIR to the selected ACT run directory}"
 : "${CKPT_NAME:=policy_best.ckpt}"
 : "${LIFT_HEIGHT:=15.5}"

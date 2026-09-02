@@ -9,7 +9,8 @@ set -euo pipefail
 # terminal so Ctrl+C reaches it directly.
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-export ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-62}
+# Domain must come from the machine (/etc/environment); see 03_inference.sh.
+: "${ROS_DOMAIN_ID:?ROS_DOMAIN_ID is not set. The robot identity lives in /etc/environment (ark-1=62, ark-2=63); refusing to guess which robot to talk to}"
 : "${EPISODE:?Set EPISODE to the recorded HDF5, for example datasets/episode_19.hdf5}"
 
 set +u

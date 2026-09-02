@@ -4,8 +4,10 @@ set -Eeuo pipefail
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/.." && pwd)"
 
-# Human DAgger uses a dedicated ROS graph. Do not inherit a stale shell value.
-export ROS_DOMAIN_ID=62
+# The ROS domain is this robot's identity and must come from the machine
+# (/etc/environment), never from the repo: hardcoding it once drove another
+# robot's lift on a shared LAN.
+: "${ROS_DOMAIN_ID:?ROS_DOMAIN_ID is not set. The robot identity lives in /etc/environment (ark-1=62, ark-2=63); refusing to guess which robot to talk to}"
 
 : "${TASK_NAME:?Set TASK_NAME, for example pickplace_right_to_bowl}"
 : "${LIFT_HEIGHT:?Set LIFT_HEIGHT to the fixed lift command in [0, 20]}"
@@ -260,6 +262,8 @@ chmod 700 "$session_dir" "$log_dir"
   printf '# session_id=%s\n' "$session_id"
   printf '# repo_root=%s\n' "$repo_root"
   printf '# started_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  printf '# hostname=%s\n' "$(hostname)"
+  printf '# ros_domain_id=%s\n' "$ROS_DOMAIN_ID"
   printf '# columns=label<TAB>pid<TAB>linux_proc_start_ticks\n'
 } > "$manifest"
 ln -s "$manifest" "$active_manifest"
