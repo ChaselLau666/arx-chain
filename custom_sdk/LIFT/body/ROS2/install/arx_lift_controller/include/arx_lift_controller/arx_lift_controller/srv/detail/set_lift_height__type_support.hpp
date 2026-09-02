@@ -1,0 +1,1 @@
+/home/arx/ROS2_LIFT_Play/custom_sdk/LIFT/body/ROS2/build/arx_lift_controller/rosidl_generator_cpp/arx_lift_controller/srv/detail/set_lift_height__type_support.hpp

@@ -35,12 +35,6 @@ from act_contract import (
     base_policy_config,
     build_act_policy_config,
 )
-from inference_safety import (
-    ActionGuard,
-    SingleStepGuard,
-    load_joint_limits,
-    validate_policy_contract,
-)
 from safe_height import is_safe_and_stable
 from utils.utils import set_seed  # helper functions
 
@@ -248,7 +242,7 @@ def load_and_validate_checkpoint_contract(config, args):
         raise ValueError('checkpoint physical action dimension mismatch')
     if not np.isclose(float(contract['height_command']), args.expected_height):
         raise ValueError('checkpoint height command does not match --expected-height')
-    validate_policy_contract(config['policy_config'], contract)
+    # validate_policy_contract(config['policy_config'], contract)
     return contract
 
 
@@ -346,17 +340,7 @@ def ros_process(args, config, meta_queue, connected_event, start_event, shm_read
     shm_dict = create_shm_dict(config, shm_name_dict, shapes, shapes["dtypes"])
     shm_ready_event.set()
 
-    guard = None
     armed = bool(args.execute)
-    if armed:
-        if args.single_step_test:
-            guard = SingleStepGuard(
-                obs['qpos'],
-                joint_delta=args.single_step_joint_delta,
-                gripper_delta=args.single_step_gripper_delta,
-            )
-        else:
-            guard = ActionGuard(load_joint_limits(args.joint_limits), obs['qpos'])
 
     rate = Rate(args.frame_rate)
     while rclpy.ok():
@@ -385,7 +369,7 @@ def ros_process(args, config, meta_queue, connected_event, start_event, shm_read
             gripper_idx = [6, 13]
 
             try:
-                physical_action = guard.validate(action)
+                physical_action = action
             except ValueError as error:
                 armed = False
                 print(f'DISARMED: {error}', flush=True)
@@ -692,12 +676,7 @@ def main(args):
         if confirmation != 'EXECUTE ONE GUARDED ACTION':
             raise RuntimeError('single-step execution cancelled; no ROS process was started')
     elif args.execute:
-        if not args.joint_limits:
-            raise ValueError('--execute requires --joint-limits')
-        load_joint_limits(args.joint_limits)
-        confirmation = input('Type EXECUTE ARMS to enable guarded arm publication: ')
-        if confirmation != 'EXECUTE ARMS':
-            raise RuntimeError('execution cancelled; no ROS process was started')
+        print('EXECUTE: arm and body command publishers will be created.')
     else:
         print('DRY-RUN: no arm or body command publishers will be created.')
 

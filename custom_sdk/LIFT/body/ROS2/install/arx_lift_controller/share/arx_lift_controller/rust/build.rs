@@ -1,0 +1,1 @@
+/home/arx/ROS2_LIFT_Play/custom_sdk/LIFT/body/ROS2/build/arx_lift_controller/rosidl_generator_rs/arx_lift_controller/rust/build.rs

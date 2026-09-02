@@ -1,0 +1,56 @@
+{
+  "type_description_msg": {
+    "type_description": {
+      "type_name": "arm_control/msg/JointControl",
+      "fields": [
+        {
+          "name": "joint_pos",
+          "type": {
+            "type_id": 58,
+            "capacity": 8,
+            "string_capacity": 0,
+            "nested_type_name": ""
+          },
+          "default_value": ""
+        },
+        {
+          "name": "joint_vel",
+          "type": {
+            "type_id": 58,
+            "capacity": 8,
+            "string_capacity": 0,
+            "nested_type_name": ""
+          },
+          "default_value": ""
+        },
+        {
+          "name": "joint_cur",
+          "type": {
+            "type_id": 58,
+            "capacity": 8,
+            "string_capacity": 0,
+            "nested_type_name": ""
+          },
+          "default_value": ""
+        },
+        {
+          "name": "mode",
+          "type": {
+            "type_id": 6,
+            "capacity": 0,
+            "string_capacity": 0,
+            "nested_type_name": ""
+          },
+          "default_value": ""
+        }
+      ]
+    },
+    "referenced_type_descriptions": []
+  },
+  "type_hashes": [
+    {
+      "type_name": "arm_control/msg/JointControl",
+      "hash_string": "RIHS01_07ec287115cbd0296d66e36ce188485ac055afd7ff006b7803571a3d156367f6"
+    }
+  ]
+}

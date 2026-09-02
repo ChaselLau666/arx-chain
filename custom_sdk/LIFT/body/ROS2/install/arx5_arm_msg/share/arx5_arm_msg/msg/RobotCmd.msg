@@ -1,0 +1,1 @@
+/home/arx/ROS2_LIFT_Play/custom_sdk/LIFT/body/ROS2/src/arxmsgros2/arx5_arm_msg/msg/RobotCmd.msg

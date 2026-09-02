@@ -1,0 +1,1 @@
+/home/arx/ROS2_LIFT_Play/custom_sdk/LIFT/body/ROS2/build/arx_lift_controller/rosidl_cmake/rosidl_cmake_export_typesupport_targets-extras.cmake

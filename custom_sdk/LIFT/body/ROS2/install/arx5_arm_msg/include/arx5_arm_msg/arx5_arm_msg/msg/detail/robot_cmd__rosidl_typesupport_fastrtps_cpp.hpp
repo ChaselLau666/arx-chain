@@ -1,0 +1,1 @@
+/home/arx/ROS2_LIFT_Play/custom_sdk/LIFT/body/ROS2/build/arx5_arm_msg/rosidl_typesupport_fastrtps_cpp/arx5_arm_msg/msg/detail/robot_cmd__rosidl_typesupport_fastrtps_cpp.hpp
