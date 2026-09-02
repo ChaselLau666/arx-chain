@@ -29,6 +29,7 @@ from copy import deepcopy
 from utils.ros_operator import Rate, RosOperator
 from utils.setup_loader import setup_loader
 from collection_ui import TerminalKeyReader, prompt_episode_decision, prompt_start_decision
+from lift_height import configure_fixed_height
 
 np.set_printoptions(linewidth=200)
 
@@ -39,65 +40,6 @@ voice_engine.setProperty('rate', 120)  # 设置语速
 voice_lock = threading.Lock()
 
 
-def feedback_is_stable(samples, tolerance=0.01, window_seconds=2.0):
-    if len(samples) < 2:
-        return False
-    all_samples = list(samples)
-    newest_time = all_samples[-1][0]
-    cutoff = newest_time - window_seconds
-    start = 0
-    for index, sample in enumerate(all_samples):
-        if sample[0] <= cutoff:
-            start = index
-        else:
-            break
-    recent = all_samples[start:]
-    if recent[-1][0] - recent[0][0] < window_seconds:
-        return False
-    values = [value for _, value in recent]
-    return max(values) - min(values) <= tolerance
-
-
-def configure_fixed_height(node, height, timeout=60.0):
-    from rclpy.parameter import Parameter
-    from rclpy.parameter_client import AsyncParameterClient
-
-    target = -1.0 if height is None else float(height)
-    if target != -1.0 and not 0.0 <= target <= 20.0:
-        raise ValueError('--height must be within [0, 20], or omitted to follow VR')
-
-    client = AsyncParameterClient(node, '/lift')
-    if not client.wait_for_services(timeout_sec=5.0):
-        raise RuntimeError('/lift parameter service unavailable; body must already be running')
-    future = client.set_parameters([Parameter('fixed_height', Parameter.Type.DOUBLE, target)])
-    deadline = time.monotonic() + 5.0
-    while not future.done() and rclpy.ok() and time.monotonic() < deadline:
-        time.sleep(0.02)
-    if not future.done() or future.result() is None:
-        raise RuntimeError('timed out setting /lift fixed_height')
-    response = future.result()
-    results = getattr(response, 'results', response)
-    if not results or not all(result.successful for result in results):
-        reason = '; '.join(result.reason for result in results if not result.successful)
-        raise RuntimeError(f'failed to set /lift fixed_height: {reason}')
-    print(f'/lift fixed_height set to {target:.6f}')
-
-    if target < 0:
-        return None
-    vr_deadline = time.monotonic() + 10.0
-    while rclpy.ok() and not node.controller_left_deque and time.monotonic() < vr_deadline:
-        time.sleep(0.05)
-    if not node.controller_left_deque:
-        raise RuntimeError('/ARX_VR_L unavailable; fixed height was not applied, collection refused')
-    node.height_feedback_deque.clear()
-    deadline = time.monotonic() + timeout
-    while rclpy.ok() and time.monotonic() < deadline:
-        if feedback_is_stable(node.height_feedback_deque):
-            settled = node.height_feedback_deque[-1][1]
-            print(f'Lift feedback settled at {settled:.6f} for command {target:.6f}')
-            return settled
-        time.sleep(0.1)
-    raise RuntimeError('lift feedback did not settle within timeout; collection refused')
 
 
 def load_yaml(yaml_file):

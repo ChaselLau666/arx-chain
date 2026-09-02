@@ -7,7 +7,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'act'))
 
-from collect import feedback_is_stable
+from lift_height import feedback_is_stable
 
 
 class FixedHeightTests(unittest.TestCase):

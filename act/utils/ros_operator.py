@@ -373,12 +373,34 @@ class RosOperator(Node):
 
         return
 
-    def follow_arm_publish_continuous(self, left_target, right_target):
+    def request_arm_publish_stop(self):
+        """Make a running follow_arm_publish_continuous return at its next step.
+
+        The guard lock is held from __init__, so releasing it is exactly what
+        that loop's non-blocking acquire is waiting for. Safe to call twice and
+        safe to call when no ramp is running.
+        """
+        try:
+            self.follow_arm_publish_lock.release()
+        except RuntimeError:
+            pass
+
+    def follow_arm_publish_continuous(self, left_target, right_target, feedback_timeout=5.0):
+        """Ramp both arms from their current pose to a target, one step per cycle.
+
+        Each cycle publishes the interpolated pose rather than the endpoint, so
+        the arms approach at arm_steps_length per cycle instead of being
+        commanded straight to the target. request_arm_publish_stop() aborts it.
+        """
         arm_steps_length = [0.05, 0.05, 0.03, 0.05, 0.05, 0.05, 0.2]
         left_arm = None
         right_arm = None
 
-        rate = self.create_rate(self.args.frame_rate)
+        # One cycle per two frame periods, keeping the original cadence so the
+        # ramp speed stays at arm_steps_length per 2/frame_rate seconds.
+        rate = self.create_rate(self.args.frame_rate / 2.0)
+
+        deadline = time.monotonic() + feedback_timeout
         while rclpy.ok():
             if len(self.follow_left_arm_deque) != 0:
                 left_arm = list(self.follow_left_arm_deque[-1].joint_pos)
@@ -389,43 +411,44 @@ class RosOperator(Node):
             if left_arm is not None and right_arm is not None:
                 break
 
+            if time.monotonic() > deadline:
+                raise RuntimeError(
+                    'arm feedback unavailable; the arm stack must be running before any ramp')
+
+            time.sleep(0.01)
+
+        if len(left_arm) != 7 or len(right_arm) != 7:
+            raise RuntimeError(
+                f'expected 7-DoF arm feedback, got {len(left_arm)}/{len(right_arm)}')
+
         # 计算方向标志位
         left_symbol = [1 if left_target[i] - left_arm[i] > 0 else -1 for i in range(len(left_target))]
         right_symbol = [1 if right_target[i] - right_arm[i] > 0 else -1 for i in range(len(right_target))]
 
         step = 0
         while rclpy.ok():
-            left_done = 0
-            right_done = 0
-
             if self.follow_arm_publish_lock.acquire(False):
+                print('follow_arm_publish_continuous: stop requested; arms hold their last target')
+
                 return
 
             left_done = self._update_arm_position(left_target, left_arm, left_symbol, arm_steps_length)
             right_done = self._update_arm_position(right_target, right_arm, right_symbol, arm_steps_length)
 
-            if left_done > len(left_target) - 1 and right_done > len(right_target) - 1:
-                print('left_done and right_done')
-
-                break
-
-            # JointControl topic
-            if len(left_arm) == 7:
-                joint_state_msg = self.robot_status()
-            else:
-                print("\033[31mInvalid joint length\033[0m")
-
-                return
-
-            joint_state_msg.joint_pos[:7] = left_target
+            joint_state_msg = self.robot_status()
+            joint_state_msg.joint_pos[:7] = left_arm
             self.follow_arm_left_publisher.publish(joint_state_msg)
-            rate.sleep()
-
-            joint_state_msg.joint_pos[:7] = right_target
+            joint_state_msg.joint_pos[:7] = right_arm
             self.follow_arm_right_publisher.publish(joint_state_msg)
 
             step += 1
-            print("follow_arm_publish_continuous:", step)
+
+            # Publish before breaking so the exact target is the last thing sent.
+            if left_done == len(left_target) and right_done == len(right_target):
+                print(f'follow_arm_publish_continuous: reached target in {step} steps')
+
+                break
+
             rate.sleep()
 
     def _extract_eef_data(self, eef):

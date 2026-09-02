@@ -30,6 +30,8 @@ from functools import partial
 
 from utils.ros_operator import RosOperator, Rate
 from utils.setup_loader import setup_loader
+from lift_height import configure_fixed_height
+from replay_support import episode_start_pose, resolve_replay_height
 
 
 def load_yaml(yaml_file):
@@ -71,7 +73,11 @@ def load_hdf5(dataset_path):
 
                 raise ValueError(f"Missing datasets in HDF5 file: {', '.join(missing_datasets)}")
 
-            return qposes[()], eefs[()], actions[()], actions_eefs[()], action_base[()], action_velocity[()]
+            recorded_height = root.attrs.get('height_command')
+
+            return (qposes[()], eefs[()], actions[()], actions_eefs[()],
+                    action_base[()], action_velocity[()],
+                    None if recorded_height is None else float(recorded_height))
     except Exception as e:
         raise RuntimeError(f"Error occurred while loading the HDF5 file: {e}")
 
@@ -90,32 +96,55 @@ def robot_action(ros_operator, args, action, action_base, actions_velocity):
         ros_operator.set_robot_base_target(np.concatenate([action_base, actions_velocity]))
 
 
-def init_robot(ros_operator, use_base):
-    init0 = [0, 0, 0, 0, 0, 0, 4]
-    init1 = [0, 0, 0, 0, 0, 0, 0]
+def init_robot(ros_operator, use_base, start_pose):
+    left_start, right_start = start_pose
 
-    ros_operator.follow_arm_publish_continuous(init0, init0)
-    ros_operator.robot_base_shutdown()
+    ros_operator.follow_arm_publish_continuous(left_start, right_start)
 
     if use_base:
         input("Enter any key to continue :")
 
         ros_operator.start_base_control_thread()
-        ros_operator.follow_arm_publish_continuous(init1, init1)
+        ros_operator.follow_arm_publish_continuous(left_start, right_start)
+
+
+stop_requested = threading.Event()
 
 
 def signal_handler(signal, frame, ros_operator):
-    print('Caught Ctrl+C / SIGINT signal')
+    """Ask the replay loop to stop; never command the lift or the base here.
 
-    # 底盘给零
-    ros_operator.robot_base_shutdown()
-    ros_operator.base_control_thread.join()
+    Publishing /body_control from an interrupt would drive the platform to the
+    height carried in that message. Stopping simply stops sending arm targets,
+    which leaves both arms holding their last commanded pose.
+    """
+    if stop_requested.is_set():
+        print('\nSecond interrupt; exiting immediately.')
+        sys.exit(1)
 
-    sys.exit(0)
+    print('\nCaught Ctrl+C / SIGINT; stopping after the current frame.')
+    stop_requested.set()
+    ros_operator.request_arm_publish_stop()
 
 
 def main(args):
+    armed = bool(args.execute)
+    if armed:
+        confirmation = input('Type EXECUTE REPLAY to publish arm targets: ')
+        if confirmation != 'EXECUTE REPLAY':
+            raise RuntimeError('replay cancelled; nothing was published')
+    else:
+        print('DRY-RUN: no arm publisher is created; pass --execute to move the arms.')
+
     setup_loader(ROOT)
+
+    (qpoes, eefs, actions, actions_eefs, action_base, actions_velocity,
+     recorded_height) = load_hdf5(args.episode_path)
+
+    # Resolve the height before the node is built. RosOperator only subscribes
+    # to /body_information when args.height is set, and configure_fixed_height
+    # waits on exactly that feedback.
+    args.height = resolve_replay_height(recorded_height, args.height)
 
     rclpy.init()
 
@@ -127,20 +156,49 @@ def main(args):
 
     signal.signal(signal.SIGINT, partial(signal_handler, ros_operator=ros_operator))
 
-    qpoes, eefs, actions, actions_eefs, action_base, actions_velocity = load_hdf5(args.episode_path)
-
-    init_robot(ros_operator, args.use_base)
+    if armed:
+        try:
+            settled = configure_fixed_height(ros_operator, args.height, require_vr=False,
+                                             should_stop=stop_requested.is_set,
+                                             tolerance=args.height_tolerance)
+        except Exception:
+            ros_operator.destroy_node()
+            rclpy.shutdown()
+            spin_thread.join(timeout=2.0)
+            raise
+        print(f'Fixed lift ready: command={args.height:.6f}, feedback={settled:.6f}')
+    else:
+        print(f'DRY-RUN: would set /lift fixed_height to {args.height:.6f}')
 
     if args.states_replay:
         replay_actions = actions
     else:
         replay_actions = qpoes
 
+    start_pose = episode_start_pose(replay_actions)
+    if armed:
+        init_robot(ros_operator, args.use_base, start_pose)
+    else:
+        print('DRY-RUN start pose:')
+        print(f'  left : {np.round(start_pose[0], 4)}')
+        print(f'  right: {np.round(start_pose[1], 4)}')
+
     rate = Rate(args.frame_rate)
-    for idx in range(len(replay_actions)):
-        print(f'{replay_actions=}')
-        robot_action(ros_operator, args, replay_actions[idx], action_base[idx], idx)
+    total = len(replay_actions)
+    for idx in range(total):
+        if stop_requested.is_set():
+            print(f'Replay stopped by operator at frame {idx}/{total}.')
+            break
+
+        if armed:
+            robot_action(ros_operator, args, replay_actions[idx],
+                         action_base[idx], actions_velocity[idx])
+        elif idx % args.frame_rate == 0:
+            print(f'DRY-RUN frame {idx}/{total}: {np.round(replay_actions[idx], 4)}')
+
         rate.sleep()
+    else:
+        print(f'Replay finished: {total} frames.')
 
     ros_operator.base_enable = False
 
@@ -161,6 +219,13 @@ def parse_args(known=False):
                         help='record data')
 
     parser.add_argument('--states_replay', action='store_true', help='use qpos replay')
+    parser.add_argument('--height', type=float, default=None,
+                        help='fixed lift command in [0, 20]; defaults to the recorded height_command')
+    parser.add_argument('--execute', action='store_true',
+                        help='publish arm targets and set the lift; default is dry-run')
+    parser.add_argument('--height-tolerance', type=float, default=0.06,
+                        help='lift feedback is settled when its 2s range stays within this; '
+                             'must exceed the encoder quantisation of the machine in use')
 
     parser.add_argument('--use_depth_image', action='store_true', help='use depth image')
     parser.add_argument('--is_compress', action='store_true', help='compress image')
