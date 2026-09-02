@@ -134,6 +134,8 @@ dry-run 不创建双臂或 `/body_control` publisher，只打印模型 action。
 
 LIFT2s 推理双臂必须使用 `v2_joint_control.launch.py`：它发布 `/arm_slave_l_status`、`/arm_slave_r_status`，并订阅模型端的 `/arm_master_l_status`、`/arm_master_r_status`。旧的 `open_double_arm.launch.py` 使用 `/joint_information*` 与 `/joint_control*`，和 `inference.py` 不兼容，不得用于本链路。
 
+`X5Controller` 在建立模型命令订阅器之前会调用底层 `arx_x(500, 2000, 10)` 初始化，现场已观察到该阶段可能产生一段 replay-like 机械臂运动。因此 `03_inference.sh` 禁止自动启动双臂控制器，只能复用由操作者在工作区清空、急停可触达时手动启动并确认初始化完成的两个 v2 controller。此初始化动作不是 checkpoint 输出；“dry-run 不发布动作”只描述模型进程，不代表启动硬件驱动本身绝对无运动。
+
 如果出现 `there is no head queue`（或 left/right wrist queue），表示推理订阅存在但对应图像没有实时 publisher。`03_inference.sh` 必须按 `Publisher count > 0` 判断双臂和三相机是否在线，并在启动后等待全部 publisher 就绪；不能仅凭 ROS daemon 中残留的 topic 名复用旧栈。检查命令：
 
 ```bash
