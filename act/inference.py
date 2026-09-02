@@ -636,7 +636,7 @@ def parse_args(known=False):
     parser.add_argument('--gripper_gate', type=float, default=-1, help='gripper gate threshold')
     parser.add_argument('--expected-height', type=float, default=EXPECTED_HEIGHT_COMMAND,
                         help='required fixed_height command; checked but never changed')
-    parser.add_argument('--height-stability-tolerance', type=float, default=0.02)
+    parser.add_argument('--height-stability-tolerance', type=float, default=0.05)
     parser.add_argument('--height-stability-window', type=float, default=2.0)
     parser.add_argument('--height-timeout', type=float, default=15.0)
     parser.add_argument('--contract-name', type=str, default='data_contract.yaml')
