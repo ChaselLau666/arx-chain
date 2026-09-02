@@ -65,16 +65,17 @@ arm_processes=$(wc -w <<<"${arm_pids}")
 v2_arm_pids=$(pgrep -f '/arx_x5_controller/[X]5Controller.*v2_joint_control.yaml' || true)
 v2_arm_processes=$(wc -w <<<"${v2_arm_pids}")
 if [[ ${arm_processes} -eq 0 ]]; then
-  gnome-terminal --title="inference-arms" -- bash -ic \
-    "cd /home/arx/LIFT/ARX_X5/ROS2/X5_ws; source install/setup.bash; ros2 launch arx_x5_controller v2_joint_control.launch.py; exec bash"
-  wait_for_publishers "inference arms" "${arm_feedback_topics[@]}"
+  echo "Refused: v2 inference arm controllers are not running." >&2
+  echo "Start v2_joint_control.launch.py manually with the workspace clear and emergency stop reachable;" >&2
+  echo "the SDK calls arx_x(...) during initialization and may move the arms before any model publisher exists." >&2
+  exit 1
 elif [[ ${arm_processes} -ne 2 || ${v2_arm_processes} -ne 2 ]]; then
   echo "Refused: expected exactly two v2_joint_control X5Controller processes; " \
        "found ${arm_processes} arm processes (${v2_arm_processes} v2)." >&2
   exit 1
 else
   wait_for_publishers "running inference arms" "${arm_feedback_topics[@]}"
-  echo "Reusing two running v2 inference arm controllers."
+  echo "Reusing two operator-started v2 inference arm controllers."
 fi
 
 camera_image_topics=()
