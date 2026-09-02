@@ -19,6 +19,7 @@ import pickle
 import argparse
 import matplotlib
 import matplotlib.pyplot as plt
+import json
 from copy import deepcopy
 from tqdm import tqdm
 
@@ -27,6 +28,12 @@ from torch.utils.tensorboard import SummaryWriter
 
 from utils.utils import load_data, compute_dict_mean, set_seed, detach_dict
 from utils.policy import ACTPolicy, CNNMLPPolicy, DiffusionPolicy
+from act_contract import (
+    base_policy_config,
+    build_act_policy_config,
+    canonical_json_hash,
+    data_contract,
+)
 
 import numpy as np
 
@@ -41,57 +48,10 @@ matplotlib.use('Agg')
 
 # 初始化策略配置
 def initialize_policy_config(args):
-    base_config = {
-        'lr': args.lr,
-        'lr_backbone': args.lr_backbone,
-        'weight_decay': args.weight_decay,
-        'loss_function': args.loss_function,
-
-        'backbone': args.backbone,
-        'chunk_size': args.chunk_size,
-        'hidden_dim': args.hidden_dim,
-
-        'camera_names': args.camera_names,
-
-        'position_embedding': args.position_embedding,
-        'masks': args.masks,
-        'dilation': args.dilation,
-
-        'use_base': args.use_base,
-
-        'use_depth_image': args.use_depth_image,
-    }
+    base_config = base_policy_config(args)
 
     if args.policy_class == 'ACT':
-        act_config = {
-            'policy_class': 'ACT',
-            'enc_layers': args.enc_layers,
-            'dec_layers': args.dec_layers,
-            'nheads': args.nheads,
-            'dropout': args.dropout,
-            'pre_norm': args.pre_norm,
-            'states_dim': 7,
-            'action_dim': 7,
-            'kl_weight': args.kl_weight,
-            'dim_feedforward': args.dim_feedforward,
-
-            'use_qvel': args.use_qvel,
-            'use_effort': args.use_effort,
-            'use_eef_states': args.use_eef_states,
-            'use_eef_action': args.use_eef_action,
-        }
-
-        # 更新 states_dim
-        act_config['states_dim'] += act_config['action_dim'] if args.use_qvel else 0
-        act_config['states_dim'] += 1 if args.use_effort else 0
-        act_config['states_dim'] *= 2
-
-        # 更新 action_dim
-        act_config['action_dim'] *= 2  # 双臂预测
-        act_config['action_dim'] += 10 if args.use_base else 0
-        act_config['action_dim'] *= 2
-
-        return {**base_config, **act_config}
+        return build_act_policy_config(args)
 
     elif args.policy_class == 'CNNMLP':
         cnnmlp_config = {
@@ -143,6 +103,16 @@ def train(args):
     else:
         num_episodes = args.num_episodes
 
+    dataset_manifest = None
+    if args.dataset_manifest:
+        with open(args.dataset_manifest, 'r', encoding='utf-8') as stream:
+            dataset_manifest = json.load(stream)
+        if int(dataset_manifest['num_episodes']) != num_episodes:
+            raise ValueError('dataset manifest count does not match --num_episodes')
+
+    if os.path.exists(ckpt_dir):
+        raise FileExistsError(f"Refused to overwrite existing checkpoint directory: {ckpt_dir}")
+
     # 初始化策略配置
     policy_config = initialize_policy_config(args)
 
@@ -172,15 +142,6 @@ def train(args):
     train_dataloader, val_dataloader, stats, _ = load_data(dataset_dir, num_episodes, args.arm_delay_time,
                                                            policy_config, args.batch_size, args.batch_size)
 
-    # 创建路径
-    if os.path.exists(ckpt_dir):
-        for root, dirs, files in os.walk(ckpt_dir, topdown=False):
-            for name in files:
-                os.remove(os.path.join(root, name))
-            for name in dirs:
-                os.rmdir(os.path.join(root, name))
-        os.rmdir(ckpt_dir)  # 删除空目录
-
     os.makedirs(ckpt_dir)
 
     # 保存数据集统计信息
@@ -190,14 +151,22 @@ def train(args):
 
     # 保存参数信息
     args_save_path = os.path.join(ckpt_dir, 'args.yaml')
-    args_dict = vars(args).copy()
+    args_dict = {
+        key: str(value) if isinstance(value, Path) else value
+        for key, value in vars(args).items()
+    }
 
     # 移除的参数
     args_dict.pop('ckpt_dir', None)
     args_dict.pop('ckpt_name', None)
     args_dict.pop('ckpt_stats_name', None)
     with open(args_save_path, 'w') as f:
-        yaml.dump(args_dict, f)
+        yaml.safe_dump(args_dict, f, sort_keys=True)
+
+    contract = data_contract(policy_config, dataset_manifest)
+    contract['dataset_manifest_hash'] = canonical_json_hash(dataset_manifest) if dataset_manifest else None
+    with open(os.path.join(ckpt_dir, 'data_contract.yaml'), 'w', encoding='utf-8') as stream:
+        yaml.safe_dump(contract, stream, sort_keys=False)
 
     # 开始训练
     best_ckpt_info = train_process(train_dataloader, val_dataloader, config, stats)
@@ -306,12 +275,8 @@ def forward_pass(policy_config, data, policy):
         return policy(image_data, image_depth_data, left_states_data, action_data, is_pad_action)
 
 
-def save_checkpoint(policy, ckpt_dir, ckpt_name, epoch, is_best=False, min_epoch=0):
-    if is_best and epoch > min_epoch:
-        ckpt_path = os.path.join(ckpt_dir, f"best_policy_epoch{epoch}_{ckpt_name}")
-    else:
-        ckpt_path = os.path.join(ckpt_dir, ckpt_name)
-
+def save_checkpoint(policy, ckpt_dir, ckpt_name):
+    ckpt_path = os.path.join(ckpt_dir, ckpt_name)
     torch.save(deepcopy(policy.serialize()), ckpt_path)
 
 
@@ -358,10 +323,15 @@ def train_process(train_dataloader, val_dataloader, config, stats):
 
         # 检查是否保存最优模型
         if epoch_val_loss < min_val_loss:
-            min_val_loss = epoch_val_loss
-            best_ckpt_info = (epoch, min_val_loss, policy)
-
-            save_checkpoint(policy, ckpt_dir, ckpt_name, epoch, is_best=True, min_epoch=550)
+            min_val_loss = float(epoch_val_loss.detach().cpu())
+            best_ckpt_info = (epoch, min_val_loss)
+            save_checkpoint(policy, ckpt_dir, ckpt_name)
+            with open(os.path.join(ckpt_dir, 'best_checkpoint.yaml'), 'w', encoding='utf-8') as stream:
+                yaml.safe_dump({
+                    'epoch': epoch,
+                    'validation_loss': min_val_loss,
+                    'checkpoint': ckpt_name,
+                }, stream, sort_keys=False)
 
         # 训练模型
         epoch_train_summary = train_epoch(train_dataloader, policy, optimizer, policy_config)
@@ -372,7 +342,7 @@ def train_process(train_dataloader, val_dataloader, config, stats):
 
         # 定期保存模型和绘制历史曲线
         if epoch != 0 and epoch % 500 == 0:
-            save_checkpoint(policy, ckpt_dir, f'policy_epoch_{epoch}_seed_{seed}.ckpt', epoch)
+            save_checkpoint(policy, ckpt_dir, f'policy_epoch_{epoch}_seed_{seed}.ckpt')
 
         if epoch % 100 == 0:
             plot_history(train_history, validation_history, epoch, ckpt_dir, seed)
@@ -398,12 +368,11 @@ def train_process(train_dataloader, val_dataloader, config, stats):
     }
     torch.save(checkpoint, final_ckpt_path)
 
-    # 保存最优模型
-    best_epoch, min_val_loss, best_state_dict = best_ckpt_info
-    save_checkpoint(best_state_dict, ckpt_dir, f'policy_epoch_{best_epoch}_seed_{seed}.ckpt', best_epoch)
+    best_epoch, min_val_loss = best_ckpt_info
 
     print(f'Training finished: Seed {seed}, best val loss {min_val_loss:.6f} at epoch {best_epoch}')
     plot_history(train_history, validation_history, num_epochs, ckpt_dir, seed)
+    writer.close()
 
     return best_ckpt_info
 
@@ -461,6 +430,8 @@ def parse_args(known=False):
                         help='ckpt stats name')
     parser.add_argument('--reload_datasets_reval', type=int, default=0,
                         help='Reload datasets; 0 for no reshuffle, otherwise interval value')
+    parser.add_argument('--dataset_manifest', type=str, default='',
+                        help='range manifest generated by run_act_experiment.py')
 
     # 训练设置
     parser.add_argument('--num_episodes', type=int, default=50, help='episodes number')

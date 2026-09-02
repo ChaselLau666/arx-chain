@@ -79,7 +79,7 @@ def load_hdf5(dataset_name):
     return eef, qpos, qvel, effort, action, action_eef, action_base, action_velocity, image_dict
 
 
-def process_episode(idx, dataset_dir, individual_views):
+def process_episode(idx, dataset_dir, output_dir, individual_views):
     dataset_name = f'episode_{idx}'
     dataset_path = os.path.join(dataset_dir, dataset_name)
 
@@ -87,13 +87,14 @@ def process_episode(idx, dataset_dir, individual_views):
 
     print(f"{dataset_path}.hdf5 loaded!")
 
-    save_videos(image_dict, action, FPS, video_path=os.path.join(dataset_dir, dataset_name + '_video'),
+    output_prefix = os.path.join(output_dir, dataset_name)
+    save_videos(image_dict, action, FPS, video_path=output_prefix + '_video',
                 individual_views=individual_views)
-    visualize_joints(qpos, action, plot_path=os.path.join(dataset_dir, dataset_name + '_qpos.png'))
-    visualize_joints_vel(qvel, action, plot_path=os.path.join(dataset_dir, dataset_name + '_qvel.png'))
-    visualize_eef(eef, action_eef, plot_path=os.path.join(dataset_dir, dataset_name + '_eef.png'))
-    visualize_robot_base(action_base, plot_path=os.path.join(dataset_dir, dataset_name + '_action_base.png'))
-    visualize_base_velocity(action_velocity, plot_path=os.path.join(dataset_dir, dataset_name + '_action_velocity.png'))
+    visualize_joints(qpos, action, plot_path=output_prefix + '_qpos.png')
+    visualize_joints_vel(qvel, action, plot_path=output_prefix + '_qvel.png')
+    visualize_eef(eef, action_eef, plot_path=output_prefix + '_eef.png')
+    visualize_robot_base(action_base, plot_path=output_prefix + '_action_base.png')
+    visualize_base_velocity(action_velocity, plot_path=output_prefix + '_action_velocity.png')
 
     return dataset_name
 
@@ -110,6 +111,8 @@ def main(args):
     episode_idx = args['episode_idx']
     dataset_name = f'episode_{episode_idx}'
     individual_views = args['individual_views']
+    output_dir = os.path.abspath(args['output_dir']) if args['output_dir'] else dataset_dir
+    os.makedirs(output_dir, exist_ok=True)
 
     STATE_NAMES = JOINT_NAMES + ["gripper"]
 
@@ -129,7 +132,7 @@ def main(args):
         end = total_files if args['end'] == -1 else min(args['end'] + 1, total_files)
 
         with ProcessPoolExecutor(max_workers=4) as executor:
-            futures = [executor.submit(process_episode, idx, dataset_dir, individual_views) for idx in
+            futures = [executor.submit(process_episode, idx, dataset_dir, output_dir, individual_views) for idx in
                        range(start, end)]
 
             for future in as_completed(futures):
@@ -140,7 +143,7 @@ def main(args):
                     print(f"Error in processing: {e}")
 
     else:
-        process_episode(episode_idx, dataset_dir, individual_views)
+        process_episode(episode_idx, dataset_dir, output_dir, individual_views)
 
 
 def save_videos(video, actions, fps, video_path=None, individual_views=False):
@@ -161,12 +164,11 @@ def save_videos(video, actions, fps, video_path=None, individual_views=False):
     out.release()
 
     if individual_views:
-        base_dir = os.path.dirname(video_path)
         for cam_name in cam_names:
             cam_video = np.array(video[cam_name])
             n_frames, h, w, _ = cam_video.shape
 
-            cam_path = os.path.join(base_dir, f"{video_path}_{cam_name}.mp4")
+            cam_path = f"{video_path}_{cam_name}.mp4"
             out = cv2.VideoWriter(cam_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
             for t in range(n_frames):
                 frame = cam_video[t].astype(np.uint8)
@@ -341,6 +343,7 @@ if __name__ == '__main__':
 
     parser.add_argument('--datasets', type=str, default=ROOT / 'datasets', help='dataset dir')
     parser.add_argument('--episode_idx', type=int, default=0, help='episode index')
+    parser.add_argument('--output_dir', type=str, default='', help='separate visualization output directory')
     parser.add_argument("--start", type=int, default=0, help="Start index in original file list")
     parser.add_argument("--end", type=int, default=-1, help="End index (inclusive), -1 means all")
     parser.add_argument("--individual_views", action='store_true', help="Plot each view individually")

@@ -17,6 +17,8 @@ if str(ROOT) not in sys.path:
 import argparse
 import collections
 import pickle
+import queue
+import time
 import yaml
 from einops import rearrange
 import rclpy
@@ -26,14 +28,19 @@ import threading
 from rclpy.executors import MultiThreadedExecutor
 
 from utils.policy import ACTPolicy, CNNMLPPolicy, DiffusionPolicy
+from act_contract import (
+    EFFECTIVE_ACTION_SEMANTICS,
+    EXPECTED_HEIGHT_COMMAND,
+    PHYSICAL_ACTION_DIM,
+    base_policy_config,
+    build_act_policy_config,
+)
+from inference_safety import ActionGuard, load_joint_limits, validate_policy_contract
+from safe_height import is_safe_and_stable
 from utils.utils import set_seed  # helper functions
 
 from utils.ros_operator import RosOperator, Rate
 from utils.setup_loader import setup_loader
-
-from functools import partial
-import signal
-import sys
 
 obs_dict = collections.OrderedDict()
 
@@ -119,54 +126,10 @@ def robot_action(action, shm_dict):
 def get_model_config(args):
     set_seed(args.seed)
 
-    base_config = {
-        'lr': args.lr,
-        'lr_backbone': args.lr_backbone,
-        'weight_decay': args.weight_decay,
-        'loss_function': args.loss_function,
-
-        'backbone': args.backbone,
-        'chunk_size': args.chunk_size,
-        'hidden_dim': args.hidden_dim,
-
-        'camera_names': args.camera_names,
-
-        'position_embedding': args.position_embedding,
-        'masks': args.masks,
-        'dilation': args.dilation,
-
-        'use_base': args.use_base,
-
-        'use_depth_image': args.use_depth_image,
-    }
+    base_config = base_policy_config(args)
 
     if args.policy_class == 'ACT':
-        policy_config = {
-            **base_config,
-            'enc_layers': args.enc_layers,
-            'dec_layers': args.dec_layers,
-            'nheads': args.nheads,
-            'dropout': args.dropout,
-            'pre_norm': args.pre_norm,
-            'states_dim': 7,
-            'action_dim': 7,
-            'kl_weight': args.kl_weight,
-            'dim_feedforward': args.dim_feedforward,
-
-            'use_qvel': args.use_qvel,
-            'use_effort': args.use_effort,
-            'use_eef_states': args.use_eef_states,
-        }
-
-        # 更新 states_dim
-        policy_config['states_dim'] += policy_config['action_dim'] if args.use_qvel else 0
-        policy_config['states_dim'] += 1 if args.use_effort else 0
-        policy_config['states_dim'] *= 2
-
-        # 更新 action_dim
-        policy_config['action_dim'] *= 2  # 双臂预测
-        policy_config['action_dim'] += 10 if args.use_base else 0
-        policy_config['action_dim'] *= 2
+        policy_config = build_act_policy_config(args)
 
         action_dim = policy_config["action_dim"]
         states_dim = policy_config['states_dim']
@@ -265,31 +228,59 @@ def get_obervations(args, timestep, ros_operator):
         return obs_dict
 
 
-def init_robot(ros_operator, use_base, connected_event, start_event):
-    init0 = [0, 0, 0, 0, 0, 0, 4]
-    init1 = [0, 0, 0, 0, 0, 0, 0]
-
-    # 发布初始位置（关节空间姿态）
-    ros_operator.follow_arm_publish_continuous(init0, init0)
-    # ros_operator.robot_base_shutdown()
-
-    connected_event.set()
-    start_event.wait()
-
-    ros_operator.follow_arm_publish_continuous(init1, init1)
-    if use_base:
-        ros_operator.start_base_control_thread()
+def resolved_checkpoint_dir(config):
+    return Path(config['ckpt_dir']).resolve()
 
 
-def signal_handler(signal, frame, ros_operator):
-    print('Caught Ctrl+C / SIGINT signal')
+def load_and_validate_checkpoint_contract(config, args):
+    contract_path = resolved_checkpoint_dir(config) / args.contract_name
+    if not contract_path.is_file():
+        raise FileNotFoundError(f'missing checkpoint contract: {contract_path}')
+    contract = load_yaml(contract_path)
+    if contract['effective_action_semantics'] != EFFECTIVE_ACTION_SEMANTICS:
+        raise ValueError('checkpoint action semantics mismatch')
+    if int(contract['physical_action_dim']) != PHYSICAL_ACTION_DIM:
+        raise ValueError('checkpoint physical action dimension mismatch')
+    if not np.isclose(float(contract['height_command']), args.expected_height):
+        raise ValueError('checkpoint height command does not match --expected-height')
+    validate_policy_contract(config['policy_config'], contract)
+    return contract
 
-    # 底盘给零
-    ros_operator.base_enable = False
-    ros_operator.robot_base_shutdown()
-    ros_operator.base_control_thread.join()
 
-    sys.exit(0)
+def verify_expected_height(node, args):
+    from rclpy.parameter_client import AsyncParameterClient
+
+    client = AsyncParameterClient(node, '/lift')
+    if not client.wait_for_services(timeout_sec=5.0):
+        raise RuntimeError('/lift parameter service is unavailable; inference refuses to start')
+    future = client.get_parameters(['fixed_height'])
+    deadline = time.monotonic() + 5.0
+    while not future.done() and rclpy.ok() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    if not future.done() or future.result() is None:
+        raise RuntimeError('timed out reading /lift fixed_height')
+    fixed_height = float(future.result().values[0].double_value)
+    if not np.isclose(fixed_height, args.expected_height, atol=1e-6):
+        raise RuntimeError(
+            f'/lift fixed_height={fixed_height}, expected {args.expected_height}; inference refused'
+        )
+    node.height_feedback_deque.clear()
+    deadline = time.monotonic() + args.height_timeout
+    while rclpy.ok() and time.monotonic() < deadline:
+        if is_safe_and_stable(
+            node.height_feedback_deque,
+            float('inf'),
+            args.height_stability_tolerance,
+            args.height_stability_window,
+        ):
+            feedback = node.height_feedback_deque[-1][1]
+            print(
+                f'Height verified: fixed_height={fixed_height:.6f}, '
+                f'stable_feedback={feedback:.6f}'
+            )
+            return feedback
+        time.sleep(0.05)
+    raise RuntimeError('height feedback did not become stable; inference refused')
 
 
 def cleanup_shm(names):
@@ -317,10 +308,9 @@ def ros_process(args, config, meta_queue, connected_event, start_event, shm_read
     spin_thread = threading.Thread(target=_spin_loop, args=(ros_operator,), daemon=True)
     spin_thread.start()
 
-    if args.use_base:
-        signal.signal(signal.SIGINT, partial(signal_handler, ros_operator=ros_operator))
-
-    init_robot(ros_operator, args.use_base, connected_event, start_event)
+    verify_expected_height(ros_operator, args)
+    connected_event.set()
+    start_event.wait()
 
     rate = Rate(args.frame_rate)
     while rclpy.ok():
@@ -351,6 +341,11 @@ def ros_process(args, config, meta_queue, connected_event, start_event, shm_read
     shm_dict = create_shm_dict(config, shm_name_dict, shapes, shapes["dtypes"])
     shm_ready_event.set()
 
+    guard = None
+    armed = bool(args.execute)
+    if armed:
+        guard = ActionGuard(load_joint_limits(args.joint_limits), obs['qpos'])
+
     rate = Rate(args.frame_rate)
     while rclpy.ok():
         obs = ros_operator.get_observation()
@@ -372,18 +367,26 @@ def ros_process(args, config, meta_queue, connected_event, start_event, shm_read
         # 读取动作并执行
         shm, shape, dtype = shm_dict["action"]
         action = np.ndarray(shape, dtype=dtype, buffer=shm.buf).copy()
-        if np.any(action):  # 确保动作不全是 0
+        if np.any(action) and armed:
             gripper_gate = args.gripper_gate
 
             gripper_idx = [6, 13]
 
-            left_action = action[:gripper_idx[0] + 1]  # 取8维度
+            try:
+                physical_action = guard.validate(action)
+            except ValueError as error:
+                armed = False
+                print(f'DISARMED: {error}', flush=True)
+                rate.sleep()
+                continue
+
+            left_action = physical_action[:gripper_idx[0] + 1]
             if gripper_gate != -1:
                 left_action[gripper_idx[0]] = apply_gripper_gate(left_action[gripper_idx[0]], gripper_gate)
 
-            right_action = action[gripper_idx[0] + 1:gripper_idx[1] + 1]
+            right_action = physical_action[gripper_idx[0] + 1:gripper_idx[1] + 1]
             if gripper_gate != -1:
-                right_action[gripper_idx[0]] = apply_gripper_gate(left_action[gripper_idx[0]], gripper_gate)
+                right_action[gripper_idx[0]] = apply_gripper_gate(right_action[gripper_idx[0]], gripper_gate)
 
             ros_operator.follow_arm_publish(left_action, right_action)
 
@@ -393,7 +396,6 @@ def ros_process(args, config, meta_queue, connected_event, start_event, shm_read
 
         rate.sleep()
 
-    executor.shutdown()
     rclpy.shutdown()
     for shm, _, _ in shm_dict.values():
         shm.close()
@@ -402,7 +404,7 @@ def ros_process(args, config, meta_queue, connected_event, start_event, shm_read
 
 def inference_process(args, config, shm_dict, shapes, ros_proc):
     model = make_policy(config['policy_class'], config['policy_config'])
-    ckpt_dir = config['ckpt_dir'] if sys.stdin.isatty() else Path.joinpath(ROOT, config['ckpt_dir'])
+    ckpt_dir = resolved_checkpoint_dir(config)
     ckpt_path = os.path.join(ckpt_dir, config['ckpt_name'])
     loading_status = model.load_state_dict(torch.load(ckpt_path, weights_only=True))
     print(loading_status)
@@ -533,6 +535,13 @@ def inference_process(args, config, shm_dict, shapes, ros_proc):
 
                 action = post_process(raw_action[0])
 
+                if not args.execute and timestep % args.frame_rate == 0:
+                    print(
+                        'DRY-RUN action[0:14]: '
+                        + np.array2string(action[:PHYSICAL_ACTION_DIM], precision=4),
+                        flush=True,
+                    )
+
                 robot_action(action, shm_dict)
 
                 timestep += 1
@@ -625,6 +634,16 @@ def parse_args(known=False):
     parser.add_argument('--use_eef_states', action='store_true', help='use eef data in state')
 
     parser.add_argument('--gripper_gate', type=float, default=-1, help='gripper gate threshold')
+    parser.add_argument('--expected-height', type=float, default=EXPECTED_HEIGHT_COMMAND,
+                        help='required fixed_height command; checked but never changed')
+    parser.add_argument('--height-stability-tolerance', type=float, default=0.02)
+    parser.add_argument('--height-stability-window', type=float, default=2.0)
+    parser.add_argument('--height-timeout', type=float, default=15.0)
+    parser.add_argument('--contract-name', type=str, default='data_contract.yaml')
+    parser.add_argument('--execute', action='store_true',
+                        help='publish guarded arm actions; default is dry-run')
+    parser.add_argument('--joint-limits', type=str, default='',
+                        help='reviewed 14-D safety YAML; required with --execute')
 
     return parser.parse_known_args()[0] if known else parser.parse_args()
 
@@ -638,24 +657,46 @@ def main(args):
 
     # 获取模型config
     config = get_model_config(args)
+    load_and_validate_checkpoint_contract(config, args)
+    if args.use_base:
+        raise ValueError('safe ACT inference does not support --use_base')
+    if args.execute:
+        if not args.joint_limits:
+            raise ValueError('--execute requires --joint-limits')
+        load_joint_limits(args.joint_limits)
+        confirmation = input('Type EXECUTE ARMS to enable guarded arm publication: ')
+        if confirmation != 'EXECUTE ARMS':
+            raise RuntimeError('execution cancelled; no ROS process was started')
+    else:
+        print('DRY-RUN: no arm or body command publishers will be created.')
 
     # 启动ROS进程
     ros_proc = mp.Process(target=ros_process, args=(args, config, meta_queue,
                                                     connected_event, start_event, shm_ready_event))
     ros_proc.start()
 
-    connected_event.wait()
-    input("Enter any key to continue :")
+    if not connected_event.wait(timeout=30.0):
+        ros_proc.terminate()
+        ros_proc.join()
+        raise RuntimeError('ROS process failed height preflight or timed out')
     start_event.set()
 
     # 等待meta信息
-    shapes = meta_queue.get()
+    try:
+        shapes = meta_queue.get(timeout=30.0)
+    except queue.Empty:
+        ros_proc.terminate()
+        ros_proc.join()
+        raise RuntimeError('sensor preflight timed out')
 
     shm_name_dict = make_shm_name_dict(args, shapes)
 
     meta_queue.put(shm_name_dict)
 
-    shm_ready_event.wait()
+    if not shm_ready_event.wait(timeout=30.0):
+        ros_proc.terminate()
+        ros_proc.join()
+        raise RuntimeError('shared-memory setup timed out')
 
     shm_dict = connect_shm_dict(shm_name_dict, shapes, shapes["dtypes"], config)
 

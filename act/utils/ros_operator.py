@@ -172,13 +172,14 @@ class RosOperator(Node):
                                          self.config['robot_base_config']['robot_base_topic'],
                                          self.base_velocity_callback,
                                          2)
-        elif getattr(self.args, 'height', None) is not None:
+        elif (getattr(self.args, 'height', None) is not None
+              or getattr(self.args, 'expected_height', None) is not None):
             self.create_subscription(self.pos_cmd,
                                      self.config['robot_base_config']['robot_base_topic'],
                                      self.height_feedback_callback,
                                      10)
         # 推理模式相关发布
-        if not self.in_collect:
+        if not self.in_collect and getattr(self.args, 'execute', True):
             self.follow_arm_left_publisher = self.create_publisher(
                 self.robot_status,
                 self.config['arm_config']['follow_arm_left_cmd_topic'],
@@ -189,11 +190,12 @@ class RosOperator(Node):
                 self.config['arm_config']['follow_arm_right_cmd_topic'],
                 10
             )
-            self.base_actuator_publisher = self.create_publisher(
-                self.pos_cmd,
-                self.config['robot_base_config']['robot_base_cmd_topic'],
-                10
-            )
+            if self.args.use_base:
+                self.base_actuator_publisher = self.create_publisher(
+                    self.pos_cmd,
+                    self.config['robot_base_config']['robot_base_cmd_topic'],
+                    10
+                )
 
     # 推理
     def follow_arm_publish(self, left, right):

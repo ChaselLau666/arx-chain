@@ -88,12 +88,13 @@ stop_pattern() {
 }
 
 stop_pattern "collector" '[p]ython .*collect.py'
+stop_pattern "inference" '[p]ython .*inference.py'
 stop_pattern "VR diagnostics" 'ros2 topic (echo|hz) /ARX_VR_[LR]'
 stop_pattern "VR serial launcher" '/opt/ros/jazzy/bin/ros2 run serial_port serial_port_node'
 stop_pattern "VR serial node" '/serial_port_node$'
 stop_pattern "RealSense launchers" '/opt/ros/jazzy/bin/ros2 launch realsense2_camera rs_launch.py'
 stop_pattern "RealSense nodes" '/realsense2_camera_node'
-stop_pattern "arm launcher" '/opt/ros/jazzy/bin/ros2 launch arx_x5_controller v2_pos_control.launch.py'
+stop_pattern "arm launcher" '/opt/ros/jazzy/bin/ros2 launch arx_x5_controller (v2_pos_control|open_double_arm).launch.py'
 stop_pattern "arm nodes" '/arx_x5_controller/X5Controller'
 stop_pattern "body launcher" '/opt/ros/jazzy/bin/ros2 launch arx_lift_controller lift.launch.py'
 stop_pattern "body node" '/arx_lift_controller/lift_controller'
@@ -101,7 +102,7 @@ stop_pattern "CAN watchdogs" '/bin/bash ./arx_can[135].sh'
 
 echo "Verifying control processes..."
 remaining=$(ps -eo pid,args | grep -E \
-  '(lift_controller|X5Controller|serial_port_node|realsense2_camera_node|collect.py)' \
+  '(lift_controller|X5Controller|serial_port_node|realsense2_camera_node|collect.py|inference.py)' \
   | grep -v grep || true)
 if [[ -n "${remaining}" ]]; then
   echo "WARNING: some control processes remain:" >&2
