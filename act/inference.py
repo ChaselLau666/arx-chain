@@ -35,7 +35,12 @@ from act_contract import (
     base_policy_config,
     build_act_policy_config,
 )
-from inference_safety import ActionGuard, load_joint_limits, validate_policy_contract
+from inference_safety import (
+    ActionGuard,
+    SingleStepGuard,
+    load_joint_limits,
+    validate_policy_contract,
+)
 from safe_height import is_safe_and_stable
 from utils.utils import set_seed  # helper functions
 
@@ -344,7 +349,14 @@ def ros_process(args, config, meta_queue, connected_event, start_event, shm_read
     guard = None
     armed = bool(args.execute)
     if armed:
-        guard = ActionGuard(load_joint_limits(args.joint_limits), obs['qpos'])
+        if args.single_step_test:
+            guard = SingleStepGuard(
+                obs['qpos'],
+                joint_delta=args.single_step_joint_delta,
+                gripper_delta=args.single_step_gripper_delta,
+            )
+        else:
+            guard = ActionGuard(load_joint_limits(args.joint_limits), obs['qpos'])
 
     rate = Rate(args.frame_rate)
     while rclpy.ok():
@@ -389,6 +401,12 @@ def ros_process(args, config, meta_queue, connected_event, start_event, shm_read
                 right_action[gripper_idx[0]] = apply_gripper_gate(right_action[gripper_idx[0]], gripper_gate)
 
             ros_operator.follow_arm_publish(left_action, right_action)
+            if args.single_step_test:
+                armed = False
+                print(
+                    'SINGLE-STEP COMPLETE: published exactly one guarded action; permanently disarmed.',
+                    flush=True,
+                )
 
             if args.use_base:
                 action_base = action[gripper_idx[1] + 1:gripper_idx[1] + 1 + 10]
@@ -644,6 +662,10 @@ def parse_args(known=False):
                         help='publish guarded arm actions; default is dry-run')
     parser.add_argument('--joint-limits', type=str, default='',
                         help='reviewed 14-D safety YAML; required with --execute')
+    parser.add_argument('--single-step-test', action='store_true',
+                        help='publish at most one small current-pose-relative action, then disarm')
+    parser.add_argument('--single-step-joint-delta', type=float, default=0.02)
+    parser.add_argument('--single-step-gripper-delta', type=float, default=0.2)
 
     return parser.parse_known_args()[0] if known else parser.parse_args()
 
@@ -660,7 +682,16 @@ def main(args):
     load_and_validate_checkpoint_contract(config, args)
     if args.use_base:
         raise ValueError('safe ACT inference does not support --use_base')
-    if args.execute:
+    if args.single_step_test:
+        if args.execute:
+            raise ValueError('use either --single-step-test or --execute, not both')
+        args.execute = True
+        confirmation = input(
+            'Type EXECUTE ONE GUARDED ACTION to enable the one-action hardware test: '
+        )
+        if confirmation != 'EXECUTE ONE GUARDED ACTION':
+            raise RuntimeError('single-step execution cancelled; no ROS process was started')
+    elif args.execute:
         if not args.joint_limits:
             raise ValueError('--execute requires --joint-limits')
         load_joint_limits(args.joint_limits)

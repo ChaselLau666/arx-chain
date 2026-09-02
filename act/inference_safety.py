@@ -94,3 +94,37 @@ class ActionGuard:
         self.previous = physical.copy()
         self.first = False
         return physical
+
+
+class SingleStepGuard:
+    """Allow at most one small action around an operator-confirmed safe pose."""
+
+    def __init__(self, initial_qpos, joint_delta: float = 0.02, gripper_delta: float = 0.2):
+        initial = np.asarray(initial_qpos, dtype=np.float32)
+        if initial.shape != (14,) or not np.isfinite(initial).all():
+            raise ValueError("initial qpos must contain 14 finite values")
+        if joint_delta <= 0 or gripper_delta <= 0:
+            raise ValueError("single-step delta limits must be positive")
+        self.initial = initial
+        self.joint_delta = float(joint_delta)
+        self.gripper_delta = float(gripper_delta)
+        self.used = False
+
+    def validate(self, model_action) -> np.ndarray:
+        if self.used:
+            raise ValueError("single-step guard has already been used")
+        action = np.asarray(model_action, dtype=np.float32)
+        if action.ndim != 1 or len(action) < 14 or not np.isfinite(action).all():
+            raise ValueError("model action must be a finite vector with at least 14 values")
+        physical = action[:14].copy()
+        physical[:7] = self.initial[:7]
+        right_joint_indices = np.arange(7, 13)
+        if np.any(
+            np.abs(physical[right_joint_indices] - self.initial[right_joint_indices])
+            > self.joint_delta
+        ):
+            raise ValueError("single-step right-joint delta exceeds the local test envelope")
+        if abs(float(physical[13] - self.initial[13])) > self.gripper_delta:
+            raise ValueError("single-step gripper delta exceeds the local test envelope")
+        self.used = True
+        return physical
