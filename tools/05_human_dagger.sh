@@ -286,7 +286,8 @@ start_component() {
 }
 
 wait_for_node() {
-  local node=$1 timeout_seconds=$2 deadline=$((SECONDS + timeout_seconds))
+  local node=$1 timeout_seconds=$2 deadline
+  deadline=$((SECONDS + timeout_seconds))
   until ros2 node list 2>/dev/null | grep -qx "$node"; do
     (( SECONDS < deadline )) || die "ROS node did not appear: ${node}"
     sleep 0.25
@@ -294,7 +295,8 @@ wait_for_node() {
 }
 
 wait_for_topic() {
-  local topic=$1 timeout_seconds=$2 deadline=$((SECONDS + timeout_seconds))
+  local topic=$1 timeout_seconds=$2 deadline
+  deadline=$((SECONDS + timeout_seconds))
   echo "Waiting for fresh data on ${topic}"
   until timeout 2 ros2 topic echo --once "$topic" >/dev/null 2>&1; do
     (( SECONDS < deadline )) || die "no message received on ${topic}"
@@ -303,7 +305,8 @@ wait_for_topic() {
 }
 
 wait_for_service() {
-  local service=$1 timeout_seconds=$2 deadline=$((SECONDS + timeout_seconds))
+  local service=$1 timeout_seconds=$2 deadline
+  deadline=$((SECONDS + timeout_seconds))
   until ros2 service list 2>/dev/null | grep -qx "$service"; do
     (( SECONDS < deadline )) || die "ROS service did not appear: ${service}"
     sleep 0.25
