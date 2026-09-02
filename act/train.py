@@ -127,6 +127,7 @@ def train(args):
         'batch_size': args.batch_size,
         'seed': args.seed,
         'num_epochs': args.epochs,
+        'checkpoint_interval': args.checkpoint_interval,
 
         'policy_class': args.policy_class,
         'policy_config': policy_config,
@@ -283,6 +284,7 @@ def save_checkpoint(policy, ckpt_dir, ckpt_name):
 def train_process(train_dataloader, val_dataloader, config, stats):
     # 基础设置
     num_epochs = config['num_epochs']
+    checkpoint_interval = config['checkpoint_interval']
     ckpt_dir = Path.joinpath(ROOT, config['ckpt_dir'])
     ckpt_name = config['ckpt_name']
     seed = config['seed']
@@ -341,8 +343,13 @@ def train_process(train_dataloader, val_dataloader, config, stats):
             writer.add_scalar(f"train/{key}", value, epoch)
 
         # 定期保存模型和绘制历史曲线
-        if epoch != 0 and epoch % 500 == 0:
-            save_checkpoint(policy, ckpt_dir, f'policy_epoch_{epoch}_seed_{seed}.ckpt')
+        completed_epochs = epoch + 1
+        if completed_epochs % checkpoint_interval == 0:
+            save_checkpoint(
+                policy,
+                ckpt_dir,
+                f'policy_epoch_{completed_epochs}_seed_{seed}.ckpt',
+            )
 
         if epoch % 100 == 0:
             plot_history(train_history, validation_history, epoch, ckpt_dir, seed)
@@ -438,6 +445,8 @@ def parse_args(known=False):
     parser.add_argument('--batch_size', type=int, default=32, help='batch size')
     parser.add_argument('--seed', type=int, default=0, help='random seed')
     parser.add_argument('--epochs', type=int, default=3000, help='number of training epochs')
+    parser.add_argument('--checkpoint_interval', type=int, default=500,
+                        help='save a raw policy after this many completed epochs')
     parser.add_argument('--lr', type=float, default=4e-5, help='learning rate')
     parser.add_argument('--lr_backbone', type=float, default=4e-5, help='learning rate for backbone')
     parser.add_argument('--weight_decay', type=float, default=1e-4, help='weight decay rate')

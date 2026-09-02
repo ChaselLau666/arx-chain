@@ -162,8 +162,14 @@ def prepare_view(view_dir: Path, manifest: dict) -> Path:
     manifest_path = view_dir / "split_manifest.json"
     if manifest_path.exists():
         existing = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if existing != manifest:
+        comparable_existing = {key: value for key, value in existing.items() if key != "repo_commit"}
+        comparable_current = {key: value for key, value in manifest.items() if key != "repo_commit"}
+        if comparable_existing != comparable_current:
             raise ValueError(f"existing manifest differs: {manifest_path}")
+        if existing != manifest:
+            manifest_path.write_text(
+                json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8"
+            )
     else:
         manifest_path.write_text(
             json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8"
@@ -184,6 +190,7 @@ def train_command(args, view_dir: Path, manifest_path: Path, run_dir: Path) -> l
         "--camera_names", *CAMERA_NAMES,
         "--batch_size", str(args.batch_size),
         "--epochs", str(args.epochs),
+        "--checkpoint_interval", str(args.checkpoint_interval),
         "--seed", str(args.seed),
         "--lr", "4e-5",
         "--lr_backbone", "4e-5",
@@ -213,6 +220,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-name")
     parser.add_argument("--epochs", type=int, default=3000)
     parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--checkpoint-interval", type=int, default=500)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument("--skip-hash", action="store_true", help="tests only; omit SHA-256")
@@ -220,8 +228,8 @@ def parse_args() -> argparse.Namespace:
     args.source_dir = args.source_dir.resolve()
     args.view_root = args.view_root.resolve()
     args.run_root = args.run_root.resolve()
-    if args.epochs <= 0 or args.batch_size <= 0:
-        parser.error("--epochs and --batch-size must be positive")
+    if args.epochs <= 0 or args.batch_size <= 0 or args.checkpoint_interval <= 0:
+        parser.error("--epochs, --batch-size, and --checkpoint-interval must be positive")
     return args
 
 

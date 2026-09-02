@@ -99,6 +99,19 @@ policy_epoch*_pretrained_all_info.ckpt
 TensorBoard 日志和训练曲线
 ```
 
+长训练可显式指定保存间隔。计数按“已完成 epoch 数”命名，因此下面的命令会从头训练 25,000 epochs，并准确保存 `5000/10000/15000/20000/25000` 五个 raw policy checkpoint：
+
+```bash
+python tools/run_act_experiment.py \
+  --start 0 --end 24 --eval-episode 50 \
+  --source-dir /home/xiangchengliu/data/arx_act_pickplace/hdf5 \
+  --view-root /home/xiangchengliu/data/arx_act_pickplace/views \
+  --run-root /home/xiangchengliu/data/arx_act_pickplace/runs \
+  --epochs 25000 \
+  --checkpoint-interval 5000 \
+  --run-name act_ep000_024_seed0_epochs25000
+```
+
 ## 5. episode_50 开环回放
 
 三组正式训练结束后：
