@@ -130,6 +130,8 @@ cd /home/arx/ROS2_LIFT_Play/tools
 
 dry-run 不创建双臂或 `/body_control` publisher，只打印模型 action。checkpoint 契约、相机顺序、14/28 维关系、action semantics 或高度不一致时直接拒绝。
 
+LIFT2s 推理双臂必须使用 `v2_joint_control.launch.py`：它发布 `/arm_slave_l_status`、`/arm_slave_r_status`，并订阅模型端的 `/arm_master_l_status`、`/arm_master_r_status`。旧的 `open_double_arm.launch.py` 使用 `/joint_information*` 与 `/joint_control*`，和 `inference.py` 不兼容，不得用于本链路。
+
 如果出现 `there is no head queue`（或 left/right wrist queue），表示推理订阅存在但对应图像没有实时 publisher。`03_inference.sh` 必须按 `Publisher count > 0` 判断双臂和三相机是否在线，并在启动后等待全部 publisher 就绪；不能仅凭 ROS daemon 中残留的 topic 名复用旧栈。检查命令：
 
 ```bash
