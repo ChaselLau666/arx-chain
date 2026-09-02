@@ -203,11 +203,15 @@ set +u
 # shellcheck disable=SC1091
 source /opt/ros/jazzy/setup.bash
 # shellcheck disable=SC1091
+source "${vr_ws}/install/setup.bash"
+# shellcheck disable=SC1091
 source "${lift_ws}/install/setup.bash"
+# Source x5_ws after vr_ws: the VR workspace carries a stale arm_control
+# (PosCmd only) whose typesupport lacks JointControl; X5Controller must
+# resolve arm_control against the full X5 build or it aborts with a
+# symbol lookup error at startup.
 # shellcheck disable=SC1091
 source "${x5_ws}/install/setup.bash"
-# shellcheck disable=SC1091
-source "${vr_ws}/install/setup.bash"
 # shellcheck disable=SC1091
 source "${realsense_ws}/install/setup.bash"
 set -u
