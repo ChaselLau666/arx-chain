@@ -89,6 +89,7 @@ stop_pattern() {
 
 stop_pattern "collector" '[p]ython .*collect.py'
 stop_pattern "inference" '[p]ython .*inference.py'
+stop_pattern "Tau0VLA inference" '[p]ython .*tau0vla_client.py'
 stop_pattern "VR diagnostics" 'ros2 topic (echo|hz) /ARX_VR_[LR]'
 stop_pattern "VR serial launcher" '/opt/ros/jazzy/bin/ros2 run serial_port serial_port_node'
 stop_pattern "VR serial node" '/serial_port_node$'
@@ -102,7 +103,7 @@ stop_pattern "CAN watchdogs" '/bin/bash ./arx_can[135].sh'
 
 echo "Verifying control processes..."
 remaining=$(ps -eo pid,args | grep -E \
-  '(lift_controller|X5Controller|serial_port_node|realsense2_camera_node|collect.py|inference.py)' \
+  '(lift_controller|X5Controller|serial_port_node|realsense2_camera_node|collect.py|inference.py|tau0vla_client.py)' \
   | grep -v grep || true)
 if [[ -n "${remaining}" ]]; then
   echo "WARNING: some control processes remain:" >&2
