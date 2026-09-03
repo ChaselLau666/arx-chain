@@ -7,6 +7,7 @@ export ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-62}
 : "${TASK_INSTRUCTION:=Pick up the handle and place it into the tray.}"
 : "${LIFT_HEIGHT:=15.5}"
 : "${REPLAN_STEPS:=auto}"
+: "${LOG_DIR:=/home/arx/logs/tau0vla}"
 
 set +u
 source /opt/ros/jazzy/setup.bash
@@ -93,14 +94,19 @@ server_q=$(printf '%q' "${MODEL_SERVER_URL}")
 task_q=$(printf '%q' "${TASK_INSTRUCTION}")
 height_q=$(printf '%q' "${LIFT_HEIGHT}")
 replan_q=$(printf '%q' "${REPLAN_STEPS}")
+mkdir -p "${LOG_DIR}"
+log_file="${LOG_DIR}/client_$(date +%Y%m%d_%H%M%S).log"
+log_q=$(printf '%q' "${log_file}")
 extra_args_q=""
 for argument in "$@"; do
   extra_args_q+=" $(printf '%q' "${argument}")"
 done
 
 gnome-terminal --title="tau0vla-inference" -- bash -ic \
-  "cd ${repo_root}/act; conda activate act; python tau0vla_client.py \
+  "set -o pipefail; cd ${repo_root}/act; conda activate act; python tau0vla_client.py \
     --server-url ${server_q} --task-instruction ${task_q} \
-    --expected-height ${height_q} --replan-steps ${replan_q}${extra_args_q}; exec bash"
+    --expected-height ${height_q} --replan-steps ${replan_q}${extra_args_q} \
+    2>&1 | tee -a ${log_q}; exec bash"
 
 echo "Tau0VLA inference terminal launched. Default mode is DRY-RUN; no action publisher is created."
+echo "Client log: ${log_file}"

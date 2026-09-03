@@ -314,6 +314,8 @@ def run(args) -> None:
         deadline = time.monotonic()
         starvation_logged = False
         step = 0
+        published_since_log = 0
+        publish_window_started = time.monotonic()
         while rclpy.ok() and not stop_event.is_set() and step < args.max_steps:
             now = time.monotonic()
             if now < deadline:
@@ -348,6 +350,15 @@ def run(args) -> None:
                 continue
             if args.execute:
                 node.publish_action(action)
+                published_since_log += 1
+                publish_elapsed = now - publish_window_started
+                if publish_elapsed >= 1.0:
+                    print(
+                        f"Publish rate={published_since_log / publish_elapsed:.2f} Hz, "
+                        f"step={step}, buffer={scheduler.remaining}"
+                    )
+                    published_since_log = 0
+                    publish_window_started = now
             elif step % FPS == 0:
                 print(f"DRY-RUN step={step}, action={np.array2string(action, precision=4)}")
             step += 1
