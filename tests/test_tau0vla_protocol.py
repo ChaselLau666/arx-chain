@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -13,9 +14,12 @@ sys.path.insert(0, str(ROOT / "act"))
 from tau0vla_protocol import (  # noqa: E402
     ACTION_DIM,
     ACTION_HORIZON,
+    PROTOCOL_VERSION,
     ActionChunk,
     ChunkScheduler,
+    Observation,
     ProtocolError,
+    Tau0VLAHttpClient,
     recommended_replan_steps,
 )
 
@@ -67,6 +71,77 @@ class ChunkSchedulerTest(unittest.TestCase):
         self.assertEqual(p99, 300.0)
         with self.assertRaises(ProtocolError):
             recommended_replan_steps([900.0] * 30, margin_ms=100.0)
+
+
+class HttpClientTest(unittest.TestCase):
+    def test_health_contract_session_and_chunk(self):
+        class Response:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def raise_for_status(self):
+                return
+
+            def json(self):
+                return self.payload
+
+        class Session:
+            def get(self, url, timeout):
+                if url.endswith("/health"):
+                    return Response({"status": "ok", "ready": True})
+                return Response(
+                    {
+                        "protocol_version": PROTOCOL_VERSION,
+                        "fps": 30,
+                        "camera_names": ["head", "left_wrist", "right_wrist"],
+                        "state_dim": 14,
+                        "action_dim": 14,
+                        "action_horizon": 30,
+                        "action_semantics": "state_t_plus_1",
+                        "joint_names": [
+                            *[f"left_j{i}" for i in range(6)], "left_gripper",
+                            *[f"right_j{i}" for i in range(6)], "right_gripper",
+                        ],
+                        "model_id": "test-model",
+                    }
+                )
+
+            def post(self, url, **kwargs):
+                if url.endswith("/sessions"):
+                    return Response(
+                        {
+                            "protocol_version": PROTOCOL_VERSION,
+                            "session_id": "session",
+                            "model_id": "test-model",
+                        }
+                    )
+                metadata = json.loads(kwargs["data"]["metadata"])
+                return Response(
+                    {
+                        "protocol_version": PROTOCOL_VERSION,
+                        "session_id": "session",
+                        "request_id": metadata["request_id"],
+                        "sample_monotonic_ns": metadata["sample_monotonic_ns"],
+                        "actions": np.zeros((30, 14), dtype=np.float32).tolist(),
+                        "action_dt": 1.0 / 30.0,
+                        "action_semantics": "state_t_plus_1",
+                        "inference_ms": 10.0,
+                        "model_id": "test-model",
+                    }
+                )
+
+        client = Tau0VLAHttpClient("http://server")
+        client.session = Session()
+        client.health()
+        client.policy_contract()
+        client.create_session("pick")
+        observation = Observation(
+            qpos=np.zeros(14, dtype=np.float32),
+            images={name: b"jpeg" for name in ("head", "left_wrist", "right_wrist")},
+            sample_monotonic_ns=123,
+        )
+        chunk = client.infer(observation, 1)
+        self.assertEqual(chunk.actions.shape, (30, 14))
 
 
 if __name__ == "__main__":
