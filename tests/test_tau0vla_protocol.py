@@ -56,6 +56,16 @@ class ChunkSchedulerTest(unittest.TestCase):
         self.assertEqual(skipped, 3)
         np.testing.assert_array_equal(scheduler.next_action(), replacement.actions[3])
 
+    def test_delayed_short_replacement_prefetches_immediately(self):
+        scheduler = ChunkScheduler(replan_steps=15)
+        scheduler.adopt(_chunk(0.0), initial=True)
+        replacement = _chunk(700.0, base=1000.0)
+        skipped = scheduler.adopt(replacement)
+        self.assertEqual(skipped, 21)
+        self.assertEqual(scheduler.remaining, 9)
+        self.assertTrue(scheduler.should_request(request_pending=False))
+        self.assertFalse(scheduler.should_request(request_pending=True))
+
     def test_invalid_chunk_and_starvation_fail(self):
         scheduler = ChunkScheduler(replan_steps=10)
         with self.assertRaises(BufferError):

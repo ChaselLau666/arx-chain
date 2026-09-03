@@ -291,7 +291,7 @@ def run(args) -> None:
         )
         replan_steps, p99_ms = _resolve_replan_steps(args.replan_steps, latencies, args.latency_margin_ms)
         print(f"Selected replan_steps={replan_steps}; measured p99 RTT={p99_ms:.1f} ms")
-        client.max_response_age_ms = max(1000.0, min(args.max_response_age_ms, 2.0 * p99_ms + args.latency_margin_ms))
+        print(f"Runtime response age limit={client.max_response_age_ms:.1f} ms")
 
         request_id += 1
         first = client.infer(wait_for_observation(node, 5.0), request_id)

@@ -201,7 +201,13 @@ class ChunkScheduler:
 
     def should_request(self, request_pending: bool) -> bool:
         return not request_pending and (
-            self.remaining == 0 or self._published_since_adopt >= self.replan_steps
+            self.remaining == 0
+            or self._published_since_adopt >= self.replan_steps
+            # A delayed response may skip most of its prefix. If the usable
+            # suffix is already shorter than the normal replan interval,
+            # prefetch its successor immediately instead of consuming the
+            # short suffix first and guaranteeing starvation.
+            or self.remaining <= self.replan_steps
         )
 
     def adopt(self, chunk: ActionChunk, *, initial: bool = False) -> int:
