@@ -79,6 +79,12 @@ source /opt/ros/jazzy/setup.bash
 source "${VR_WS}/install/setup.bash"
 source "${LIFT_WS}/install/setup.bash"
 source "${X5_WS}/install/setup.bash"
+# Cameras are the one component with no fallback: with no realsense build
+# there is no rs_launch.py to run and no image topics for the collector.
+# Checked here so the failure names the cause, rather than set -e aborting
+# on a bare "No such file or directory" from the source below.
+[[ -f "${REALSENSE_WS}/install/setup.bash" ]] || die \
+    "realsense is not built at ${REALSENSE_WS}; run: cd ${REALSENSE_WS} && colcon build"
 source "${REALSENSE_WS}/install/setup.bash"
 set -u
 
