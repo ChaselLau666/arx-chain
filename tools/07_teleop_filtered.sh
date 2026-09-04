@@ -4,9 +4,12 @@ set -Eeuo pipefail
 # Teleop only, with the VR pose stream low-passed before it reaches the arms.
 #
 # This is 06_collect_filtered.sh with the recording removed: no cameras, no
-# collector, no lift. It exists to answer one question - does teleop actually
-# go through the filter - on a machine that has arms and a VR rig and nothing
-# else. tools/vr_filter_monitor.py reports the answer while this runs.
+# collector. It exists to answer one question - does teleop actually go through
+# the filter - on a machine that has arms and a VR rig and nothing else.
+# tools/vr_filter_monitor.py reports the answer while this runs.
+#
+# WITH_BODY=1 also starts the lift and leaves its height unpinned, so the VR
+# stick raises and lowers the platform. Collection pins it instead; see below.
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/.." && pwd)"
@@ -16,6 +19,8 @@ repo_root="$(cd "${script_dir}/.." && pwd)"
 SMOOTH_TAU=${SMOOTH_TAU:-0.05}
 LOG_DIR=${LOG_DIR:-$HOME/teleop_logs}
 ACT_PYTHON=${ACT_PYTHON:-/home/arx/miniconda3/envs/act/bin/python}
+WITH_BODY=${WITH_BODY:-0}
+LIFT_WS=/home/arx/LIFT/body/ROS2
 X5_WS=/home/arx/LIFT/ARX_X5/ROS2/X5_ws
 VR_WS=/home/arx/LIFT/ARX_VR_SDK/ROS2
 FILTERED_L=/ARX_VR_L_filtered
@@ -57,6 +62,7 @@ source /opt/ros/jazzy/setup.bash
 # sourced before X5: whichever is sourced last wins, and X5Controller aborts at
 # startup with an undefined JointControl typesupport symbol otherwise.
 source "${VR_WS}/install/setup.bash"
+source "${LIFT_WS}/install/setup.bash"
 source "${X5_WS}/install/setup.bash"
 set -u
 
@@ -72,9 +78,10 @@ done
 # Same one-shot bring-up as 06_collect_filtered.sh, and not arx_can1.sh: the
 # repair path in those scripts runs `pkill -9 slcand`, killing the daemon behind
 # every other interface, and their success path loops without ever sleeping.
-# Only can1 and can3 here - teleop needs the arms, not the body on can5.
+# can1 and can3 carry the arms; can5 carries the lift and is only needed when
+# WITH_BODY asks for it.
 SKIP_AUTOSTART=${SKIP_AUTOSTART:-0}
-declare -A CAN_DEVICE=( [can1]=/dev/arxcan1 [can3]=/dev/arxcan3 )
+declare -A CAN_DEVICE=( [can1]=/dev/arxcan1 [can3]=/dev/arxcan3 [can5]=/dev/arxcan5 )
 
 can_is_up() { ip link show "$1" 2>/dev/null | grep -q 'UP'; }
 
@@ -96,11 +103,35 @@ bring_up_can() {
     can_is_up "$iface" || die "${iface} is still not UP after bring-up"
 }
 
-for interface in can1 can3; do
+can_interfaces=(can1 can3)
+(( WITH_BODY )) && can_interfaces+=(can5)
+for interface in "${can_interfaces[@]}"; do
     can_is_up "$interface" && continue
     (( SKIP_AUTOSTART )) && die "${interface} is not UP"
     bring_up_can "$interface"
 done
+
+# --- body, only when the lift is meant to follow the stick ------------------
+
+if (( WITH_BODY )); then
+    lift_is_up() { ros2 node list 2>/dev/null | grep -qx '/lift'; }
+    if ! lift_is_up; then
+        echo "WARNING: body starts now and the lift may home itself. Stand clear."
+        start_component body ros2 launch arx_lift_controller lift.launch.py
+        for _ in $(seq 1 60); do
+            lift_is_up && break
+            sleep 0.5
+        done
+        lift_is_up || die "/lift did not appear within 30s; see ${LOG_DIR}/body.log"
+        wait_for_topic /body_information 20
+    fi
+    # No fixed_height on purpose. The patched body reads -1.0 as "not pinned" and
+    # falls through to the height carried in the VR message, which is what makes
+    # the stick work; the filter passes that field through untouched. Collection
+    # pins it instead, because a recorded episode needs one known height.
+    echo "  lift follows the VR stick - height is NOT pinned"
+    echo "  WARNING: the platform moves to the stick's height on the first VR message"
+fi
 
 # --- arms, pointed at whichever stream this run is testing -------------------
 
