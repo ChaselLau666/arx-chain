@@ -107,10 +107,11 @@ def build_node(args):
                 self.set_state(ARMED, 'arm feedback arrived')
 
         def on_pose(self, msg):
+            now = time.monotonic()
+            self.t_last_pose = now
             if self.state == WAITING:
                 return
             T = target_transform([msg.x, msg.y, msg.z], [msg.roll, msg.pitch, msg.yaw])
-            now = time.monotonic()
 
             if self.state == ARMED:
                 # Gate against where the arm really is, not where the solver was.
@@ -183,6 +184,17 @@ def build_node(args):
             return np.array([self.robot.get_joint(n) for n in JOINTS])
 
         def report(self):
+            # A stalled VR stream is the first thing to rule out: the gate
+            # distance below would otherwise be reported forever from the
+            # last message received, which reads as a hand that never moves.
+            stale = None if self.t_last_pose is None else time.monotonic() - self.t_last_pose
+            if stale is not None and stale > 1.0:
+                self.get_logger().warning(
+                    f'{self.state}: no VR pose for {stale:.0f} s - is serial_port_node running, '
+                    f'the headset awake, and the USB cable in?')
+                self.solved = self.clamped = 0
+                self.residual.clear()
+                return
             if self.state == WAITING:
                 self.get_logger().info('WAITING: no arm feedback yet')
             elif self.state == ARMED:

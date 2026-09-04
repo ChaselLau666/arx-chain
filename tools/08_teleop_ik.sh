@@ -162,12 +162,23 @@ fi
 
 # --- VR serial and the pose filter: reuse or start --------------------------
 
-if topic_up /ARX_VR_L && topic_up /ARX_VR_R; then
+# Alive means a message arrived just now, not that the topic is listed: a
+# serial node whose headset went to sleep, or whose USB port reset, keeps its
+# topics advertised while publishing nothing. Starting a second node beside
+# it makes things worse - two processes contend for the same tty and neither
+# delivers - which is exactly how the VR stream died once. So a stale node is
+# stopped and replaced rather than joined.
+vr_alive() { timeout 3 ros2 topic echo --once "$1" >/dev/null 2>&1; }
+
+if vr_alive /ARX_VR_R; then
     echo "  reusing the running VR serial node"
 else
+    stop_matching "stale VR serial node(s)" \
+        '^[^ ]*python[0-9.]* [^ ]*/ros2 run serial_port serial_port_node( |$)|^[^ ]*/serial_port_node( |$)'
     start_component vr_serial ros2 run serial_port serial_port_node
     wait_for_topic /ARX_VR_L 25
     wait_for_topic /ARX_VR_R 25
+    vr_alive /ARX_VR_R || die "serial_port_node is up but publishes nothing; is the headset on and its USB cable in? see ${LOG_DIR}/vr_serial.log"
 fi
 
 if topic_up "$FILTERED_L" && topic_up "$FILTERED_R"; then
