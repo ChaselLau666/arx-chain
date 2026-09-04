@@ -425,7 +425,7 @@ def run(args) -> None:
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--server-url", default="http://192.168.77.1:8000")
+    parser.add_argument("--server-url", default="http://192.168.50.2:8000")
     parser.add_argument("--task-instruction", default=DEFAULT_TASK)
     parser.add_argument("--config", type=Path, default=ROOT / "data/config.yaml")
     parser.add_argument("--expected-height", type=float, default=15.5)

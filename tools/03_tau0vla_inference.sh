@@ -3,10 +3,10 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-62}
-: "${MODEL_SERVER_URL:=http://192.168.77.1:8000}"
-: "${DIRECT_SERVER_IP:=192.168.77.1}"
+: "${MODEL_SERVER_URL:=http://192.168.50.2:8000}"
+: "${DIRECT_SERVER_IP:=192.168.50.2}"
 : "${DIRECT_INTERFACE:=enp130s0}"
-: "${DIRECT_CLIENT_IP:=192.168.77.2}"
+: "${DIRECT_CLIENT_IP:=192.168.50.1}"
 : "${ALLOW_NON_DIRECT_MODEL_SERVER:=0}"
 : "${TASK_INSTRUCTION:=Pick up the handle and place it into the tray.}"
 : "${LIFT_HEIGHT:=15.5}"

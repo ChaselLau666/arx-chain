@@ -1,6 +1,6 @@
 # Tau0VLA remote inference on ARX LIFT2s
 
-Tau0VLA runs on the dedicated Ethernet link at `192.168.77.1:8000`; ARX1 keeps ROS subscriptions and arm
+Tau0VLA runs on the dedicated Ethernet link at `192.168.50.2:8000`; ARX1 keeps ROS subscriptions and arm
 publication local. This is an independent inference path and does not modify
 `act/inference.py` or the ACT checkpoint path.
 
@@ -30,7 +30,7 @@ Dry-run is the default:
 
 ```bash
 cd /home/arx/ROS2_LIFT_Play/tools
-MODEL_SERVER_URL=http://192.168.77.1:8000 \
+MODEL_SERVER_URL=http://192.168.50.2:8000 \
   ./03_tau0vla_inference.sh
 ```
 
@@ -50,8 +50,8 @@ disabled. For a second-stage arm-only smoothing trial, set
 validated. Every run writes a JSONL command/feedback trace beside the client
 log; summarize it with `python act/tau0vla_trace.py TRACE.jsonl`.
 
-The launcher refuses a direct URL unless `ip route get 192.168.77.1` resolves
-through `enp130s0` with source `192.168.77.2`. Wi-Fi is an explicit diagnostic
+The launcher refuses a direct URL unless `ip route get 192.168.50.2` resolves
+through `enp130s0` with source `192.168.50.1`. Wi-Fi is an explicit diagnostic
 fallback only: it requires both a Wi-Fi URL and
 `ALLOW_NON_DIRECT_MODEL_SERVER=1`.
 
