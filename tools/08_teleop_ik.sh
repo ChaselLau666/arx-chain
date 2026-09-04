@@ -183,7 +183,11 @@ fi
 
 # --- IK nodes: always restarted, so the flags on this command line apply ----
 
-stop_matching "previous IK node(s)" '/act/vr_ik_node\.py( |$)'
+# Anchored on a python interpreter as argv[0] and the script as argv[1]. A
+# looser pattern also matches any shell whose command line merely mentions
+# the script - such as the ssh session that ran this launcher during
+# testing, which it promptly killed.
+stop_matching "previous IK node(s)" '^[^ ]*python[0-9.]* [^ ]*act/vr_ik_node\.py( |$)'
 
 ik_args=(--dt "${IK_DT}" --max-velocity "${IK_MAX_VEL}"
          --engage-distance "$(awk "BEGIN{print ${IK_ENGAGE_MM}/1000}")" --engage-angle "${IK_ENGAGE_DEG}"
