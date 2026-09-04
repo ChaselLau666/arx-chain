@@ -25,20 +25,69 @@ if [[ ! -f "${episode_path}" ]]; then
   exit 1
 fi
 
-# Body must already be up: replay pins /lift through its parameter service and
-# refuses to start if that service is missing. Starting body is deliberately
-# left to the operator, who must first confirm the platform is safely low.
-if ! ros2 node list 2>/dev/null | grep -qx '/lift'; then
-  echo "Refused: /lift is not running. Start body only while the platform is at a safe low position." >&2
-  exit 1
-fi
-
+# CAN first: body talks to the lift over can5, so it cannot come up before this.
+# Brought up with a one-shot slcand rather than arx_can1.sh and friends, whose
+# repair path runs `pkill -9 slcand` and takes down every other interface too.
+declare -A CAN_DEVICE=( [can1]=/dev/arxcan1 [can3]=/dev/arxcan3 [can5]=/dev/arxcan5 )
 for interface in can1 can3 can5; do
-  if ! ip link show "${interface}" 2>/dev/null | grep -q 'UP'; then
+  ip link show "${interface}" 2>/dev/null | grep -q 'UP' && continue
+  if [[ "${SKIP_AUTOSTART:-0}" == 1 ]]; then
     echo "Refused: ${interface} is not UP." >&2
     exit 1
   fi
+  device=${CAN_DEVICE[${interface}]}
+  if ! ip link show "${interface}" >/dev/null 2>&1; then
+    if [[ ! -e "${device}" ]]; then
+      echo "Refused: ${device} is missing; the CAN adapter for ${interface} is unplugged." >&2
+      exit 1
+    fi
+    echo "  ${interface}: starting slcand on ${device}"
+    sudo slcand -o -f -s8 "${device}" "${interface}" || {
+      echo "Refused: slcand failed for ${interface}." >&2; exit 1; }
+    for _ in $(seq 1 20); do
+      ip link show "${interface}" >/dev/null 2>&1 && break
+      sleep 0.25
+    done
+  fi
+  sudo ip link set "${interface}" up || { echo "Refused: could not bring ${interface} up." >&2; exit 1; }
+  ip link show "${interface}" 2>/dev/null | grep -q 'UP' || {
+    echo "Refused: ${interface} is still not UP after bring-up." >&2; exit 1; }
 done
+
+# Body: launch when absent, reuse when already up - the same shape as the arm
+# stack below, so running this script twice in a row starts one body, not two.
+# Replay pins /lift through its parameter service, so it has to exist.
+if ros2 node list 2>/dev/null | grep -qx '/lift'; then
+  echo "Reusing the running body."
+elif [[ "${SKIP_AUTOSTART:-0}" == 1 ]]; then
+  echo "Refused: /lift is not running." >&2
+  exit 1
+else
+  body_log=/tmp/replay_body.log
+  echo "Starting body; log: ${body_log}"
+  echo "WARNING: body starts now and the lift may home itself. Stand clear."
+  setsid bash -c '
+    set +u
+    source /opt/ros/jazzy/setup.bash
+    source /home/arx/LIFT/body/ROS2/install/setup.bash
+    set -u
+    exec ros2 launch arx_lift_controller lift.launch.py
+  ' > "${body_log}" 2>&1 < /dev/null &
+
+  body_ready=false
+  for _ in $(seq 1 60); do
+    sleep 0.5
+    if ros2 node list 2>/dev/null | grep -qx '/lift'; then
+      body_ready=true
+      break
+    fi
+  done
+  if [[ "${body_ready}" != true ]]; then
+    echo "Refused: /lift did not appear within 30s. Check ${body_log}" >&2
+    exit 1
+  fi
+  echo "Body is up."
+fi
 
 # VR must be absent. Its arm stack (v2_pos_control) subscribes to ARX_VR_* instead
 # of arm_master_*_status, so replay commands would be ignored while VR keeps
