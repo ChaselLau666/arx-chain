@@ -41,6 +41,20 @@ class ActRangeToolTests(unittest.TestCase):
             self.assertEqual((root / "view" / "episode_0.hdf5").resolve(), sources[0])
             self.assertTrue(manifest_path.is_file())
 
+    def test_view_allows_code_commit_refresh_without_data_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.hdf5"
+            source.touch()
+            base = {
+                "repo_commit": "old",
+                "episodes": [{"local_episode": 0, "source_path": str(source.resolve())}],
+            }
+            manifest_path = prepare_view(root / "view", base)
+            updated = {**base, "repo_commit": "new"}
+            prepare_view(root / "view", updated)
+            self.assertIn('"new"', manifest_path.read_text())
+
     def test_temporal_aggregation_uses_only_valid_chunks(self):
         chunks = np.zeros((3, 5, 2), dtype=np.float32)
         valid = np.zeros((3, 5), dtype=bool)

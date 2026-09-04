@@ -112,7 +112,7 @@ if [[ "$tracked_session" != true ]]; then
     exit 1
   fi
   legacy_candidates=$(ps -eo pid,ppid,pgid,args | grep -E \
-    '(lift_controller|X5Controller|serial_port_node|realsense2_camera_node|collect.py|human_dagger.py)' \
+    '(lift_controller|X5Controller|serial_port_node|realsense2_camera_node|collect.py|human_dagger.py|tau0vla_client.py)' \
     | grep -v grep || true)
   echo "LEGACY SHUTDOWN OPT-IN: these broad-matched processes may be stopped:"
   printf '%s\n' "${legacy_candidates:-<none found>}"
@@ -346,6 +346,7 @@ else
   stop_pattern "Human DAgger frontend" '[p]ython(3)? .*[/]human_dagger.py'
   stop_pattern "collector" '[p]ython .*collect.py'
   stop_pattern "inference" '[p]ython .*inference.py'
+  stop_pattern "Tau0VLA inference" '[p]ython .*tau0vla_client.py'
   stop_pattern "replay" '[p]ython .*replay.py'
   stop_pattern "VR diagnostics" 'ros2 topic (echo|hz) /ARX_VR_[LR]'
   stop_pattern "VR serial launcher" '/opt/ros/jazzy/bin/ros2 run serial_port serial_port_node'
@@ -360,7 +361,7 @@ else
 fi
 echo "Verifying control processes..."
 remaining=$(ps -eo pid,args | grep -E \
-  '(lift_controller|X5Controller|serial_port_node|realsense2_camera_node|collect.py|inference.py|human_dagger.py|human_dagger_arm_(left|right)|arx_can[135].sh)' \
+  '(lift_controller|X5Controller|serial_port_node|realsense2_camera_node|collect.py|inference.py|tau0vla_client.py|human_dagger.py|human_dagger_arm_(left|right)|arx_can[135].sh)' \
   | grep -v grep || true)
 if [[ -n "${remaining}" ]]; then
   echo "WARNING: some control processes remain:" >&2
