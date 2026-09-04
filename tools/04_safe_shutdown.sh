@@ -11,6 +11,11 @@ source /home/arx/LIFT/body/ROS2/install/setup.bash
 set -u
 
 runtime_root=${HUMAN_DAGGER_RUNTIME_DIR:-"${XDG_RUNTIME_DIR:-/tmp}/human_dagger-${UID}"}
+# HUMAN_DAGGER_AUTO_CONFIRM=1 (04_auto_shutdown.sh) answers the LOWER/LOW
+# prompts automatically. The height gate stays: wait_for_safe_height.py still
+# blocks on stable feedback <= 1.0. The legacy broad-match path is NEVER
+# auto-confirmed; it can kill another developer's processes.
+auto_confirm=${HUMAN_DAGGER_AUTO_CONFIRM:-0}
 active_manifest="${runtime_root}/active.manifest"
 
 proc_start_ticks() {
@@ -111,6 +116,11 @@ if [[ "$tracked_session" != true ]]; then
     | grep -v grep || true)
   echo "LEGACY SHUTDOWN OPT-IN: these broad-matched processes may be stopped:"
   printf '%s\n' "${legacy_candidates:-<none found>}"
+  if [[ "$auto_confirm" == 1 ]]; then
+    echo 'Refused: auto-confirm never covers the legacy broad-match path.' >&2
+    echo 'Run 04_safe_shutdown.sh interactively to review the PIDs above.' >&2
+    exit 1
+  fi
   read -r -p 'Type CONFIRM LEGACY PIDS to continue: ' legacy_confirmation
   if [[ "$legacy_confirmation" != "CONFIRM LEGACY PIDS" ]]; then
     echo "Cancelled; no HOLD, height command, or signal sent."
@@ -173,7 +183,12 @@ if ros2 node list 2>/dev/null | grep -qx '/lift'; then
   echo "Direction: DOWN (or HOLD if already low)"
   echo "Expected behavior: platform reaches a stable feedback <= 1.0 before body is stopped."
   echo "WARNING: an active episode will be closed as partial/quarantined data."
-  read -r -p 'Type LOWER AND SHUTDOWN to continue: ' confirmation
+  if [[ "$auto_confirm" == 1 ]]; then
+    confirmation='LOWER AND SHUTDOWN'
+    echo 'Auto-confirm: LOWER AND SHUTDOWN'
+  else
+    read -r -p 'Type LOWER AND SHUTDOWN to continue: ' confirmation
+  fi
   if [[ "${confirmation}" != "LOWER AND SHUTDOWN" ]]; then
     echo "Cancelled; no command or signal sent."
     exit 1
@@ -195,7 +210,12 @@ if ros2 node list 2>/dev/null | grep -qx '/lift'; then
     --safe-max 1.0 --tolerance 0.02 --window 2.0 --timeout 90.0
 
   echo "Feedback is low and stable. Visually inspect the platform now."
-  read -r -p 'Type CONFIRM LOW to stop all control programs: ' low_confirmation
+  if [[ "$auto_confirm" == 1 ]]; then
+    low_confirmation='CONFIRM LOW'
+    echo 'Auto-confirm: CONFIRM LOW (feedback height verified stable and low)'
+  else
+    read -r -p 'Type CONFIRM LOW to stop all control programs: ' low_confirmation
+  fi
   if [[ "${low_confirmation}" != "CONFIRM LOW" ]]; then
     echo "Refused: body remains running at low target; no processes were stopped."
     exit 1
@@ -212,7 +232,12 @@ else
   echo "Required physical state: platform is already at a safe low position."
   echo "Expected behavior: only remaining collector, VR, cameras, arms, and CAN watchdogs will stop."
   echo "WARNING: an active episode will be closed as partial/quarantined data."
-  read -r -p 'After visually confirming the platform is low, type CONFIRM ALREADY LOW: ' low_confirmation
+  if [[ "$auto_confirm" == 1 ]]; then
+    low_confirmation='CONFIRM ALREADY LOW'
+    echo 'Auto-confirm: CONFIRM ALREADY LOW (no lift command is sent on this path)'
+  else
+    read -r -p 'After visually confirming the platform is low, type CONFIRM ALREADY LOW: ' low_confirmation
+  fi
   if [[ "${low_confirmation}" != "CONFIRM ALREADY LOW" ]]; then
     echo "Cancelled; no command or signal sent."
     exit 1
