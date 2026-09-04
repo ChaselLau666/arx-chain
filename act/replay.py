@@ -17,6 +17,7 @@ import yaml
 import h5py
 import argparse
 import signal
+import time
 
 import rclpy
 
@@ -31,7 +32,8 @@ from functools import partial
 from utils.ros_operator import RosOperator, Rate
 from utils.setup_loader import setup_loader
 from lift_height import configure_fixed_height
-from replay_support import episode_start_pose, resolve_replay_height
+from replay_support import (episode_start_pose, resolve_replay_height, tracking_report,
+                            smooth_causal)
 
 
 def load_yaml(yaml_file):
@@ -96,6 +98,16 @@ def robot_action(ros_operator, args, action, action_base, actions_velocity):
         ros_operator.set_robot_base_target(np.concatenate([action_base, actions_velocity]))
 
 
+def current_qpos(ros_operator):
+    """Latest 14-D arm feedback, or None until both arms have reported."""
+    left = ros_operator.follow_left_arm_deque
+    right = ros_operator.follow_right_arm_deque
+    if not left or not right:
+        return None
+
+    return np.concatenate([list(left[-1].joint_pos)[:7], list(right[-1].joint_pos)[:7]])
+
+
 def init_robot(ros_operator, use_base, start_pose):
     left_start, right_start = start_pose
 
@@ -125,6 +137,31 @@ def signal_handler(signal, frame, ros_operator):
     print('\nCaught Ctrl+C / SIGINT; stopping after the current frame.')
     stop_requested.set()
     ros_operator.request_arm_publish_stop()
+
+
+def summarise_tracking(args, times, command, actual):
+    """Report how closely the arms followed the replayed trajectory."""
+    report = tracking_report(command, actual)
+    elapsed = times[-1] - times[0]
+    achieved = (len(times) - 1) / elapsed if elapsed > 0 else float('nan')
+
+    print('\n--- tracking report ---')
+    print(f'frames compared : {report["frames"]}')
+    print(f'replay rate     : {achieved:.2f} Hz measured vs {args.frame_rate} Hz requested')
+    print(f'feedback lag    : {report["lag_frames"]} frames '
+          f'({report["lag_frames"] / args.frame_rate * 1000:.1f} ms)')
+    print(f'arm joints      : rmse {report["arm_rmse"]:.4f} rad, max {report["arm_max"]:.4f} rad')
+    print(f'  left  rmse {np.round(report["arm_per_joint_rmse"][:6], 4)}')
+    print(f'  right rmse {np.round(report["arm_per_joint_rmse"][6:], 4)}')
+    print(f'grippers        : feedback sits {report["gripper_turns"]} whole turn(s) '
+          f'from the commanded frame (removed before comparing)')
+    print(f'  residual      rmse {np.round(report["gripper_rmse"], 4)} rad, '
+          f'max {np.round(report["gripper_max"], 4)}')
+
+    os.makedirs(os.path.dirname(os.path.abspath(args.record_actual)) or '.', exist_ok=True)
+    np.savez(args.record_actual, t=times, command=command, actual=actual,
+             frame_rate=args.frame_rate, episode=str(args.episode_path))
+    print(f'raw log saved to {args.record_actual}')
 
 
 def main(args):
@@ -175,6 +212,14 @@ def main(args):
     else:
         replay_actions = qpoes
 
+    if args.smooth_tau > 0:
+        raw = replay_actions
+        replay_actions = smooth_causal(replay_actions, args.smooth_tau, 1.0 / args.frame_rate)
+        moved = np.abs(replay_actions - raw).max()
+        print(f'Smoothed arm joints with a causal one-pole filter: tau={args.smooth_tau:.3f}s, '
+              f'alpha={1 - np.exp(-1 / (args.frame_rate * args.smooth_tau)):.4f}; '
+              f'largest change {moved:.4f} rad. Grippers were left untouched.')
+
     start_pose = episode_start_pose(replay_actions)
     if armed:
         init_robot(ros_operator, args.use_base, start_pose)
@@ -185,6 +230,7 @@ def main(args):
 
     rate = Rate(args.frame_rate)
     total = len(replay_actions)
+    log_t, log_cmd, log_actual = [], [], []
     for idx in range(total):
         if stop_requested.is_set():
             print(f'Replay stopped by operator at frame {idx}/{total}.')
@@ -193,12 +239,21 @@ def main(args):
         if armed:
             robot_action(ros_operator, args, replay_actions[idx],
                          action_base[idx], actions_velocity[idx])
+            if args.record_actual:
+                measured = current_qpos(ros_operator)
+                if measured is not None:
+                    log_t.append(time.monotonic())
+                    log_cmd.append(np.asarray(replay_actions[idx], dtype=float))
+                    log_actual.append(measured)
         elif idx % args.frame_rate == 0:
             print(f'DRY-RUN frame {idx}/{total}: {np.round(replay_actions[idx], 4)}')
 
         rate.sleep()
     else:
         print(f'Replay finished: {total} frames.')
+
+    if armed and args.record_actual and len(log_cmd) >= 2:
+        summarise_tracking(args, np.array(log_t), np.array(log_cmd), np.array(log_actual))
 
     ros_operator.base_enable = False
 
@@ -223,6 +278,14 @@ def parse_args(known=False):
                         help='fixed lift command in [0, 20]; defaults to the recorded height_command')
     parser.add_argument('--execute', action='store_true',
                         help='publish arm targets and set the lift; default is dry-run')
+    parser.add_argument('--smooth-tau', type=float, default=0.0,
+                        help='time constant of a causal one-pole filter applied to the arm '
+                             'joints before replay, in seconds; 0 disables it. Matches the '
+                             'teleop-app filter, and delays the trajectory by roughly tau')
+    parser.add_argument('--record-actual', type=str,
+                        default=str(Path.home() / 'replay_logs' / 'replay_actual.npz'),
+                        help='write per-frame commanded/actual qpos here and print a tracking '
+                             'report; pass an empty string to disable')
     parser.add_argument('--height-tolerance', type=float, default=0.06,
                         help='lift feedback is settled when its 2s range stays within this; '
                              'must exceed the encoder quantisation of the machine in use')
