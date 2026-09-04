@@ -26,16 +26,20 @@ its joint limits 236 mm from the target on the first dry run. So:
   TRACKING  solving and publishing. Each joint may move at most
             --max-velocity, using the measured message interval, so a far
             target is walked toward rather than lunged at. If the position
-            residual exceeds --max-residual the target has left the
-            workspace (or the controller dropped back to its parking pose);
-            publishing stops and the node returns to ARMED, holding the
-            last command, until the target comes back within reach.
+            residual stays above --max-residual without improving over
+            --stall-window messages, the solver has stalled: the target left
+            the workspace, or the controller dropped back to its parking
+            pose. Publishing stops and the node returns to ARMED, holding
+            the last command, until the target comes back within reach.
+            Distance alone is not the test - right after engaging the
+            residual is the whole engage distance and is meant to shrink.
 
 Nothing is published without --execute.
 """
 from __future__ import annotations
 
 import argparse
+import collections
 import sys
 import time
 from pathlib import Path
@@ -82,6 +86,7 @@ def build_node(args):
             self.t_prev_msg = None
             self.solved = self.clamped = 0
             self.residual = []
+            self.res_hist = collections.deque(maxlen=args.stall_window)
             self.gate = None            # (distance m, angle deg) of the latest target vs the arm
             self.t_state_change = time.monotonic()
 
@@ -116,6 +121,7 @@ def build_node(args):
                     return
                 self.seed(self.q_feedback)
                 self.t_prev_msg = now
+                self.res_hist.clear()
                 self.set_state(TRACKING, f'target within {self.gate[0] * 1000:.0f} mm / {self.gate[1]:.0f} deg of the arm')
 
             dt = min(max(now - self.t_prev_msg, 1 / 500), 1 / 20)   # tolerate a stalled stream
@@ -135,9 +141,17 @@ def build_node(args):
 
             res = float(np.linalg.norm(self.robot.get_T_world_frame(EE_FRAME)[:3, 3] - T[:3, 3]))
             self.residual.append(res)
+            self.res_hist.append(res)
             self.solved += 1
-            if res > args.max_residual:
-                self.set_state(ARMED, f'residual {res * 1000:.0f} mm - target left the workspace; holding')
+            # Unreachable means the solver has stalled, not that the target is
+            # currently far: right after engaging the residual is the whole
+            # engage distance and shrinks over the next few messages as the
+            # velocity cap lets the arm walk in. A target outside the workspace
+            # leaves the residual large and flat instead.
+            if (res > args.max_residual and len(self.res_hist) == self.res_hist.maxlen
+                    and res > 0.9 * self.res_hist[0]):
+                self.set_state(ARMED, f'residual {res * 1000:.0f} mm and not improving over '
+                                      f'{self.res_hist.maxlen} messages - target is out of reach; holding')
                 return
 
             if self.pub is not None:
@@ -207,7 +221,9 @@ def main():
     parser.add_argument('--max-velocity', type=float, default=1.5,
                         help='rad/s per joint, applied per message using the measured interval')
     parser.add_argument('--max-residual', type=float, default=0.03,
-                        help='m; above this the target is treated as unreachable and publishing stops')
+                        help='m; a residual above this that stops improving means the target is out of reach')
+    parser.add_argument('--stall-window', type=int, default=30,
+                        help='messages over which the residual must improve, else the target is out of reach')
     parser.add_argument('--report-period', type=float, default=2.0)
     parser.add_argument('--execute', action='store_true',
                         help='publish joint targets; default solves and reports only')
