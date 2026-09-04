@@ -137,6 +137,10 @@ COLCON_IGNORE
 AMENT_IGNORE
 
 **/datasets
+# Only the bare name matched above, so dated and purpose-suffixed capture
+# directories (datasets_0902_PICKANDPLACE, datasets_pipeline_test) were not
+# covered. Directory-scoped so a datasets_*.py file is still tracked.
+**/datasets_*/
 **/dagger_datasets
 **/weights
 **/runs
