@@ -31,6 +31,9 @@ SKIP_AUTOSTART=${SKIP_AUTOSTART:-0}
 # has none. The episodes carry no images and are written elsewhere; see the
 # collector invocation at the end of this file.
 SKIP_CAMERAS=${SKIP_CAMERAS:-0}
+# Starts nothing and reuses whatever is already running, for when the
+# collector alone needs restarting. Verified, not assumed; see below.
+COLLECTOR_ONLY=${COLLECTOR_ONLY:-0}
 LOG_DIR=${LOG_DIR:-$HOME/collect_logs}
 ACT_PYTHON=${ACT_PYTHON:-/home/arx/miniconda3/envs/act/bin/python}
 LIFT_WS=/home/arx/LIFT/body/ROS2
@@ -96,68 +99,90 @@ set -u
 
 # --- preconditions, all refused rather than repaired -------------------------
 
-# Anchored on the executable path, not on any mention of the name: a plain
-# substring also matches the shell that happens to have the word in its command
-# line, which refuses startup for no reason.
-for pattern in '/arx_x5_controller/X5Controller( |$)' \
-               '/serial_port_node( |$)' \
-               '/act/collect\.py( |$)' \
-               '/act/vr_pose_filter\.py( |$)'; do
-    if conflicting=$(pgrep -f -- "$pattern" 2>/dev/null); then
-        echo "Conflicting processes for ${pattern}:" >&2
-        ps -o pid,args -p "$(tr '\n' ',' <<< "$conflicting" | sed 's/,$//')" >&2 || true
-        die "another control stack is already running"
-    fi
-done
-
-declare -A CAN_DEVICE=( [can1]=/dev/arxcan1 [can3]=/dev/arxcan3 [can5]=/dev/arxcan5 )
-
-can_is_up() { ip link show "$1" 2>/dev/null | grep -q 'UP'; }
-
-# Deliberately not arx_can1.sh and friends: each of those is a watchdog loop
-# whose repair path runs `pkill -9 slcand`, taking down the daemon behind every
-# other interface too, and whose success path spins without ever sleeping. This
-# does the one-shot bring-up those scripts do, and nothing else.
-bring_up_can() {
-    # Two statements, not one: local expands all its arguments before it
-    # assigns any of them, so ${CAN_DEVICE[$iface]} on the same line reads an
-    # iface that is still unset and yields an empty device path.
-    local iface=$1
-    local dev=${CAN_DEVICE[$iface]}
-    if ! ip link show "$iface" >/dev/null 2>&1; then
-        [[ -e "$dev" ]] || die "${dev} is missing; the CAN adapter for ${iface} is unplugged"
-        echo "  ${iface}: starting slcand on ${dev}"
-        sudo slcand -o -f -s8 "$dev" "$iface" || die "slcand failed for ${iface}"
-        for _ in $(seq 1 20); do
-            ip link show "$iface" >/dev/null 2>&1 && break
-            sleep 0.25
+if (( COLLECTOR_ONLY )); then
+    # Reuse a stack that is already up. The usual case is a collector that died
+    # or was stopped while every other component kept running, where restarting
+    # the lot costs another lift homing cycle for nothing. Nothing is started
+    # here, so what the collector reads is checked rather than assumed.
+    echo "COLLECTOR_ONLY=1: reusing the running stack, starting only the collector."
+    required=(/ARX_VR_L /arm_l_status_full /arm_r_status_full /body_information)
+    if (( ! SKIP_CAMERAS )); then
+        for camera in camera_h camera_l camera_r; do
+            required+=("/camera/${camera}/color/image_rect_raw/compressed")
         done
     fi
-    sudo ip link set "$iface" up || die "could not bring ${iface} up"
-    can_is_up "$iface" || die "${iface} is still not UP after bring-up"
-}
-
-for interface in can1 can3 can5; do
-    can_is_up "$interface" && continue
-    (( SKIP_AUTOSTART )) && die "${interface} is not UP"
-    bring_up_can "$interface"
-done
-
-lift_is_up() { ros2 node list 2>/dev/null | grep -qx '/lift'; }
-
-if ! lift_is_up; then
-    (( SKIP_AUTOSTART )) && die "/lift is not running"
-    # The lift motor is uncalibrated at power-on and homes itself before it obeys
-    # fixed_height, so the platform can travel on its own here. 01_collect.sh
-    # starts body exactly the same way; this only says so out loud first.
-    echo "WARNING: body starts now and the lift may home itself. Stand clear."
-    start_component body ros2 launch arx_lift_controller lift.launch.py
-    for _ in $(seq 1 60); do
-        lift_is_up && break
-        sleep 0.5
+    for topic in "${required[@]}"; do
+        ros2 topic list 2>/dev/null | grep -qx "$topic" \
+            || die "${topic} is missing, so the stack is not up; rerun without COLLECTOR_ONLY=1"
     done
-    lift_is_up || die "/lift did not appear within 30s; see ${LOG_DIR}/body.log"
-    wait_for_topic /body_information 20
+    ros2 node list 2>/dev/null | grep -qx '/lift' \
+        || die "/lift is not running; rerun without COLLECTOR_ONLY=1"
+    echo "  every topic the collector reads is present"
+else
+    # Anchored on the executable path, not on any mention of the name: a plain
+    # substring also matches the shell that happens to have the word in its command
+    # line, which refuses startup for no reason.
+    for pattern in '/arx_x5_controller/X5Controller( |$)' \
+                   '/serial_port_node( |$)' \
+                   '/act/collect\.py( |$)' \
+                   '/act/vr_pose_filter\.py( |$)'; do
+        if conflicting=$(pgrep -f -- "$pattern" 2>/dev/null); then
+            echo "Conflicting processes for ${pattern}:" >&2
+            ps -o pid,args -p "$(tr '\n' ',' <<< "$conflicting" | sed 's/,$//')" >&2 || true
+            die "another control stack is already running"
+        fi
+    done
+
+    declare -A CAN_DEVICE=( [can1]=/dev/arxcan1 [can3]=/dev/arxcan3 [can5]=/dev/arxcan5 )
+
+    can_is_up() { ip link show "$1" 2>/dev/null | grep -q 'UP'; }
+
+    # Deliberately not arx_can1.sh and friends: each of those is a watchdog loop
+    # whose repair path runs `pkill -9 slcand`, taking down the daemon behind every
+    # other interface too, and whose success path spins without ever sleeping. This
+    # does the one-shot bring-up those scripts do, and nothing else.
+    bring_up_can() {
+        # Two statements, not one: local expands all its arguments before it
+        # assigns any of them, so ${CAN_DEVICE[$iface]} on the same line reads an
+        # iface that is still unset and yields an empty device path.
+        local iface=$1
+        local dev=${CAN_DEVICE[$iface]}
+        if ! ip link show "$iface" >/dev/null 2>&1; then
+            [[ -e "$dev" ]] || die "${dev} is missing; the CAN adapter for ${iface} is unplugged"
+            echo "  ${iface}: starting slcand on ${dev}"
+            sudo slcand -o -f -s8 "$dev" "$iface" || die "slcand failed for ${iface}"
+            for _ in $(seq 1 20); do
+                ip link show "$iface" >/dev/null 2>&1 && break
+                sleep 0.25
+            done
+        fi
+        sudo ip link set "$iface" up || die "could not bring ${iface} up"
+        can_is_up "$iface" || die "${iface} is still not UP after bring-up"
+    }
+
+    for interface in can1 can3 can5; do
+        can_is_up "$interface" && continue
+        (( SKIP_AUTOSTART )) && die "${interface} is not UP"
+        bring_up_can "$interface"
+    done
+
+    lift_is_up() { ros2 node list 2>/dev/null | grep -qx '/lift'; }
+
+    if ! lift_is_up; then
+        (( SKIP_AUTOSTART )) && die "/lift is not running"
+        # The lift motor is uncalibrated at power-on and homes itself before it obeys
+        # fixed_height, so the platform can travel on its own here. 01_collect.sh
+        # starts body exactly the same way; this only says so out loud first.
+        echo "WARNING: body starts now and the lift may home itself. Stand clear."
+        start_component body ros2 launch arx_lift_controller lift.launch.py
+        for _ in $(seq 1 60); do
+            lift_is_up && break
+            sleep 0.5
+        done
+        lift_is_up || die "/lift did not appear within 30s; see ${LOG_DIR}/body.log"
+        wait_for_topic /body_information 20
+    fi
+
 fi
 
 # --- pin the lift before VR starts ------------------------------------------
@@ -188,80 +213,83 @@ if [[ "${height_set}" != true ]]; then
 fi
 echo "  /lift fixed_height set to ${LIFT_HEIGHT}"
 
-# --- arms, pointed at the filtered pose stream ------------------------------
+if (( ! COLLECTOR_ONLY )); then
+    # --- arms, pointed at the filtered pose stream ------------------------------
 
-echo "WARNING: the arms power up now and may home themselves. Stand clear."
+    echo "WARNING: the arms power up now and may home themselves. Stand clear."
 
-start_arm() {
-    local node=$1 can=$2 pub=$3 sub=$4
-    start_component "$node" \
-        ros2 run arx_x5_controller X5Controller --ros-args \
-        -r __node:="$node" \
-        -p arm_can_id:="$can" \
-        -p arm_control_type:=vr_slave \
-        -p arm_end_type:=2 \
-        -p arm_pub_topic_name:="$pub" \
-        -p arm_sub_topic_name:="$sub"
-}
+    start_arm() {
+        local node=$1 can=$2 pub=$3 sub=$4
+        start_component "$node" \
+            ros2 run arx_x5_controller X5Controller --ros-args \
+            -r __node:="$node" \
+            -p arm_can_id:="$can" \
+            -p arm_control_type:=vr_slave \
+            -p arm_end_type:=2 \
+            -p arm_pub_topic_name:="$pub" \
+            -p arm_sub_topic_name:="$sub"
+    }
 
-if [[ "${SMOOTH_TAU}" == "0" || "${SMOOTH_TAU}" == "0.0" ]]; then
-    echo "  SMOOTH_TAU=0: arms take the raw VR stream, matching 01_collect.sh"
-    start_arm vr_arm_l can1 arm_l_status /ARX_VR_L
-    start_arm vr_arm_r can3 arm_r_status /ARX_VR_R
-else
-    start_arm vr_arm_l can1 arm_l_status "${FILTERED_L}"
-    start_arm vr_arm_r can3 arm_r_status "${FILTERED_R}"
-fi
-wait_for_topic /arm_l_status_full 25
-wait_for_topic /arm_r_status_full 25
+    if [[ "${SMOOTH_TAU}" == "0" || "${SMOOTH_TAU}" == "0.0" ]]; then
+        echo "  SMOOTH_TAU=0: arms take the raw VR stream, matching 01_collect.sh"
+        start_arm vr_arm_l can1 arm_l_status /ARX_VR_L
+        start_arm vr_arm_r can3 arm_r_status /ARX_VR_R
+    else
+        start_arm vr_arm_l can1 arm_l_status "${FILTERED_L}"
+        start_arm vr_arm_r can3 arm_r_status "${FILTERED_R}"
+    fi
+    wait_for_topic /arm_l_status_full 25
+    wait_for_topic /arm_r_status_full 25
 
-# --- cameras ----------------------------------------------------------------
+    # --- cameras ----------------------------------------------------------------
 
-if (( SKIP_CAMERAS )); then
-    echo "  SKIP_CAMERAS=1: no cameras started; the episodes will carry no images"
-else
-    # realsense.sh opens a gnome-terminal per camera, which cannot work once this
-    # script is detached from a display. The serials still come from that file, so
-    # it stays the one place they are configured.
-    declare -A CAMERA_SERIAL
-    while read -r name serial; do
-        [[ -n "$name" ]] && CAMERA_SERIAL["$name"]="$serial"
-    done < <(sed -n 's/^ *\[\([a-z_]*\)\]="\([0-9]*\)".*/\1 \2/p' \
-             "${repo_root}/realsense/realsense.sh")
-    (( ${#CAMERA_SERIAL[@]} == 3 )) \
-        || die "expected 3 camera serials in realsense/realsense.sh, found ${#CAMERA_SERIAL[@]}"
+    if (( SKIP_CAMERAS )); then
+        echo "  SKIP_CAMERAS=1: no cameras started; the episodes will carry no images"
+    else
+        # realsense.sh opens a gnome-terminal per camera, which cannot work once this
+        # script is detached from a display. The serials still come from that file, so
+        # it stays the one place they are configured.
+        declare -A CAMERA_SERIAL
+        while read -r name serial; do
+            [[ -n "$name" ]] && CAMERA_SERIAL["$name"]="$serial"
+        done < <(sed -n 's/^ *\[\([a-z_]*\)\]="\([0-9]*\)".*/\1 \2/p' \
+                 "${repo_root}/realsense/realsense.sh")
+        (( ${#CAMERA_SERIAL[@]} == 3 )) \
+            || die "expected 3 camera serials in realsense/realsense.sh, found ${#CAMERA_SERIAL[@]}"
 
-    for camera in camera_h camera_l camera_r; do
-        serial=${CAMERA_SERIAL[$camera]:-}
-        [[ -n "$serial" ]] || die "no serial configured for ${camera}"
-        start_component "$camera" \
-            ros2 launch realsense2_camera rs_launch.py \
-            camera_name:="$camera" \
-            depth_module.color_profile:="${CAMERA_PROFILE}" \
-            depth_module.depth_profile:="${CAMERA_PROFILE}" \
-            serial_no:="_${serial}"
-    done
-    for camera in camera_h camera_l camera_r; do
-        wait_for_topic "/camera/${camera}/color/image_rect_raw/compressed" 40
-    done
-fi
+        for camera in camera_h camera_l camera_r; do
+            serial=${CAMERA_SERIAL[$camera]:-}
+            [[ -n "$serial" ]] || die "no serial configured for ${camera}"
+            start_component "$camera" \
+                ros2 launch realsense2_camera rs_launch.py \
+                camera_name:="$camera" \
+                depth_module.color_profile:="${CAMERA_PROFILE}" \
+                depth_module.depth_profile:="${CAMERA_PROFILE}" \
+                serial_no:="_${serial}"
+        done
+        for camera in camera_h camera_l camera_r; do
+            wait_for_topic "/camera/${camera}/color/image_rect_raw/compressed" 40
+        done
+    fi
 
-# --- VR, then the filter that feeds the arms --------------------------------
+    # --- VR, then the filter that feeds the arms --------------------------------
 
-start_component vr_serial ros2 run serial_port serial_port_node
-wait_for_topic /ARX_VR_L 25
-wait_for_topic /ARX_VR_R 25
+    start_component vr_serial ros2 run serial_port serial_port_node
+    wait_for_topic /ARX_VR_L 25
+    wait_for_topic /ARX_VR_R 25
 
-if [[ "${SMOOTH_TAU}" != "0" && "${SMOOTH_TAU}" != "0.0" ]]; then
-    start_component vr_filter_l "$ACT_PYTHON" "${repo_root}/act/vr_pose_filter.py" \
-        --in-topic /ARX_VR_L --out-topic "${FILTERED_L}" \
-        --tau "${SMOOTH_TAU}" --node-name vr_pose_filter_l
-    start_component vr_filter_r "$ACT_PYTHON" "${repo_root}/act/vr_pose_filter.py" \
-        --in-topic /ARX_VR_R --out-topic "${FILTERED_R}" \
-        --tau "${SMOOTH_TAU}" --node-name vr_pose_filter_r
-    wait_for_topic "${FILTERED_L}" 20
-    wait_for_topic "${FILTERED_R}" 20
-    echo "  VR poses are low-passed at tau=${SMOOTH_TAU}s before reaching the arms"
+    if [[ "${SMOOTH_TAU}" != "0" && "${SMOOTH_TAU}" != "0.0" ]]; then
+        start_component vr_filter_l "$ACT_PYTHON" "${repo_root}/act/vr_pose_filter.py" \
+            --in-topic /ARX_VR_L --out-topic "${FILTERED_L}" \
+            --tau "${SMOOTH_TAU}" --node-name vr_pose_filter_l
+        start_component vr_filter_r "$ACT_PYTHON" "${repo_root}/act/vr_pose_filter.py" \
+            --in-topic /ARX_VR_R --out-topic "${FILTERED_R}" \
+            --tau "${SMOOTH_TAU}" --node-name vr_pose_filter_r
+        wait_for_topic "${FILTERED_L}" 20
+        wait_for_topic "${FILTERED_R}" 20
+        echo "  VR poses are low-passed at tau=${SMOOTH_TAU}s before reaching the arms"
+    fi
+
 fi
 
 trap - EXIT
