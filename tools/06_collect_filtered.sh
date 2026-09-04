@@ -3,7 +3,8 @@ set -Eeuo pipefail
 
 # Collection with the VR pose stream low-passed before it reaches the arms.
 #
-# The only difference from 01_collect.sh is where the arms get their commands:
+# Like 01_collect.sh this brings up CAN and body itself, so it is a drop-in
+# replacement for it. The functional difference is where the arms get commands:
 # a filter node sits between the VR serial node and the arm controllers, so the
 # poses that drive inverse kinematics are smooth. Nothing in the ARX SDK is
 # modified - the arms are started with ros2 run and told which topic to listen
@@ -23,6 +24,9 @@ repo_root="$(cd "${script_dir}/.." && pwd)"
 : "${TASK_NAME:?Set TASK_NAME, for example pickplace_right_to_bowl}"
 
 SMOOTH_TAU=${SMOOTH_TAU:-0.05}
+# CAN and body are started when absent, matching 01_collect.sh. Set this to 1
+# for the earlier behaviour, where either one missing refuses the run.
+SKIP_AUTOSTART=${SKIP_AUTOSTART:-0}
 LOG_DIR=${LOG_DIR:-$HOME/collect_logs}
 ACT_PYTHON=${ACT_PYTHON:-/home/arx/miniconda3/envs/act/bin/python}
 LIFT_WS=/home/arx/LIFT/body/ROS2
@@ -83,8 +87,8 @@ set -u
 # Anchored on the executable path, not on any mention of the name: a plain
 # substring also matches the shell that happens to have the word in its command
 # line, which refuses startup for no reason.
-for pattern in '/arx_x5_controller/X5Controller$' \
-               '/serial_port_node$' \
+for pattern in '/arx_x5_controller/X5Controller( |$)' \
+               '/serial_port_node( |$)' \
                '/act/collect\.py( |$)' \
                '/act/vr_pose_filter\.py( |$)'; do
     if conflicting=$(pgrep -f -- "$pattern" 2>/dev/null); then
@@ -94,12 +98,55 @@ for pattern in '/arx_x5_controller/X5Controller$' \
     fi
 done
 
+declare -A CAN_DEVICE=( [can1]=/dev/arxcan1 [can3]=/dev/arxcan3 [can5]=/dev/arxcan5 )
+
+can_is_up() { ip link show "$1" 2>/dev/null | grep -q 'UP'; }
+
+# Deliberately not arx_can1.sh and friends: each of those is a watchdog loop
+# whose repair path runs `pkill -9 slcand`, taking down the daemon behind every
+# other interface too, and whose success path spins without ever sleeping. This
+# does the one-shot bring-up those scripts do, and nothing else.
+bring_up_can() {
+    # Two statements, not one: local expands all its arguments before it
+    # assigns any of them, so ${CAN_DEVICE[$iface]} on the same line reads an
+    # iface that is still unset and yields an empty device path.
+    local iface=$1
+    local dev=${CAN_DEVICE[$iface]}
+    if ! ip link show "$iface" >/dev/null 2>&1; then
+        [[ -e "$dev" ]] || die "${dev} is missing; the CAN adapter for ${iface} is unplugged"
+        echo "  ${iface}: starting slcand on ${dev}"
+        sudo slcand -o -f -s8 "$dev" "$iface" || die "slcand failed for ${iface}"
+        for _ in $(seq 1 20); do
+            ip link show "$iface" >/dev/null 2>&1 && break
+            sleep 0.25
+        done
+    fi
+    sudo ip link set "$iface" up || die "could not bring ${iface} up"
+    can_is_up "$iface" || die "${iface} is still not UP after bring-up"
+}
+
 for interface in can1 can3 can5; do
-    ip link show "$interface" 2>/dev/null | grep -q 'UP' || die "${interface} is not UP"
+    can_is_up "$interface" && continue
+    (( SKIP_AUTOSTART )) && die "${interface} is not UP"
+    bring_up_can "$interface"
 done
 
-ros2 node list 2>/dev/null | grep -qx '/lift' \
-    || die "/lift is not running. Start body only while the platform is at a safe low position."
+lift_is_up() { ros2 node list 2>/dev/null | grep -qx '/lift'; }
+
+if ! lift_is_up; then
+    (( SKIP_AUTOSTART )) && die "/lift is not running"
+    # The lift motor is uncalibrated at power-on and homes itself before it obeys
+    # fixed_height, so the platform can travel on its own here. 01_collect.sh
+    # starts body exactly the same way; this only says so out loud first.
+    echo "WARNING: body starts now and the lift may home itself. Stand clear."
+    start_component body ros2 launch arx_lift_controller lift.launch.py
+    for _ in $(seq 1 60); do
+        lift_is_up && break
+        sleep 0.5
+    done
+    lift_is_up || die "/lift did not appear within 30s; see ${LOG_DIR}/body.log"
+    wait_for_topic /body_information 20
+fi
 
 # --- pin the lift before VR starts ------------------------------------------
 # The body must never briefly follow a raw VR height during collection.
