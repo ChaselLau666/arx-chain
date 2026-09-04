@@ -147,3 +147,5 @@ AMENT_IGNORE
 **/dataset_views
 **/data_review
 **/test
+# Mesh-free URDF that tools/validate_ik_offline.py regenerates from the vendor file.
+act/x5_kin.urdf
