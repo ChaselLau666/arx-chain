@@ -112,7 +112,7 @@ if [[ "$tracked_session" != true ]]; then
     exit 1
   fi
   legacy_candidates=$(ps -eo pid,ppid,pgid,args | grep -E \
-    '(lift_controller|X5Controller|serial_port_node|realsense2_camera_node|collect.py|human_dagger.py|tau0vla_client.py)' \
+    '(lift_controller|X5Controller|serial_port_node|realsense2_camera_node|collect.py|human_dagger.py|tau0vla_client.py|vr_pose_filter.py)' \
     | grep -v grep || true)
   echo "LEGACY SHUTDOWN OPT-IN: these broad-matched processes may be stopped:"
   printf '%s\n' "${legacy_candidates:-<none found>}"
@@ -351,6 +351,9 @@ else
   stop_pattern "VR diagnostics" 'ros2 topic (echo|hz) /ARX_VR_[LR]'
   stop_pattern "VR serial launcher" '/opt/ros/jazzy/bin/ros2 run serial_port serial_port_node'
   stop_pattern "VR serial node" '/serial_port_node$'
+  # Between the VR serial node and the arms, so it is stopped with the stream
+  # it filters. Left out, it survives shutdown and the next launch refuses.
+  stop_pattern "VR pose filter" '[/]act/vr_pose_filter\.py'
   stop_pattern "RealSense launchers" '/opt/ros/jazzy/bin/ros2 launch realsense2_camera rs_launch.py'
   stop_pattern "RealSense nodes" '/realsense2_camera_node'
   stop_pattern "arm launcher" '/opt/ros/jazzy/bin/ros2 launch arx_x5_controller (v2_pos_control|v2_joint_control|open_double_arm).launch.py'
@@ -361,7 +364,7 @@ else
 fi
 echo "Verifying control processes..."
 remaining=$(ps -eo pid,args | grep -E \
-  '(lift_controller|X5Controller|serial_port_node|realsense2_camera_node|collect.py|inference.py|tau0vla_client.py|human_dagger.py|human_dagger_arm_(left|right)|arx_can[135].sh)' \
+  '(lift_controller|X5Controller|serial_port_node|realsense2_camera_node|collect.py|inference.py|tau0vla_client.py|human_dagger.py|human_dagger_arm_(left|right)|arx_can[135].sh|vr_pose_filter.py)' \
   | grep -v grep || true)
 if [[ -n "${remaining}" ]]; then
   echo "WARNING: some control processes remain:" >&2
