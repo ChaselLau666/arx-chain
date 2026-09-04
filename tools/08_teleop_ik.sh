@@ -186,8 +186,11 @@ fi
 # Anchored on a python interpreter as argv[0] and the script as argv[1]. A
 # looser pattern also matches any shell whose command line merely mentions
 # the script - such as the ssh session that ran this launcher during
-# testing, which it promptly killed.
-stop_matching "previous IK node(s)" '^[^ ]*python[0-9.]* [^ ]*act/vr_ik_node\.py( |$)'
+# testing, which it promptly killed. argv[1] only has to end in the script
+# name, so a node started by hand from inside act/ with a bare relative
+# path is stopped too; leaving one behind would mean two publishers on the
+# arm's command topic.
+stop_matching "previous IK node(s)" '^[^ ]*python[0-9.]* [^ ]*vr_ik_node\.py( |$)'
 
 ik_args=(--dt "${IK_DT}" --max-velocity "${IK_MAX_VEL}"
          --engage-distance "$(awk "BEGIN{print ${IK_ENGAGE_MM}/1000}")" --engage-angle "${IK_ENGAGE_DEG}"
