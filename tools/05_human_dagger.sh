@@ -140,8 +140,14 @@ is_nonnegative_integer "$MIN_FREE_GIB" || die "HUMAN_DAGGER_MIN_FREE_GIB must be
 (( MIN_FREE_GIB >= 1 )) || die "HUMAN_DAGGER_MIN_FREE_GIB must be at least 1"
 
 [[ -t 0 && -t 1 ]] || die "run this script in an interactive terminal on the robot desktop"
-[[ -z "${SSH_CONNECTION:-}" && -z "${SSH_TTY:-}" ]] || \
-  die "keyboard takeover must run in a local robot terminal, not over SSH"
+if [[ -n "${SSH_CONNECTION:-}" || -n "${SSH_TTY:-}" ]]; then
+  if [[ "${HUMAN_DAGGER_ALLOW_SSH:-0}" != 1 ]]; then
+    die "keyboard takeover must run in a local robot terminal, not over SSH (set HUMAN_DAGGER_ALLOW_SSH=1 to override; keep the physical e-stop within reach)"
+  fi
+  echo "WARNING: running keyboard takeover over SSH. If this connection drops,"
+  echo "WARNING: nobody can take over from the policy. Keep the physical"
+  echo "WARNING: emergency stop within reach at all times."
+fi
 
 require_command df
 require_command find
@@ -365,6 +371,21 @@ wait_for_topic /body_information 15
 # cannot publish until both feedback streams exist, but once they do its first
 # command is a measured POSITION_CONTROL HOLD.
 start_frontend
+
+# Whole-session CPU profile of the frontend tree (supervisor + control/policy/
+# recorder children). py-spy carries cap_sys_ptrace, so no sudo is needed; it
+# exits by itself when the frontend does and only then writes the file.
+# Collapsed-stack lines, most-sampled first:
+#   sort -t" " -k2 -rn logs/pyspy_raw.txt | head
+# Disable with PROFILE_DAGGER=0.
+if [[ "${PROFILE_DAGGER:-1}" == 1 ]] \
+  && PYSPY_BIN=$(command -v /home/arx/miniconda3/envs/act/bin/py-spy); then
+  setsid "$PYSPY_BIN" record --pid "$frontend_pid" --subprocesses \
+    --rate 50 --format raw -o "${log_dir}/pyspy_raw.txt" \
+    </dev/null >>"${log_dir}/pyspy.log" 2>&1 &
+  echo "Profiler attached (py-spy); stacks will land in ${log_dir}/pyspy_raw.txt"
+fi
+
 wait_for_node /human_dagger_control 30
 wait_for_service /human_dagger/request_hold 10
 
@@ -388,11 +409,15 @@ start_component arm_right \
   -p arm_pub_topic_name:=/human_dagger/arm/right/status \
   -p arm_sub_topic_name:=/human_dagger/arm/right/command
 
-CAMERA_H_SERIAL=${CAMERA_H_SERIAL:-260422273990}
+CAMERA_H_SERIAL=${CAMERA_H_SERIAL:-260522275257}
 CAMERA_L_SERIAL=${CAMERA_L_SERIAL:-260422273222}
 CAMERA_R_SERIAL=${CAMERA_R_SERIAL:-260422272473}
 COLOR_PROFILE=${COLOR_PROFILE:-640x480x90}
 DEPTH_PROFILE=${DEPTH_PROFILE:-640x480x90}
+# Nothing consumes depth (use_depth_image: false; the frontend and recorder
+# subscribe to color only). Publishing it costs USB bandwidth -- fatal for a
+# camera that renegotiated down to USB2 -- and CPU on all three nodes.
+ENABLE_DEPTH=${ENABLE_DEPTH:-false}
 
 start_camera() {
   local name=$1 raw_serial=$2 serial
@@ -403,6 +428,7 @@ start_camera() {
     camera_name:="$name" \
     depth_module.color_profile:="$COLOR_PROFILE" \
     depth_module.depth_profile:="$DEPTH_PROFILE" \
+    enable_depth:="$ENABLE_DEPTH" \
     serial_no:="_${serial}"
 }
 
