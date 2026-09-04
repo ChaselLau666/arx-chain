@@ -819,8 +819,13 @@ def _run_ros_control(
     last_graph_check_ns = 0
     cached_graph_error: str | None = "waiting for ROS graph discovery"
 
-    checkpoint_path = Path(args.ckpt_dir) / args.ckpt_name
-    checkpoint_sha = ("0" * 64) if args.mock_policy else sha256_file(checkpoint_path)
+    if getattr(args, "policy_backend", "act") == "tau0vla":
+        # Remote model: record the server URL; there is no local file to hash.
+        checkpoint_path = f"tau0vla:{args.model_server_url}"
+        checkpoint_sha = "0" * 64
+    else:
+        checkpoint_path = Path(args.ckpt_dir) / args.ckpt_name
+        checkpoint_sha = ("0" * 64) if args.mock_policy else sha256_file(checkpoint_path)
 
     def send_ui(kind: str, **values: Any) -> None:
         ui_status_queue.put({"kind": kind, **values})
@@ -1521,6 +1526,37 @@ def run_supervisor(args: argparse.Namespace, runtime_config: dict[str, Any]) -> 
                 args.mock_policy_delay,
             ),
         )
+    elif args.policy_backend == "tau0vla":
+        from human_dagger_tau0vla_policy import (
+            Tau0VLAWorkerConfig,
+            tau0vla_policy_worker_main,
+        )
+
+        tau0vla_config = Tau0VLAWorkerConfig(
+            server_url=args.model_server_url,
+            task_instruction=args.task_instruction,
+            replan_steps=str(args.replan_steps),
+            chunk_blend_steps=args.chunk_blend_steps,
+            arm_ema_alpha=args.arm_ema_alpha,
+            gripper_ema_alpha=args.gripper_ema_alpha,
+            # Kept coupled to the core's policy_timeout_ns on purpose, the
+            # same way the ACT worker's staleness window is.
+            max_observation_age_ns=int(
+                float(runtime_config.get("control", {}).get("policy_timeout_ms", 250.0))
+                * 1_000_000
+            ),
+        )
+        policy_process = context.Process(
+            name="human-dagger-policy-tau0vla",
+            target=tau0vla_policy_worker_main,
+            args=(
+                tau0vla_config,
+                policy_control_queue,
+                policy_observation_queue,
+                policy_result_queue,
+                policy_status_queue,
+            ),
+        )
     else:
         worker_config = PolicyWorkerConfig(
             ckpt_dir=args.ckpt_dir,
@@ -1664,12 +1700,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dagger-round", type=int, default=0)
     parser.add_argument("--max-timesteps", type=int, default=800)
     parser.add_argument("--frame-rate", type=float, default=60.0)
-    parser.add_argument("--ckpt-dir", required=True)
+    parser.add_argument("--policy-backend", choices=("act", "tau0vla"), default="act")
+    parser.add_argument("--ckpt-dir", default="")
     parser.add_argument("--ckpt-name", default="policy_best.ckpt")
     parser.add_argument("--stats-name", default="dataset_stats.pkl")
     parser.add_argument("--policy-args-name", default="args.yaml")
     parser.add_argument("--gripper-gate", type=float, default=-1.0)
     parser.add_argument("--temporal-agg", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--model-server-url", default="")
+    parser.add_argument("--task-instruction", default="")
+    parser.add_argument("--replan-steps", default="auto")
+    parser.add_argument("--chunk-blend-steps", type=int, default=6)
+    parser.add_argument("--arm-ema-alpha", type=float, default=1.0)
+    parser.add_argument("--gripper-ema-alpha", type=float, default=1.0)
     parser.add_argument("--mock-policy", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--mock-policy-delay", type=float, default=0.0, help=argparse.SUPPRESS)
     parser.add_argument("--session-manifest", default="", help=argparse.SUPPRESS)
@@ -1681,7 +1724,14 @@ def validate_startup_args(args: argparse.Namespace) -> None:
         raise ValueError("--height must be within [0, 20]")
     if args.frame_rate <= 0 or args.max_timesteps < 2:
         raise ValueError("frame rate must be positive and max timesteps must be at least 2")
-    if not args.mock_policy:
+    if args.policy_backend == "tau0vla":
+        if not args.model_server_url:
+            raise ValueError("--model-server-url is required for the tau0vla backend")
+        if not args.task_instruction.strip():
+            raise ValueError("--task-instruction is required for the tau0vla backend")
+    elif not args.mock_policy:
+        if not args.ckpt_dir:
+            raise ValueError("--ckpt-dir is required for the act backend")
         ckpt_dir = Path(args.ckpt_dir).expanduser().resolve()
         for filename in (args.ckpt_name, args.stats_name):
             if not (ckpt_dir / filename).is_file():

@@ -11,7 +11,23 @@ repo_root="$(cd "${script_dir}/.." && pwd)"
 
 : "${TASK_NAME:?Set TASK_NAME, for example pickplace_right_to_bowl}"
 : "${LIFT_HEIGHT:?Set LIFT_HEIGHT to the fixed lift command in [0, 20]}"
-: "${CKPT_DIR:?Set CKPT_DIR to the directory containing the checkpoint and stats}"
+
+# POLICY_BACKEND selects the policy worker: "act" (local checkpoint, default)
+# or "tau0vla" (remote inference over the dedicated direct link).
+POLICY_BACKEND=${POLICY_BACKEND:-act}
+case "$POLICY_BACKEND" in
+  act)
+    : "${CKPT_DIR:?Set CKPT_DIR to the directory containing the checkpoint and stats}"
+    ;;
+  tau0vla)
+    : "${MODEL_SERVER_URL:?Set MODEL_SERVER_URL for the tau0vla backend}"
+    : "${TASK_INSTRUCTION:?Set TASK_INSTRUCTION for the tau0vla backend}"
+    ;;
+  *)
+    echo "Unknown POLICY_BACKEND: ${POLICY_BACKEND} (expected act or tau0vla)" >&2
+    exit 1
+    ;;
+esac
 
 CKPT_NAME=${CKPT_NAME:-policy_best.ckpt}
 STATS_NAME=${STATS_NAME:-dataset_stats.pkl}
@@ -166,10 +182,45 @@ require_file "$CONFIG_PATH"
 require_file "$ACT_PYTHON"
 require_file "${repo_root}/act/human_dagger.py"
 
-[[ -d "$CKPT_DIR" ]] || die "CKPT_DIR is not a directory: ${CKPT_DIR}"
-ckpt_dir_abs="$(cd "$CKPT_DIR" && pwd)"
-require_file "${ckpt_dir_abs}/${CKPT_NAME}"
-require_file "${ckpt_dir_abs}/${STATS_NAME}"
+ckpt_dir_abs=""
+if [[ "$POLICY_BACKEND" == act ]]; then
+  [[ -d "$CKPT_DIR" ]] || die "CKPT_DIR is not a directory: ${CKPT_DIR}"
+  ckpt_dir_abs="$(cd "$CKPT_DIR" && pwd)"
+  require_file "${ckpt_dir_abs}/${CKPT_NAME}"
+  require_file "${ckpt_dir_abs}/${STATS_NAME}"
+else
+  require_file "${repo_root}/act/human_dagger_tau0vla_policy.py"
+  require_file "${repo_root}/act/tau0vla_protocol.py"
+
+  # Same direct-link gating as 03_tau0vla_inference.sh: the reviewed model
+  # server lives on a dedicated Ethernet segment; Wi-Fi is a diagnostic
+  # fallback that must be requested explicitly.
+  DIRECT_SERVER_IP=${DIRECT_SERVER_IP:-192.168.50.2}
+  DIRECT_INTERFACE=${DIRECT_INTERFACE:-enp130s0}
+  DIRECT_CLIENT_IP=${DIRECT_CLIENT_IP:-192.168.50.1}
+  ALLOW_NON_DIRECT_MODEL_SERVER=${ALLOW_NON_DIRECT_MODEL_SERVER:-0}
+  server_host=${MODEL_SERVER_URL#*://}
+  server_host=${server_host%%[:/]*}
+  if [[ "${server_host}" != "${DIRECT_SERVER_IP}" ]]; then
+    if [[ "${ALLOW_NON_DIRECT_MODEL_SERVER}" != "1" ]]; then
+      echo "Refused: MODEL_SERVER_URL=${MODEL_SERVER_URL} is not the reviewed direct-link server." >&2
+      echo "Set ALLOW_NON_DIRECT_MODEL_SERVER=1 only for an explicit Wi-Fi diagnostic." >&2
+      exit 1
+    fi
+  else
+    route_info=$(ip route get "${DIRECT_SERVER_IP}" 2>/dev/null || true)
+    if [[ "${route_info}" != *"dev ${DIRECT_INTERFACE}"* || "${route_info}" != *"src ${DIRECT_CLIENT_IP}"* ]]; then
+      echo "Refused: direct-link route is not active." >&2
+      echo "Expected: ${DIRECT_SERVER_IP} dev ${DIRECT_INTERFACE} src ${DIRECT_CLIENT_IP}" >&2
+      echo "Actual: ${route_info:-unavailable}" >&2
+      exit 1
+    fi
+    echo "Direct model route verified: ${route_info}"
+  fi
+  if ! curl --fail --silent --show-error --max-time 3 "${MODEL_SERVER_URL}/health" >/dev/null; then
+    die "Tau0VLA server is not ready at ${MODEL_SERVER_URL}"
+  fi
+fi
 
 # Refuse all known competing arm owners and duplicate sensor/control stacks.
 conflict_patterns=(
@@ -223,18 +274,36 @@ source "${realsense_ws}/install/setup.bash"
 set -u
 require_command ros2
 
-if ! "$ACT_PYTHON" -c \
-  'import cv2, h5py, numpy, rclpy, scipy, torch, yaml' >/dev/null 2>&1; then
-  die "ACT_PYTHON is missing a required runtime module (cv2/h5py/numpy/rclpy/scipy/torch/yaml)"
+if [[ "$POLICY_BACKEND" == act ]]; then
+  if ! "$ACT_PYTHON" -c \
+    'import cv2, h5py, numpy, rclpy, scipy, torch, yaml' >/dev/null 2>&1; then
+    die "ACT_PYTHON is missing a required runtime module (cv2/h5py/numpy/rclpy/scipy/torch/yaml)"
+  fi
+else
+  # Inference is remote: torch is not needed locally, requests is.
+  if ! "$ACT_PYTHON" -c \
+    'import cv2, h5py, numpy, rclpy, requests, scipy, yaml' >/dev/null 2>&1; then
+    die "ACT_PYTHON is missing a required runtime module (cv2/h5py/numpy/rclpy/requests/scipy/yaml)"
+  fi
 fi
 
-echo "Validating ACT architecture, checkpoint, statistics, and CUDA before hardware startup..."
-if ! "$ACT_PYTHON" "${repo_root}/act/human_dagger_policy.py" \
-  --preflight \
-  --ckpt-dir "$ckpt_dir_abs" \
-  --ckpt-name "$CKPT_NAME" \
-  --stats-name "$STATS_NAME"; then
-  die "policy preflight failed; no CAN/body/arm component was started"
+if [[ "$POLICY_BACKEND" == act ]]; then
+  echo "Validating ACT architecture, checkpoint, statistics, and CUDA before hardware startup..."
+  if ! "$ACT_PYTHON" "${repo_root}/act/human_dagger_policy.py" \
+    --preflight \
+    --ckpt-dir "$ckpt_dir_abs" \
+    --ckpt-name "$CKPT_NAME" \
+    --stats-name "$STATS_NAME"; then
+    die "policy preflight failed; no CAN/body/arm component was started"
+  fi
+else
+  echo "Validating the Tau0VLA server contract before hardware startup..."
+  if ! "$ACT_PYTHON" "${repo_root}/act/human_dagger_tau0vla_policy.py" \
+    --preflight \
+    --server-url "$MODEL_SERVER_URL" \
+    --task-instruction "$TASK_INSTRUCTION"; then
+    die "tau0vla preflight failed; no CAN/body/arm component was started"
+  fi
 fi
 
 # Do not start the vendor arx_can*.sh watchdog loops here. Each loop busy-spins
@@ -325,14 +394,30 @@ wait_for_service() {
 
 start_frontend() {
   echo "Starting Human DAgger coordinator/UI in this terminal."
+  local -a backend_args
+  if [[ "$POLICY_BACKEND" == act ]]; then
+    backend_args=(
+      --ckpt-dir "$ckpt_dir_abs"
+      --ckpt-name "$CKPT_NAME"
+      --stats-name "$STATS_NAME"
+    )
+  else
+    backend_args=(
+      --policy-backend tau0vla
+      --model-server-url "$MODEL_SERVER_URL"
+      --task-instruction "$TASK_INSTRUCTION"
+      --replan-steps "${REPLAN_STEPS:-auto}"
+      --chunk-blend-steps "${CHUNK_BLEND_STEPS:-6}"
+      --arm-ema-alpha "${ARM_EMA_ALPHA:-1.0}"
+      --gripper-ema-alpha "${GRIPPER_EMA_ALPHA:-1.0}"
+    )
+  fi
   "$ACT_PYTHON" "${repo_root}/act/human_dagger.py" \
     --config "$CONFIG_PATH" \
     --datasets "$DATASET_DIR" \
     --task "$TASK_NAME" \
     --height "$LIFT_HEIGHT_ROS" \
-    --ckpt-dir "$ckpt_dir_abs" \
-    --ckpt-name "$CKPT_NAME" \
-    --stats-name "$STATS_NAME" \
+    "${backend_args[@]}" \
     --dagger-round "$DAGGER_ROUND" \
     --episode-idx -1 \
     --max-timesteps "$MAX_TIMESTEPS" \
