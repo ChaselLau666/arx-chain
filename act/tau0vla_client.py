@@ -19,6 +19,7 @@ from tau0vla_protocol import (
     ACTION_DIM,
     ACTION_HORIZON,
     FPS,
+    ActionEMA,
     ActionChunk,
     ChunkScheduler,
     Observation,
@@ -26,6 +27,7 @@ from tau0vla_protocol import (
     Tau0VLAHttpClient,
     recommended_replan_steps,
 )
+from tau0vla_trace import TraceWriter, analyze_trace
 from utils.setup_loader import setup_loader
 
 
@@ -136,6 +138,17 @@ def create_observation_node(config: dict, *, max_observation_age_ms: float, max_
         def height_samples(self):
             with self._lock:
                 return tuple(self._height_samples)
+
+        def current_qpos(self) -> np.ndarray:
+            with self._lock:
+                if "arm:left" not in self._latest or "arm:right" not in self._latest:
+                    raise ProtocolError("joint feedback is unavailable")
+                left = np.asarray(self._latest["arm:left"][0].joint_pos, dtype=np.float32)
+                right = np.asarray(self._latest["arm:right"][0].joint_pos, dtype=np.float32)
+            qpos = np.concatenate((left[:7], right[:7]))
+            if qpos.shape != (ACTION_DIM,) or not np.isfinite(qpos).all():
+                raise ProtocolError("joint feedback is not a finite 14-vector")
+            return qpos
 
         def enable_publishers(self) -> None:
             if self._left_publisher is not None:
@@ -261,7 +274,9 @@ def run(args) -> None:
     signal.signal(signal.SIGINT, lambda *_: stop_event.set())
     executor = ThreadPoolExecutor(max_workers=1)
     pending: Future[ActionChunk] | None = None
+    trace = TraceWriter(None)
     try:
+        trace = TraceWriter(args.trace_path)
         verify_height(
             node,
             args.expected_height,
@@ -281,6 +296,15 @@ def run(args) -> None:
         print(f"Server health: {json.dumps(health, sort_keys=True)}")
         print(f"Policy contract: {json.dumps(contract, sort_keys=True)}")
         print(f"Session: {session['session_id']}")
+        trace.metadata(
+            session_id=session["session_id"],
+            server_url=args.server_url,
+            task_instruction=args.task_instruction,
+            execute=args.execute,
+            blend_steps=args.chunk_blend_steps,
+            arm_ema_alpha=args.arm_ema_alpha,
+            gripper_ema_alpha=args.gripper_ema_alpha,
+        )
 
         request_id, latencies = benchmark(
             client,
@@ -295,8 +319,11 @@ def run(args) -> None:
 
         request_id += 1
         first = client.infer(wait_for_observation(node, 5.0), request_id)
-        scheduler = ChunkScheduler(replan_steps)
-        scheduler.adopt(first, initial=True)
+        scheduler = ChunkScheduler(replan_steps, blend_steps=args.chunk_blend_steps)
+        ema = ActionEMA(args.arm_ema_alpha, args.gripper_ema_alpha)
+        ema.reset(node.current_qpos())
+        first_info = scheduler.adopt(first, initial=True, arrival_monotonic_ns=time.monotonic_ns())
+        trace.adoption(first.request_id, first_info)
 
         if args.execute:
             confirmation = input(
@@ -306,7 +333,11 @@ def run(args) -> None:
             if confirmation != "EXECUTE TAU0VLA PICKPLACE":
                 raise RuntimeError("execution cancelled; no action publisher was created")
             node.enable_publishers()
-            print("EXECUTE mode: publishing raw finite 14D Tau0VLA actions without clipping.")
+            print(
+                "EXECUTE mode: publishing finite 14D Tau0VLA actions "
+                f"with blend_steps={args.chunk_blend_steps}, arm_ema_alpha={args.arm_ema_alpha}, "
+                f"gripper_ema_alpha={args.gripper_ema_alpha}."
+            )
         else:
             print("DRY-RUN mode: no action publisher was created.")
 
@@ -327,11 +358,14 @@ def run(args) -> None:
 
             if pending is not None and pending.done():
                 result = pending.result()
-                skipped = scheduler.adopt(result)
+                adoption = scheduler.adopt(result, arrival_monotonic_ns=time.monotonic_ns())
+                trace.adoption(result.request_id, adoption)
                 print(
                     f"Response request={result.request_id}, RTT={result.round_trip_ms:.1f} ms, "
-                    f"inference={result.inference_ms:.1f} ms, skipped={skipped}, "
-                    f"buffer={scheduler.remaining}"
+                    f"inference={result.inference_ms:.1f} ms, skipped={adoption.skipped}, "
+                    f"blended={adoption.blended_steps}, buffer={scheduler.remaining}, "
+                    f"boundary_jump={adoption.raw_boundary_jump_max:.5f}->"
+                    f"{adoption.blended_boundary_jump_max:.5f}"
                 )
                 pending = None
                 starvation_logged = False
@@ -342,12 +376,22 @@ def run(args) -> None:
                 pending = executor.submit(client.infer, observation, request_id)
 
             try:
-                action = scheduler.next_action()
+                scheduled = scheduler.next_action()
             except BufferError:
                 if not starvation_logged:
                     print("BUFFER STARVED: publication paused until a fresh action chunk arrives.")
+                    trace.starvation(time.monotonic_ns(), step)
                     starvation_logged = True
                 continue
+            action = ema.apply(scheduled.action)
+            trace.tick(
+                monotonic_ns=time.monotonic_ns(),
+                control_step=step,
+                scheduled=scheduled,
+                command=action,
+                feedback=node.current_qpos(),
+                execute=args.execute,
+            )
             if args.execute:
                 node.publish_action(action)
                 published_since_log += 1
@@ -366,15 +410,22 @@ def run(args) -> None:
         if pending is not None:
             pending.cancel()
         executor.shutdown(wait=False, cancel_futures=True)
+        trace.close()
         stop_event.set()
         node.destroy_node()
         rclpy.shutdown()
         spin_thread.join(timeout=2.0)
+        if args.trace_path is not None and args.trace_path.exists():
+            try:
+                print(f"Trace: {args.trace_path}")
+                print(f"Trace summary: {json.dumps(analyze_trace(args.trace_path), sort_keys=True)}")
+            except Exception as error:  # trace analysis must never block ROS cleanup
+                print(f"Trace analysis failed: {error}")
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--server-url", default="http://192.168.31.83:8000")
+    parser.add_argument("--server-url", default="http://192.168.77.1:8000")
     parser.add_argument("--task-instruction", default=DEFAULT_TASK)
     parser.add_argument("--config", type=Path, default=ROOT / "data/config.yaml")
     parser.add_argument("--expected-height", type=float, default=15.5)
@@ -390,6 +441,10 @@ def parse_args():
     parser.add_argument("--benchmark-warmup", type=int, default=3)
     parser.add_argument("--benchmark-requests", type=int, default=30)
     parser.add_argument("--replan-steps", default="auto")
+    parser.add_argument("--chunk-blend-steps", type=int, default=6)
+    parser.add_argument("--arm-ema-alpha", type=float, default=1.0)
+    parser.add_argument("--gripper-ema-alpha", type=float, default=1.0)
+    parser.add_argument("--trace-path", type=Path, default=None)
     parser.add_argument("--max-steps", type=int, default=10000)
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args()
@@ -397,6 +452,11 @@ def parse_args():
         parser.error("benchmark counts must be non-negative, with at least one measured request")
     if args.request_timeout <= 0 or args.max_response_age_ms <= 0:
         parser.error("HTTP timeouts must be positive")
+    if not 0 <= args.chunk_blend_steps < ACTION_HORIZON:
+        parser.error(f"--chunk-blend-steps must be in [0, {ACTION_HORIZON - 1}]")
+    for name in ("arm_ema_alpha", "gripper_ema_alpha"):
+        if not 0.0 < getattr(args, name) <= 1.0:
+            parser.error(f"--{name.replace('_', '-')} must be in (0, 1]")
     return args
 
 

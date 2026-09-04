@@ -1,6 +1,6 @@
 # Tau0VLA remote inference on ARX LIFT2s
 
-Tau0VLA runs on `192.168.31.83:8000`; ARX1 keeps ROS subscriptions and arm
+Tau0VLA runs on the dedicated Ethernet link at `192.168.77.1:8000`; ARX1 keeps ROS subscriptions and arm
 publication local. This is an independent inference path and does not modify
 `act/inference.py` or the ACT checkpoint path.
 
@@ -30,7 +30,7 @@ Dry-run is the default:
 
 ```bash
 cd /home/arx/ROS2_LIFT_Play/tools
-MODEL_SERVER_URL=http://192.168.31.83:8000 \
+MODEL_SERVER_URL=http://192.168.77.1:8000 \
   ./03_tau0vla_inference.sh
 ```
 
@@ -41,6 +41,19 @@ chunk schedules:
 ```bash
 REPLAN_STEPS=10 ./03_tau0vla_inference.sh
 ```
+
+The default `CHUNK_BLEND_STEPS=6` performs a smoothstep transition between
+time-aligned old and new chunk tails instead of replacing the active plan in
+one control tick. `ARM_EMA_ALPHA=1.0` and `GRIPPER_EMA_ALPHA=1.0` leave EMA
+disabled. For a second-stage arm-only smoothing trial, set
+`ARM_EMA_ALPHA=0.4`; keep the gripper at `1.0` unless its timing is separately
+validated. Every run writes a JSONL command/feedback trace beside the client
+log; summarize it with `python act/tau0vla_trace.py TRACE.jsonl`.
+
+The launcher refuses a direct URL unless `ip route get 192.168.77.1` resolves
+through `enp130s0` with source `192.168.77.2`. Wi-Fi is an explicit diagnostic
+fallback only: it requires both a Wi-Fi URL and
+`ALLOW_NON_DIRECT_MODEL_SERVER=1`.
 
 For physical execution:
 

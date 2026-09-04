@@ -46,6 +46,26 @@ class ActionChunk:
     model_id: str
 
 
+@dataclass(frozen=True)
+class AdoptionInfo:
+    skipped: int
+    blended_steps: int
+    age_ms: float
+    raw_boundary_jump_max: float
+    blended_boundary_jump_max: float
+
+
+@dataclass(frozen=True)
+class ScheduledAction:
+    action: np.ndarray
+    raw_action: np.ndarray
+    request_id: int
+    source_index: int
+    skipped: int
+    blend_alpha: float
+    round_trip_ms: float
+
+
 class Tau0VLAHttpClient:
     def __init__(self, base_url: str, *, request_timeout: float = 5.0, max_response_age_ms: float = 2000.0):
         import requests
@@ -185,19 +205,23 @@ def recommended_replan_steps(
 
 
 class ChunkScheduler:
-    """Single-request double buffer with RTT-based action-prefix skipping."""
+    """Single-request buffer with time alignment and smooth chunk handoff."""
 
-    def __init__(self, replan_steps: int):
+    def __init__(self, replan_steps: int, blend_steps: int = 6):
         if not 1 <= int(replan_steps) < ACTION_HORIZON:
             raise ValueError(f"replan_steps must be in [1, {ACTION_HORIZON - 1}]")
+        if not 0 <= int(blend_steps) < ACTION_HORIZON:
+            raise ValueError(f"blend_steps must be in [0, {ACTION_HORIZON - 1}]")
         self.replan_steps = int(replan_steps)
-        self._actions = np.empty((0, ACTION_DIM), dtype=np.float32)
+        self.blend_steps = int(blend_steps)
+        self._steps: list[ScheduledAction] = []
         self._index = 0
         self._published_since_adopt = 0
+        self._last_action: np.ndarray | None = None
 
     @property
     def remaining(self) -> int:
-        return len(self._actions) - self._index
+        return len(self._steps) - self._index
 
     def should_request(self, request_pending: bool) -> bool:
         return not request_pending and (
@@ -210,33 +234,108 @@ class ChunkScheduler:
             or self.remaining <= self.replan_steps
         )
 
-    def adopt(self, chunk: ActionChunk, *, initial: bool = False) -> int:
+    def adopt(
+        self,
+        chunk: ActionChunk,
+        *,
+        initial: bool = False,
+        arrival_monotonic_ns: int | None = None,
+    ) -> AdoptionInfo:
         actions = np.asarray(chunk.actions, dtype=np.float32)
         if actions.shape != (ACTION_HORIZON, ACTION_DIM) or not np.isfinite(actions).all():
             raise ProtocolError("cannot adopt an invalid action chunk")
-        skipped = 0 if initial else min(
-            ACTION_HORIZON - 1,
-            int(math.ceil(chunk.round_trip_ms * FPS / 1000.0)),
-        )
-        self._actions = actions[skipped:].copy()
+        if arrival_monotonic_ns is None:
+            age_ms = float(chunk.round_trip_ms)
+        else:
+            age_ms = max(0.0, (int(arrival_monotonic_ns) - int(chunk.sample_monotonic_ns)) / 1_000_000.0)
+        # action[0] targets state(t+1), so it remains usable until one full
+        # control period has elapsed. Floor avoids discarding a still-future
+        # first target on low-latency Ethernet responses.
+        skipped = 0 if initial else min(ACTION_HORIZON - 1, int(math.floor(age_ms * FPS / 1000.0)))
+        fresh = actions[skipped:]
+        old_steps = self._steps[self._index :]
+        overlap = 0 if initial else min(self.blend_steps, len(old_steps), len(fresh))
+        scheduled: list[ScheduledAction] = []
+        for offset, raw_action in enumerate(fresh):
+            alpha = 1.0
+            action = raw_action.copy()
+            if offset < overlap:
+                progress = (offset + 1) / overlap
+                alpha = progress * progress * (3.0 - 2.0 * progress)
+                action = (1.0 - alpha) * old_steps[offset].action + alpha * raw_action
+            scheduled.append(
+                ScheduledAction(
+                    action=np.asarray(action, dtype=np.float32),
+                    raw_action=np.asarray(raw_action, dtype=np.float32).copy(),
+                    request_id=int(chunk.request_id),
+                    source_index=skipped + offset,
+                    skipped=skipped,
+                    blend_alpha=float(alpha),
+                    round_trip_ms=float(chunk.round_trip_ms),
+                )
+            )
+        raw_jump = 0.0
+        blended_jump = 0.0
+        if self._last_action is not None and len(fresh):
+            raw_jump = float(np.max(np.abs(fresh[0] - self._last_action)))
+            blended_jump = float(np.max(np.abs(scheduled[0].action - self._last_action)))
+        self._steps = scheduled
         self._index = 0
         self._published_since_adopt = 0
-        return skipped
+        return AdoptionInfo(
+            skipped=skipped,
+            blended_steps=overlap,
+            age_ms=age_ms,
+            raw_boundary_jump_max=raw_jump,
+            blended_boundary_jump_max=blended_jump,
+        )
 
-    def next_action(self) -> np.ndarray:
+    def next_action(self) -> ScheduledAction:
         if self.remaining <= 0:
             raise BufferError("action chunk exhausted")
-        action = self._actions[self._index].copy()
+        step = self._steps[self._index]
         self._index += 1
         self._published_since_adopt += 1
-        return action
+        self._last_action = step.action.copy()
+        return step
+
+
+class ActionEMA:
+    """Optional command EMA; alpha=1 keeps the scheduled action unchanged."""
+
+    def __init__(self, arm_alpha: float = 1.0, gripper_alpha: float = 1.0):
+        for name, value in (("arm_alpha", arm_alpha), ("gripper_alpha", gripper_alpha)):
+            if not 0.0 < float(value) <= 1.0:
+                raise ValueError(f"{name} must be in (0, 1]")
+        self._alpha = np.full(ACTION_DIM, float(arm_alpha), dtype=np.float32)
+        self._alpha[[6, 13]] = float(gripper_alpha)
+        self._previous: np.ndarray | None = None
+
+    def reset(self, action: np.ndarray) -> None:
+        value = np.asarray(action, dtype=np.float32)
+        if value.shape != (ACTION_DIM,) or not np.isfinite(value).all():
+            raise ProtocolError("EMA initial action must be a finite 14-vector")
+        self._previous = value.copy()
+
+    def apply(self, action: np.ndarray) -> np.ndarray:
+        value = np.asarray(action, dtype=np.float32)
+        if value.shape != (ACTION_DIM,) or not np.isfinite(value).all():
+            raise ProtocolError("EMA input must be a finite 14-vector")
+        if self._previous is None:
+            filtered = value.copy()
+        else:
+            filtered = self._alpha * value + (1.0 - self._alpha) * self._previous
+        self._previous = filtered.copy()
+        return filtered
 
 
 __all__ = [
     "ACTION_DIM",
     "ACTION_HORIZON",
     "ACTION_SEMANTICS",
+    "ActionEMA",
     "ActionChunk",
+    "AdoptionInfo",
     "CAMERA_NAMES",
     "ChunkScheduler",
     "FPS",
@@ -244,6 +343,7 @@ __all__ = [
     "Observation",
     "PROTOCOL_VERSION",
     "ProtocolError",
+    "ScheduledAction",
     "Tau0VLAHttpClient",
     "recommended_replan_steps",
 ]

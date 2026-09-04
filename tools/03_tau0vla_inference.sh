@@ -3,16 +3,42 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-62}
-: "${MODEL_SERVER_URL:=http://192.168.31.83:8000}"
+: "${MODEL_SERVER_URL:=http://192.168.77.1:8000}"
+: "${DIRECT_SERVER_IP:=192.168.77.1}"
+: "${DIRECT_INTERFACE:=enp130s0}"
+: "${DIRECT_CLIENT_IP:=192.168.77.2}"
+: "${ALLOW_NON_DIRECT_MODEL_SERVER:=0}"
 : "${TASK_INSTRUCTION:=Pick up the handle and place it into the tray.}"
 : "${LIFT_HEIGHT:=15.5}"
 : "${REPLAN_STEPS:=auto}"
+: "${CHUNK_BLEND_STEPS:=6}"
+: "${ARM_EMA_ALPHA:=1.0}"
+: "${GRIPPER_EMA_ALPHA:=1.0}"
 : "${LOG_DIR:=/home/arx/logs/tau0vla}"
 
 set +u
 source /opt/ros/jazzy/setup.bash
 source /home/arx/LIFT/body/ROS2/install/setup.bash
 set -u
+
+server_host=${MODEL_SERVER_URL#*://}
+server_host=${server_host%%[:/]*}
+if [[ "${server_host}" != "${DIRECT_SERVER_IP}" ]]; then
+  if [[ "${ALLOW_NON_DIRECT_MODEL_SERVER}" != "1" ]]; then
+    echo "Refused: MODEL_SERVER_URL=${MODEL_SERVER_URL} is not the reviewed direct-link server." >&2
+    echo "Set ALLOW_NON_DIRECT_MODEL_SERVER=1 only for an explicit Wi-Fi diagnostic." >&2
+    exit 1
+  fi
+else
+  route_info=$(ip route get "${DIRECT_SERVER_IP}" 2>/dev/null || true)
+  if [[ "${route_info}" != *"dev ${DIRECT_INTERFACE}"* || "${route_info}" != *"src ${DIRECT_CLIENT_IP}"* ]]; then
+    echo "Refused: direct-link route is not active." >&2
+    echo "Expected: ${DIRECT_SERVER_IP} dev ${DIRECT_INTERFACE} src ${DIRECT_CLIENT_IP}" >&2
+    echo "Actual: ${route_info:-unavailable}" >&2
+    exit 1
+  fi
+  echo "Direct model route verified: ${route_info}"
+fi
 
 if ! curl --fail --silent --show-error --max-time 3 "${MODEL_SERVER_URL}/health" >/dev/null; then
   echo "Refused: Tau0VLA server is not ready at ${MODEL_SERVER_URL}." >&2
@@ -94,9 +120,14 @@ server_q=$(printf '%q' "${MODEL_SERVER_URL}")
 task_q=$(printf '%q' "${TASK_INSTRUCTION}")
 height_q=$(printf '%q' "${LIFT_HEIGHT}")
 replan_q=$(printf '%q' "${REPLAN_STEPS}")
+blend_q=$(printf '%q' "${CHUNK_BLEND_STEPS}")
+arm_ema_q=$(printf '%q' "${ARM_EMA_ALPHA}")
+gripper_ema_q=$(printf '%q' "${GRIPPER_EMA_ALPHA}")
 mkdir -p "${LOG_DIR}"
 log_file="${LOG_DIR}/client_$(date +%Y%m%d_%H%M%S).log"
+trace_file="${LOG_DIR}/trace_$(date +%Y%m%d_%H%M%S).jsonl"
 log_q=$(printf '%q' "${log_file}")
+trace_q=$(printf '%q' "${trace_file}")
 extra_args_q=""
 for argument in "$@"; do
   extra_args_q+=" $(printf '%q' "${argument}")"
@@ -105,8 +136,11 @@ done
 gnome-terminal --title="tau0vla-inference" -- bash -ic \
   "set -o pipefail; cd ${repo_root}/act; conda activate act; python tau0vla_client.py \
     --server-url ${server_q} --task-instruction ${task_q} \
-    --expected-height ${height_q} --replan-steps ${replan_q}${extra_args_q} \
+    --expected-height ${height_q} --replan-steps ${replan_q} \
+    --chunk-blend-steps ${blend_q} --arm-ema-alpha ${arm_ema_q} \
+    --gripper-ema-alpha ${gripper_ema_q} --trace-path ${trace_q}${extra_args_q} \
     2>&1 | tee -a ${log_q}; exec bash"
 
 echo "Tau0VLA inference terminal launched. Default mode is DRY-RUN; no action publisher is created."
 echo "Client log: ${log_file}"
+echo "Action trace: ${trace_file}"
