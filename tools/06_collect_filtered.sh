@@ -157,15 +157,29 @@ fi
 # --- pin the lift before VR starts ------------------------------------------
 # The body must never briefly follow a raw VR height during collection.
 
+# Both `param set` and `param get` exit 0 even for a parameter the node never
+# declared: an unpatched body answers "Setting parameter failed: Invalid access
+# to undeclared parameter(s)" and still reports success. Trusting the exit code
+# let collection start with the platform free to follow the VR stick, which is
+# the exact failure this guard exists to prevent. Read the value back instead.
 height_set=false
 for _ in $(seq 1 20); do
-    if ros2 param set /lift fixed_height "${LIFT_HEIGHT}" >/dev/null 2>&1; then
+    ros2 param set /lift fixed_height "${LIFT_HEIGHT}" >/dev/null 2>&1 || true
+    readback=$(ros2 param get /lift fixed_height 2>/dev/null \
+               | sed -n 's/^Double value is: //p')
+    if [[ -n "$readback" ]] && awk -v a="$readback" -v b="${LIFT_HEIGHT}" \
+        'BEGIN { d = a - b; if (d < 0) d = -d; exit !(d < 1e-6) }'; then
         height_set=true
         break
     fi
     sleep 0.5
 done
-[[ "${height_set}" == true ]] || die "could not set /lift fixed_height"
+if [[ "${height_set}" != true ]]; then
+    echo "Last value read back from /lift: ${readback:-<none>}" >&2
+    die "/lift did not accept fixed_height=${LIFT_HEIGHT}. If the body is running,\
+ its SDK is probably unpatched: run tools/apply_lift_fixed_height_patch.sh and\
+ restart body."
+fi
 echo "  /lift fixed_height set to ${LIFT_HEIGHT}"
 
 # --- arms, pointed at the filtered pose stream ------------------------------
