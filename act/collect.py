@@ -150,7 +150,8 @@ def compress_and_pad_images(data_dict, camera_names, use_depth, quality=50):
                 all_encoded.append(len(enc))
             data_dict[key] = encoded_list
 
-        padded_size = max(all_encoded)
+            # Empty whenever the run has no cameras at all, where max() raises.
+        padded_size = max(all_encoded) if all_encoded else 0
 
         for cam in camera_names:
             key = f'/observations/{key_prefix}/{cam}'
@@ -172,6 +173,11 @@ def create_and_write_hdf5(args, data_dict, dataset_path, data_size, padded_size,
     with h5py.File(dataset_path + '.hdf5', 'w', rdcc_nbytes=1024 ** 2 * 2) as root:
         root.attrs['sim'] = False
         root.attrs['task'] = str(args.task)
+        if not args.camera_names:
+            # No images in this episode, so it can verify the recording path
+            # but cannot train a policy. Marked so a loader refuses it rather
+            # than silently reading an empty images group.
+            root.attrs['no_images'] = True
         if args.height is not None:
             root.attrs['height_command'] = float(args.height)
 
@@ -373,7 +379,7 @@ def parse_arguments(known=False):
                         help='config file')
 
     # 图像处理选项
-    parser.add_argument('--camera_names', nargs='+', type=str,
+    parser.add_argument('--camera_names', nargs='*', type=str,
                         choices=['head', 'left_wrist', 'right_wrist', ],
                         default=['head', 'left_wrist', 'right_wrist'], help='camera names')
     parser.add_argument('--use_depth_image', action='store_true', help='use depth image')

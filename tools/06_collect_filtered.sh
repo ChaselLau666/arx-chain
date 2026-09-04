@@ -27,6 +27,10 @@ SMOOTH_TAU=${SMOOTH_TAU:-0.05}
 # CAN and body are started when absent, matching 01_collect.sh. Set this to 1
 # for the earlier behaviour, where either one missing refuses the run.
 SKIP_AUTOSTART=${SKIP_AUTOSTART:-0}
+# Records without cameras, to exercise the collection path on a robot that
+# has none. The episodes carry no images and are written elsewhere; see the
+# collector invocation at the end of this file.
+SKIP_CAMERAS=${SKIP_CAMERAS:-0}
 LOG_DIR=${LOG_DIR:-$HOME/collect_logs}
 ACT_PYTHON=${ACT_PYTHON:-/home/arx/miniconda3/envs/act/bin/python}
 LIFT_WS=/home/arx/LIFT/body/ROS2
@@ -83,9 +87,11 @@ source "${X5_WS}/install/setup.bash"
 # there is no rs_launch.py to run and no image topics for the collector.
 # Checked here so the failure names the cause, rather than set -e aborting
 # on a bare "No such file or directory" from the source below.
-[[ -f "${REALSENSE_WS}/install/setup.bash" ]] || die \
-    "realsense is not built at ${REALSENSE_WS}; run: cd ${REALSENSE_WS} && colcon build"
-source "${REALSENSE_WS}/install/setup.bash"
+if (( ! SKIP_CAMERAS )); then
+    [[ -f "${REALSENSE_WS}/install/setup.bash" ]] || die \
+        "realsense is not built at ${REALSENSE_WS}; run: cd ${REALSENSE_WS} && colcon build"
+    source "${REALSENSE_WS}/install/setup.bash"
+fi
 set -u
 
 # --- preconditions, all refused rather than repaired -------------------------
@@ -211,30 +217,34 @@ wait_for_topic /arm_r_status_full 25
 
 # --- cameras ----------------------------------------------------------------
 
-# realsense.sh opens a gnome-terminal per camera, which cannot work once this
-# script is detached from a display. The serials still come from that file, so
-# it stays the one place they are configured.
-declare -A CAMERA_SERIAL
-while read -r name serial; do
-    [[ -n "$name" ]] && CAMERA_SERIAL["$name"]="$serial"
-done < <(sed -n 's/^ *\[\([a-z_]*\)\]="\([0-9]*\)".*/\1 \2/p' \
-         "${repo_root}/realsense/realsense.sh")
-(( ${#CAMERA_SERIAL[@]} == 3 )) \
-    || die "expected 3 camera serials in realsense/realsense.sh, found ${#CAMERA_SERIAL[@]}"
+if (( SKIP_CAMERAS )); then
+    echo "  SKIP_CAMERAS=1: no cameras started; the episodes will carry no images"
+else
+    # realsense.sh opens a gnome-terminal per camera, which cannot work once this
+    # script is detached from a display. The serials still come from that file, so
+    # it stays the one place they are configured.
+    declare -A CAMERA_SERIAL
+    while read -r name serial; do
+        [[ -n "$name" ]] && CAMERA_SERIAL["$name"]="$serial"
+    done < <(sed -n 's/^ *\[\([a-z_]*\)\]="\([0-9]*\)".*/\1 \2/p' \
+             "${repo_root}/realsense/realsense.sh")
+    (( ${#CAMERA_SERIAL[@]} == 3 )) \
+        || die "expected 3 camera serials in realsense/realsense.sh, found ${#CAMERA_SERIAL[@]}"
 
-for camera in camera_h camera_l camera_r; do
-    serial=${CAMERA_SERIAL[$camera]:-}
-    [[ -n "$serial" ]] || die "no serial configured for ${camera}"
-    start_component "$camera" \
-        ros2 launch realsense2_camera rs_launch.py \
-        camera_name:="$camera" \
-        depth_module.color_profile:="${CAMERA_PROFILE}" \
-        depth_module.depth_profile:="${CAMERA_PROFILE}" \
-        serial_no:="_${serial}"
-done
-for camera in camera_h camera_l camera_r; do
-    wait_for_topic "/camera/${camera}/color/image_rect_raw/compressed" 40
-done
+    for camera in camera_h camera_l camera_r; do
+        serial=${CAMERA_SERIAL[$camera]:-}
+        [[ -n "$serial" ]] || die "no serial configured for ${camera}"
+        start_component "$camera" \
+            ros2 launch realsense2_camera rs_launch.py \
+            camera_name:="$camera" \
+            depth_module.color_profile:="${CAMERA_PROFILE}" \
+            depth_module.depth_profile:="${CAMERA_PROFILE}" \
+            serial_no:="_${serial}"
+    done
+    for camera in camera_h camera_l camera_r; do
+        wait_for_topic "/camera/${camera}/color/image_rect_raw/compressed" 40
+    done
+fi
 
 # --- VR, then the filter that feeds the arms --------------------------------
 
@@ -265,4 +275,13 @@ set +u
 source /home/arx/miniconda3/etc/profile.d/conda.sh
 conda activate act
 set -u
-exec python collect.py --episode_idx -1 --height "${LIFT_HEIGHT}" --task "${TASK_NAME}" "$@"
+collect_args=(--episode_idx -1 --height "${LIFT_HEIGHT}" --task "${TASK_NAME}")
+if (( SKIP_CAMERAS )); then
+    # --camera_names with no values leaves the list empty, which switches off
+    # the per-camera checks in get_observation. Written outside datasets/ so an
+    # image-less episode is never picked up as training data by mistake.
+    pipeline_dir="${repo_root}/act/datasets_pipeline_test"
+    mkdir -p "$pipeline_dir"
+    collect_args+=(--camera_names --datasets "$pipeline_dir")
+fi
+exec python collect.py "${collect_args[@]}" "$@"
