@@ -69,8 +69,37 @@ for pattern in '/arx_x5_controller/X5Controller( |$)' '/serial_port_node( |$)' \
     fi
 done
 
+# Same one-shot bring-up as 06_collect_filtered.sh, and not arx_can1.sh: the
+# repair path in those scripts runs `pkill -9 slcand`, killing the daemon behind
+# every other interface, and their success path loops without ever sleeping.
+# Only can1 and can3 here - teleop needs the arms, not the body on can5.
+SKIP_AUTOSTART=${SKIP_AUTOSTART:-0}
+declare -A CAN_DEVICE=( [can1]=/dev/arxcan1 [can3]=/dev/arxcan3 )
+
+can_is_up() { ip link show "$1" 2>/dev/null | grep -q 'UP'; }
+
+bring_up_can() {
+    # Two statements, not one: local expands all its arguments before it assigns
+    # any of them, so ${CAN_DEVICE[$iface]} on the same line reads an unset iface.
+    local iface=$1
+    local dev=${CAN_DEVICE[$iface]}
+    if ! ip link show "$iface" >/dev/null 2>&1; then
+        [[ -e "$dev" ]] || die "${dev} is missing; the CAN adapter for ${iface} is unplugged"
+        echo "  ${iface}: starting slcand on ${dev}"
+        sudo slcand -o -f -s8 "$dev" "$iface" || die "slcand failed for ${iface}"
+        for _ in $(seq 1 20); do
+            ip link show "$iface" >/dev/null 2>&1 && break
+            sleep 0.25
+        done
+    fi
+    sudo ip link set "$iface" up || die "could not bring ${iface} up"
+    can_is_up "$iface" || die "${iface} is still not UP after bring-up"
+}
+
 for interface in can1 can3; do
-    ip link show "$interface" 2>/dev/null | grep -q 'UP' || die "${interface} is not UP"
+    can_is_up "$interface" && continue
+    (( SKIP_AUTOSTART )) && die "${interface} is not UP"
+    bring_up_can "$interface"
 done
 
 # --- arms, pointed at whichever stream this run is testing -------------------
