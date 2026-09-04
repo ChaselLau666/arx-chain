@@ -250,6 +250,69 @@ class TickResult:
     events: Tuple[TimelineEvent, ...]
 
 
+class _OneEuroFilter:
+    """One Euro filter over the 7 channels of one arm's rebased target.
+
+    Channels 0-2 are metres, 3-5 are radians (unwrapped against the previous
+    filtered value so a pi -> -pi step is not smoothed as a full turn), 6 is
+    the gripper. First sample passes through unchanged, which keeps the
+    exact-first-frame handoff equality intact.
+    """
+
+    _ANGLE_CHANNELS = (3, 4, 5)
+
+    def __init__(self, min_cutoff_hz: float, beta: float, d_cutoff_hz: float) -> None:
+        self._min_cutoff = float(min_cutoff_hz)
+        self._beta = float(beta)
+        self._d_cutoff = float(d_cutoff_hz)
+        self._prev_time_ns: Optional[int] = None
+        self._prev_value: Optional[list] = None
+        self._prev_derivative: Optional[list] = None
+
+    def reset(self) -> None:
+        self._prev_time_ns = None
+        self._prev_value = None
+        self._prev_derivative = None
+
+    @staticmethod
+    def _alpha(cutoff_hz: float, dt_s: float) -> float:
+        tau = 1.0 / (2.0 * math.pi * cutoff_hz)
+        return 1.0 / (1.0 + tau / dt_s)
+
+    def filter(self, values: Tuple[float, ...], now_ns: int) -> Tuple[float, ...]:
+        sample = list(values)
+        if self._prev_value is None or self._prev_time_ns is None:
+            self._prev_time_ns = now_ns
+            self._prev_value = sample
+            self._prev_derivative = [0.0] * len(sample)
+            return tuple(sample)
+        dt_s = (now_ns - self._prev_time_ns) / 1e9
+        if dt_s <= 0.0:
+            return tuple(self._prev_value)
+        assert self._prev_derivative is not None
+        d_alpha = self._alpha(self._d_cutoff, dt_s)
+        result = []
+        for index, raw in enumerate(sample):
+            prev = self._prev_value[index]
+            if index in self._ANGLE_CHANNELS:
+                # Shortest-path unwrap so wrap-around is not seen as motion.
+                raw = prev + math.atan2(math.sin(raw - prev), math.cos(raw - prev))
+            derivative = (raw - prev) / dt_s
+            smoothed_derivative = (
+                d_alpha * derivative + (1.0 - d_alpha) * self._prev_derivative[index]
+            )
+            cutoff = self._min_cutoff + self._beta * abs(smoothed_derivative)
+            alpha = self._alpha(cutoff, dt_s)
+            filtered = alpha * raw + (1.0 - alpha) * prev
+            if index in self._ANGLE_CHANNELS:
+                filtered = math.atan2(math.sin(filtered), math.cos(filtered))
+            self._prev_derivative[index] = smoothed_derivative
+            result.append(filtered)
+        self._prev_time_ns = now_ns
+        self._prev_value = result
+        return tuple(result)
+
+
 @dataclass(frozen=True)
 class HumanDaggerConfig:
     feedback_timeout_ns: int = 100_000_000
@@ -268,6 +331,12 @@ class HumanDaggerConfig:
     )
     future_timestamp_tolerance_ns: int = 5_000_000
     gripper_delta_scale: float = -3.4 / 5.0
+    # One Euro smoothing of the HUMAN rebased target; min_cutoff <= 0 disables.
+    # Disabled by default: the exact SE(3) rebase output is a tested contract.
+    # The Human DAgger app opts in via human_dagger.yaml.
+    human_filter_min_cutoff_hz: float = 0.0
+    human_filter_beta: float = 0.15
+    human_filter_d_cutoff_hz: float = 1.0
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -296,6 +365,19 @@ class HumanDaggerConfig:
             raise ValueError("policy_slew_step_per_arm values must be finite and positive")
         if not math.isfinite(self.gripper_delta_scale):
             raise ValueError("gripper_delta_scale must be finite")
+        for field_name in (
+            "human_filter_min_cutoff_hz",
+            "human_filter_beta",
+            "human_filter_d_cutoff_hz",
+        ):
+            if not math.isfinite(float(getattr(self, field_name))):
+                raise ValueError(f"{field_name} must be finite")
+        if self.human_filter_min_cutoff_hz > 0 and (
+            self.human_filter_beta < 0 or self.human_filter_d_cutoff_hz <= 0
+        ):
+            raise ValueError(
+                "human_filter_beta must be >= 0 and human_filter_d_cutoff_hz > 0"
+            )
 
 
 @dataclass(frozen=True)
@@ -335,6 +417,16 @@ class HumanDaggerCore:
         self._left_vr: Optional[VrPose] = None
         self._right_vr: Optional[VrPose] = None
         self._human_anchor: Optional[_HumanAnchor] = None
+        self._human_filters: Optional[dict] = None
+        if config.human_filter_min_cutoff_hz > 0:
+            self._human_filters = {
+                side: _OneEuroFilter(
+                    config.human_filter_min_cutoff_hz,
+                    config.human_filter_beta,
+                    config.human_filter_d_cutoff_hz,
+                )
+                for side in ("left", "right")
+            }
         self._latest_rebased_expert: Optional[Vector14] = None
 
         self._latest_policy_packet: Optional[PolicyActionPacket] = None
@@ -885,6 +977,19 @@ class HumanDaggerCore:
                 self._human_anchor.right_vr,
                 self._right_vr,
             )
+            if self._human_filters is not None:
+                # Smooth the commanded target, not the raw VR: this also
+                # absorbs the 0-17ms sampling-age jitter of the fixed-rate
+                # tick. The same filtered value feeds the recorded expert
+                # action below, preserving recorded == emitted.
+                left_filtered = self._human_filters["left"].filter(
+                    (*left_target[0], left_target[1]), now
+                )
+                right_filtered = self._human_filters["right"].filter(
+                    (*right_target[0], right_target[1]), now
+                )
+                left_target = (_float_tuple(left_filtered[:6]), float(left_filtered[6]))
+                right_target = (_float_tuple(right_filtered[:6]), float(right_filtered[6]))
             assert self._left_vr is not None
             assert self._right_vr is not None
             self._latest_rebased_expert = (
@@ -1038,6 +1143,9 @@ class HumanDaggerCore:
             right_vr=self._right_vr,
         )
         self._latest_rebased_expert = None
+        if self._human_filters is not None:
+            for side_filter in self._human_filters.values():
+                side_filter.reset()
 
     def _rebase_one(
         self,

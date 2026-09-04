@@ -467,6 +467,7 @@ def _run_ros_control(
     from arx5_arm_msg.msg import RobotCmd, RobotStatus
     from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
     from rclpy.executors import MultiThreadedExecutor
+    from rclpy.experimental.events_executor import EventsExecutor
     from rclpy.node import Node
     from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
     from sensor_msgs.msg import CompressedImage
@@ -524,6 +525,13 @@ def _run_ros_control(
         float(control_config.get("future_timestamp_tolerance_ms", 5.0)) * 1_000_000
     )
     gripper_delta_scale = float(control_config.get("gripper_delta_scale", -3.4 / 5.0))
+    human_filter_min_cutoff_hz = float(
+        control_config.get("human_filter_min_cutoff_hz", 1.0)
+    )
+    human_filter_beta = float(control_config.get("human_filter_beta", 0.15))
+    human_filter_d_cutoff_hz = float(
+        control_config.get("human_filter_d_cutoff_hz", 1.0)
+    )
     if int(control_config.get("joint_mode", 5)) != 5:
         raise ValueError("Human DAgger HOLD/POLICY requires X5 POSITION_CONTROL mode 5")
     if int(control_config.get("eef_mode", 4)) != 4:
@@ -578,6 +586,11 @@ def _run_ros_control(
             self.cameras: dict[str, tuple[bytes, int]] = {}
             self.feedback: dict[str, tuple[ArmFeedback, tuple[float, ...], tuple[float, ...]]] = {}
             self.vr: dict[str, VrPose] = {}
+            # Read-only latency diagnostics: per-stream inter-message gap and
+            # count, drained every few seconds by the control loop's [diag] line.
+            self.diag_last_ns: dict[str, int] = {}
+            self.diag_max_gap_ns: dict[str, int] = {}
+            self.diag_count: dict[str, int] = {}
             self.body: tuple[float, int] | None = None
             self.external_hold_requested = threading.Event()
             self.external_hold_ack = threading.Event()
@@ -657,6 +670,7 @@ def _run_ros_control(
             )
             with self.sample_lock:
                 self.feedback[side] = (sample, qvel, effort)
+                self._diag_note_locked(f"fb_{side}", now)
 
         def _vr_callback(self, side: str, message: Any) -> None:
             sample = VrPose(
@@ -673,6 +687,7 @@ def _run_ros_control(
             )
             with self.sample_lock:
                 self.vr[side] = sample
+                self._diag_note_locked(f"vr_{side}", sample.timestamp_ns)
 
         def _body_callback(self, message: Any) -> None:
             with self.sample_lock:
@@ -691,6 +706,25 @@ def _run_ros_control(
                 else "timed out waiting for Human DAgger HOLD acknowledgement"
             )
             return response
+
+        def _diag_note_locked(self, stream: str, now: int) -> None:
+            # Caller holds sample_lock.
+            last = self.diag_last_ns.get(stream)
+            if last is not None and now - last > self.diag_max_gap_ns.get(stream, 0):
+                self.diag_max_gap_ns[stream] = now - last
+            self.diag_last_ns[stream] = now
+            self.diag_count[stream] = self.diag_count.get(stream, 0) + 1
+
+        def drain_diagnostics(self) -> dict[str, tuple[int, int]]:
+            """Max inter-message gap and count per stream since the last drain."""
+            with self.sample_lock:
+                drained = {
+                    stream: (self.diag_max_gap_ns.get(stream, 0), self.diag_count.get(stream, 0))
+                    for stream in self.diag_last_ns
+                }
+                self.diag_max_gap_ns.clear()
+                self.diag_count.clear()
+                return drained
 
         def snapshot(self) -> dict[str, Any]:
             with self.sample_lock:
@@ -738,17 +772,30 @@ def _run_ros_control(
             policy_slew_step_per_arm=policy_slew_steps,
             future_timestamp_tolerance_ns=future_timestamp_tolerance_ns,
             gripper_delta_scale=gripper_delta_scale,
+            human_filter_min_cutoff_hz=human_filter_min_cutoff_hz,
+            human_filter_beta=human_filter_beta,
+            human_filter_d_cutoff_hz=human_filter_d_cutoff_hz,
         )
     )
     rclpy.init(args=[])
     node = HumanDaggerRosNode()
-    executor = MultiThreadedExecutor(num_threads=4)
+    # DAGGER_EXECUTOR=classic restores the MultiThreadedExecutor if the
+    # experimental one ever misbehaves; everything else is unchanged.
+    if os.environ.get('DAGGER_EXECUTOR', 'events') == 'classic':
+        executor = MultiThreadedExecutor(num_threads=4)
+    else:
+        executor = EventsExecutor()
     executor.add_node(node)
     spin_thread = threading.Thread(target=executor.spin, name="human-dagger-ros-spin", daemon=True)
     spin_thread.start()
 
     frame_period = 1.0 / float(args.frame_rate)
     start_ns = monotonic_ns()
+    # Latency diagnostics: report tick health and per-stream gaps every 5 s.
+    diag_interval_ns = 5_000_000_000
+    last_diag_report_ns = start_ns
+    tick_count = 0
+    tick_overruns = 0
     last_ui_heartbeat_ns = start_ns
     height_stable_since_ns: int | None = None
     precheck_submitted = False
@@ -1338,6 +1385,30 @@ def _run_ros_control(
 
             previous_state = result.snapshot.state
 
+            tick_count += 1
+            if now_ns - last_diag_report_ns >= diag_interval_ns:
+                elapsed_s = (now_ns - last_diag_report_ns) / 1e9
+                diag = node.drain_diagnostics()
+                if result.snapshot.state is not ControlState.PRECHECK_HOLD:
+                    def _diag_gap(stream: str) -> str:
+                        entry = diag.get(stream)
+                        return f"{entry[0] / 1e6:.0f}ms" if entry and entry[1] else "--"
+
+                    # Reading the line: tick low / overrun high -> frontend starved;
+                    # one arm's fb gap high -> that arm's USB-CAN link; VR gap high
+                    # -> VR serial side.
+                    send_ui(
+                        "info",
+                        message=(
+                            f"[diag] tick {tick_count / elapsed_s:.1f}Hz overrun={tick_overruns}"
+                            f" | L-fb gap {_diag_gap('fb_left')} | R-fb gap {_diag_gap('fb_right')}"
+                            f" | VR-L gap {_diag_gap('vr_left')} | VR-R gap {_diag_gap('vr_right')}"
+                        ),
+                    )
+                tick_count = 0
+                tick_overruns = 0
+                last_diag_report_ns = now_ns
+
             if shutdown_requested:
                 if result.command is not None and result.command.source is CommandSource.HOLD:
                     if recording_open and not fault_quarantine_sent:
@@ -1357,6 +1428,7 @@ def _run_ros_control(
             if sleep_seconds > 0:
                 time.sleep(sleep_seconds)
             else:
+                tick_overruns += 1
                 next_tick = time.monotonic()
     except BaseException as exc:
         try:
@@ -1382,7 +1454,11 @@ def _run_ros_control(
         send_ui("exit")
         executor.shutdown(timeout_sec=1.0)
         node.destroy_node()
-        rclpy.shutdown()
+        # The exception path above may already have shut the context down; a
+        # second unconditional call raises "rcl_shutdown already called" and
+        # turns a clean exit into a traceback.
+        if rclpy.ok():
+            rclpy.shutdown()
         spin_thread.join(timeout=1.0)
 
 
