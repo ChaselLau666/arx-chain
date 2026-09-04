@@ -28,7 +28,8 @@ repo_root="$(cd "${script_dir}/.." && pwd)"
 SMOOTH_TAU=${SMOOTH_TAU:-0.05}
 IK_SIDE=${IK_SIDE:-right}                    # right | left | both
 IK_DRY_RUN=${IK_DRY_RUN:-0}                   # 1: solve and report, publish nothing
-IK_ENGAGE_MM=${IK_ENGAGE_MM:-50}              # target must come this close to the arm to engage
+IK_AUTO_ENGAGE=${IK_AUTO_ENGAGE:-0}           # 1: follow the absolute VR pose once near the arm (needs the app to have zeroed it)
+IK_ENGAGE_MM=${IK_ENGAGE_MM:-50}              # with IK_AUTO_ENGAGE, how close the target must come
 IK_ENGAGE_DEG=${IK_ENGAGE_DEG:-20}
 IK_MAX_VEL=${IK_MAX_VEL:-1.5}                 # rad/s per joint
 IK_MAX_RESIDUAL_MM=${IK_MAX_RESIDUAL_MM:-30}  # above this the target is treated as unreachable
@@ -207,6 +208,7 @@ ik_args=(--dt "${IK_DT}" --max-velocity "${IK_MAX_VEL}"
          --engage-distance "$(awk "BEGIN{print ${IK_ENGAGE_MM}/1000}")" --engage-angle "${IK_ENGAGE_DEG}"
          --max-residual "$(awk "BEGIN{print ${IK_MAX_RESIDUAL_MM}/1000}")")
 (( IK_DRY_RUN )) || ik_args+=(--execute)
+(( IK_AUTO_ENGAGE )) && ik_args+=(--auto-engage)
 
 sides=()
 case "$IK_SIDE" in right) sides=(right);; left) sides=(left);; both) sides=(left right);; esac
@@ -224,9 +226,17 @@ trap - EXIT
 echo
 if (( IK_DRY_RUN )); then
     echo "IK is in DRY-RUN: solving and reporting, publishing nothing. The arms hold."
-else
+elif (( IK_AUTO_ENGAGE )); then
     echo "IK is live for the ${IK_SIDE} arm(s). Nothing moves until the VR target comes within"
     echo "${IK_ENGAGE_MM} mm / ${IK_ENGAGE_DEG} deg of where the arm is; the log says how far it is."
+else
+    echo "IK is live for the ${IK_SIDE} arm(s) and HOLDING. Put the controller where you want to"
+    echo "start from, then engage; the arm follows the controller's motion from that moment:"
+    for side in "${sides[@]}"; do
+        echo "  ros2 service call /vr_ik_${side:0:1}/engage std_srvs/srv/Trigger"
+    done
+    echo "Disengage (hold) with the matching /disengage service. The log says whether the"
+    echo "VR pose is actually moving - if it is not, the controller is not tracking."
 fi
 echo "  tail -f ${LOG_DIR}/vr_ik_${sides[0]:0:1}.log"
 echo

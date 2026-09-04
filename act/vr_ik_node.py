@@ -11,28 +11,38 @@ remote_slave mode. The target then exists as a message, and can be recorded.
 The arm has to be started with v2_joint_control.launch.py, not the vr_slave
 launcher; tools/08_teleop_ik.sh does that.
 
-Safety is a small state machine, because the VR stream is not always a hand:
-when a controller is not tracking, the headset app publishes a fixed parking
-pose some 30 cm from the arm's home with a resting-hand orientation, which is
-outside the reachable workspace. Solving toward that pinned the solver against
-its joint limits 236 mm from the target on the first dry run. So:
+Engagement works the way the vendor app's "operating" state does, and for
+the same reason. The VR stream is not always a hand: a controller that is
+not tracking is published as a fixed pose that can sit a metre from the arm,
+and even a tracking one lives in the headset's frame until the app zeroes
+it. So the node never follows the VR pose as an absolute target by default.
+It waits for an engage request, and at that moment records both where the
+VR pose is and where the arm is; from then on the arm follows the VR pose's
+motion relative to that moment, applied to the arm's pose at that moment.
+Where the VR frame sits is irrelevant, and engaging on a frozen pose moves
+nothing. The serial packet carries no button state, so the request is a ROS
+service rather than a controller button:
 
-  WAITING   no arm feedback or no VR pose yet; nothing published
-  ARMED     both present; the target is checked against where the arm
-            actually is, and nothing is published until it comes within
-            --engage-distance / --engage-angle of it. That is what the
-            vendor app's "operating" state guarantees by construction: the
-            hand starts where the arm is.
-  TRACKING  solving and publishing. Each joint may move at most
-            --max-velocity, using the measured message interval, so a far
-            target is walked toward rather than lunged at. If the position
-            residual stays above --max-residual without improving over
-            --stall-window messages, the solver has stalled: the target left
-            the workspace, or the controller dropped back to its parking
-            pose. Publishing stops and the node returns to ARMED, holding
-            the last command, until the target comes back within reach.
-            Distance alone is not the test - right after engaging the
-            residual is the whole engage distance and is meant to shrink.
+    ros2 service call /vr_ik_r/engage std_srvs/srv/Trigger
+    ros2 service call /vr_ik_r/disengage std_srvs/srv/Trigger
+
+--auto-engage restores the earlier behaviour for a stream the app has
+already zeroed: the absolute VR pose is followed, once it comes within
+--engage-distance / --engage-angle of where the arm actually is.
+
+  WAITING   no arm feedback yet; nothing published
+  ARMED     feedback present; holding, waiting for engage (or, with
+            --auto-engage, for the target to come within reach)
+  TRACKING  solving and publishing. Each joint moves at most --max-velocity,
+            using the measured message interval, so a far target is walked
+            toward rather than lunged at. A residual above --max-residual
+            that stops improving over --stall-window messages means the
+            target left the workspace; publishing stops and the node
+            returns to ARMED holding the last command.
+
+The report line always says whether the VR pose has moved in the last
+second and how long since it was last received, because "is the controller
+tracking?" is the first question to answer when nothing happens.
 
 Nothing is published without --execute.
 """
@@ -48,7 +58,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation as R
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from x5_model import EE_FRAME, GRIPPER_SCALE, JOINTS, kinematic_urdf, target_transform  # noqa: E402
+from x5_model import EE_FRAME, EULER, GRIPPER_SCALE, JOINTS, kinematic_urdf, target_transform  # noqa: E402
 
 WAITING, ARMED, TRACKING = 'WAITING', 'ARMED', 'TRACKING'
 
@@ -63,6 +73,7 @@ def build_node(args):
     from rclpy.node import Node
     from arm_control.msg import PosCmd
     from arx5_arm_msg.msg import RobotStatus
+    from std_srvs.srv import Trigger
 
     class VrIkNode(Node):
         def __init__(self):
@@ -76,8 +87,7 @@ def build_node(args):
             self.task.configure(EE_FRAME, 'soft', 1.0, 1.0)
             self.solver.add_regularization_task(1e-5)
             self.solver.dt = args.dt
-            # A second wrapper just for FK of the feedback, so the gate can be
-            # evaluated without disturbing the solver's state.
+            # FK of the feedback for gating and engaging, without touching the solver.
             self.fk_robot = placo.RobotWrapper(str(urdf), placo.Flags.ignore_collisions)
 
             self.state = WAITING
@@ -87,18 +97,26 @@ def build_node(args):
             self.solved = self.clamped = 0
             self.residual = []
             self.res_hist = collections.deque(maxlen=args.stall_window)
-            self.gate = None            # (distance m, angle deg) of the latest target vs the arm
-            self.t_state_change = time.monotonic()
+            self.gate = None
+            self.t_last_pose = None
+            self.vr_p = self.vr_R = None                 # latest VR pose, base frame
+            self.vr_recent = collections.deque()         # (t, p) over the last second
+            self.origin = None                           # (p_arm0, R_arm0, p_vr0, R_vr0) set at engage
 
             self.pub = self.create_publisher(RobotStatus, args.out_topic, 10) if args.execute else None
             self.create_subscription(RobotStatus, args.feedback_topic, self.on_feedback, 10)
             self.create_subscription(PosCmd, args.in_topic, self.on_pose, 10)
+            self.create_service(Trigger, '~/engage', self.srv_engage)
+            self.create_service(Trigger, '~/disengage', self.srv_disengage)
             self.create_timer(args.report_period, self.report)
+            mode = ('auto-engage on the absolute VR pose within '
+                    f'{args.engage_distance * 1000:.0f} mm / {args.engage_angle:.0f} deg'
+                    if args.auto_engage else
+                    f'relative to the pose at engage; call /{args.node_name}/engage')
             self.get_logger().info(
                 f'{args.in_topic} -> IK -> {args.out_topic}  '
-                f'{"PUBLISHING" if args.execute else "DRY-RUN, pass --execute to publish"}; '
-                f'engage within {args.engage_distance * 1000:.0f} mm / {args.engage_angle:.0f} deg, '
-                f'max {args.max_velocity:.2f} rad/s, hold above {args.max_residual * 1000:.0f} mm residual')
+                f'{"PUBLISHING" if args.execute else "DRY-RUN, pass --execute to publish"}; {mode}; '
+                f'max {args.max_velocity:.2f} rad/s')
 
         # --- inputs ------------------------------------------------------------
         def on_feedback(self, msg):
@@ -109,21 +127,30 @@ def build_node(args):
         def on_pose(self, msg):
             now = time.monotonic()
             self.t_last_pose = now
+            T_vr = target_transform([msg.x, msg.y, msg.z], [msg.roll, msg.pitch, msg.yaw])
+            self.vr_p, self.vr_R = T_vr[:3, 3].copy(), T_vr[:3, :3].copy()
+            self.vr_recent.append((now, self.vr_p))
+            while self.vr_recent and now - self.vr_recent[0][0] > 1.0:
+                self.vr_recent.popleft()
             if self.state == WAITING:
                 return
-            T = target_transform([msg.x, msg.y, msg.z], [msg.roll, msg.pitch, msg.yaw])
 
             if self.state == ARMED:
-                # Gate against where the arm really is, not where the solver was.
-                self.fk_set(self.q_feedback)
-                T_arm = np.array(self.fk_robot.get_T_world_frame(EE_FRAME))
-                self.gate = (float(np.linalg.norm(T[:3, 3] - T_arm[:3, 3])), rotation_angle_deg(T[:3, :3], T_arm[:3, :3]))
+                if not args.auto_engage:
+                    return
+                T_arm = self.fk_of(self.q_feedback)
+                self.gate = (float(np.linalg.norm(self.vr_p - T_arm[:3, 3])), rotation_angle_deg(self.vr_R, T_arm[:3, :3]))
                 if self.gate[0] > args.engage_distance or self.gate[1] > args.engage_angle:
                     return
-                self.seed(self.q_feedback)
-                self.t_prev_msg = now
-                self.res_hist.clear()
-                self.set_state(TRACKING, f'target within {self.gate[0] * 1000:.0f} mm / {self.gate[1]:.0f} deg of the arm')
+                self.engage(f'target within {self.gate[0] * 1000:.0f} mm / {self.gate[1]:.0f} deg of the arm', now)
+
+            if self.origin is None:          # auto-engage: follow the absolute pose
+                T = T_vr
+            else:                            # relative: VR motion since engage, applied to the arm's pose then
+                p_arm0, R_arm0, p_vr0, R_vr0 = self.origin
+                T = np.eye(4)
+                T[:3, 3] = p_arm0 + (self.vr_p - p_vr0)
+                T[:3, :3] = (self.vr_R @ R_vr0.T) @ R_arm0
 
             dt = min(max(now - self.t_prev_msg, 1 / 500), 1 / 20)   # tolerate a stalled stream
             self.t_prev_msg = now
@@ -144,15 +171,13 @@ def build_node(args):
             self.residual.append(res)
             self.res_hist.append(res)
             self.solved += 1
-            # Unreachable means the solver has stalled, not that the target is
-            # currently far: right after engaging the residual is the whole
-            # engage distance and shrinks over the next few messages as the
-            # velocity cap lets the arm walk in. A target outside the workspace
-            # leaves the residual large and flat instead.
+            # Out of reach means the solver has stalled, not that the target is
+            # currently far: right after engaging the residual can be the whole
+            # engage distance and shrinks as the velocity cap walks the arm in.
             if (res > args.max_residual and len(self.res_hist) == self.res_hist.maxlen
                     and res > 0.9 * self.res_hist[0]):
-                self.set_state(ARMED, f'residual {res * 1000:.0f} mm and not improving over '
-                                      f'{self.res_hist.maxlen} messages - target is out of reach; holding')
+                self.disengage(f'residual {res * 1000:.0f} mm and not improving over '
+                               f'{self.res_hist.maxlen} messages - target is out of reach')
                 return
 
             if self.pub is not None:
@@ -162,12 +187,52 @@ def build_node(args):
                 out.joint_pos[6] = float(msg.gripper) * GRIPPER_SCALE
                 self.pub.publish(out)
 
+        # --- engage / disengage --------------------------------------------------
+        def engage(self, why, now=None):
+            """Seed the solver from the arm and, unless auto-engaging, anchor the VR frame here."""
+            now = now or time.monotonic()
+            self.seed(self.q_feedback)
+            self.t_prev_msg = now
+            self.res_hist.clear()
+            if not args.auto_engage:
+                T_arm = self.fk_of(self.q_feedback)
+                self.origin = (T_arm[:3, 3].copy(), T_arm[:3, :3].copy(), self.vr_p.copy(), self.vr_R.copy())
+            self.set_state(TRACKING, why)
+
+        def disengage(self, why):
+            self.origin = None
+            self.set_state(ARMED, why + '; holding')
+
+        def srv_engage(self, _req, resp):
+            if self.state == WAITING:
+                resp.success, resp.message = False, 'no arm feedback yet'
+            elif self.state == TRACKING:
+                resp.success, resp.message = False, 'already tracking; disengage first to re-anchor'
+            elif self.t_last_pose is None or time.monotonic() - self.t_last_pose > 0.5:
+                resp.success, resp.message = False, 'no recent VR pose; is serial_port_node running and the headset awake?'
+            else:
+                moving = self.vr_motion_mm()
+                self.engage(f'engaged by request; VR pose {"moving" if moving > 1 else "NOT moving"} '
+                            f'({moving:.0f} mm over the last second)')
+                resp.success = True
+                resp.message = (f'engaged at q={np.round(self.q_feedback, 3).tolist()}; '
+                                + ('VR pose is moving' if moving > 1 else
+                                   'WARNING: VR pose is not moving - the arm will not move until the controller tracks'))
+            return resp
+
+        def srv_disengage(self, _req, resp):
+            if self.state == TRACKING:
+                self.disengage('disengaged by request')
+                resp.success, resp.message = True, 'holding'
+            else:
+                resp.success, resp.message = False, f'not tracking (state {self.state})'
+            return resp
+
         # --- helpers -------------------------------------------------------------
         def set_state(self, state, why):
             if state != self.state:
                 self.get_logger().info(f'{self.state} -> {state}: {why}')
                 self.state = state
-                self.t_state_change = time.monotonic()
 
         def seed(self, q):
             for name, value in zip(JOINTS, q):
@@ -175,40 +240,48 @@ def build_node(args):
             self.robot.update_kinematics()
             self.last_q = np.asarray(q, dtype=float).copy()
 
-        def fk_set(self, q):
+        def fk_of(self, q):
             for name, value in zip(JOINTS, q):
                 self.fk_robot.set_joint(name, float(value))
             self.fk_robot.update_kinematics()
+            return np.array(self.fk_robot.get_T_world_frame(EE_FRAME))
 
         def current_q(self):
             return np.array([self.robot.get_joint(n) for n in JOINTS])
 
+        def vr_motion_mm(self):
+            if len(self.vr_recent) < 2:
+                return 0.0
+            ps = np.array([p for _, p in self.vr_recent])
+            return float(np.linalg.norm(ps.max(0) - ps.min(0)) * 1000)
+
         def report(self):
-            # A stalled VR stream is the first thing to rule out: the gate
-            # distance below would otherwise be reported forever from the
-            # last message received, which reads as a hand that never moves.
             stale = None if self.t_last_pose is None else time.monotonic() - self.t_last_pose
             if stale is not None and stale > 1.0:
                 self.get_logger().warning(
                     f'{self.state}: no VR pose for {stale:.0f} s - is serial_port_node running, '
                     f'the headset awake, and the USB cable in?')
-                self.solved = self.clamped = 0
-                self.residual.clear()
-                return
-            if self.state == WAITING:
+            elif self.state == WAITING:
                 self.get_logger().info('WAITING: no arm feedback yet')
             elif self.state == ARMED:
-                if self.gate is None:
+                if self.t_last_pose is None:
                     self.get_logger().info('ARMED: no VR pose yet')
                 else:
-                    self.get_logger().info(
-                        f'ARMED: target is {self.gate[0] * 1000:.0f} mm / {self.gate[1]:.0f} deg from the arm; '
-                        f'need < {args.engage_distance * 1000:.0f} mm / {args.engage_angle:.0f} deg. '
-                        f'Is the controller tracking? Bring the hand to where the arm is.')
+                    moving = self.vr_motion_mm()
+                    vr = f'VR pose {"moving" if moving > 1 else "NOT moving"} ({moving:.0f} mm/s)'
+                    if args.auto_engage and self.gate is not None:
+                        self.get_logger().info(
+                            f'ARMED: {vr}; target is {self.gate[0] * 1000:.0f} mm / {self.gate[1]:.0f} deg from the arm, '
+                            f'need < {args.engage_distance * 1000:.0f} mm / {args.engage_angle:.0f} deg')
+                    else:
+                        self.get_logger().info(
+                            f'ARMED: {vr}; holding. Engage with: '
+                            f'ros2 service call /{args.node_name}/engage std_srvs/srv/Trigger')
             elif self.residual:
                 r = np.array(self.residual) * 1000
                 self.get_logger().info(
-                    f'TRACKING {self.solved / args.report_period:5.1f} Hz  residual mean {r.mean():.2f} mm max {r.max():.2f} mm  '
+                    f'TRACKING {self.solved / args.report_period:5.1f} Hz  VR {self.vr_motion_mm():.0f} mm/s  '
+                    f'residual mean {r.mean():.2f} mm max {r.max():.2f} mm  '
                     f'clamped {self.clamped}/{self.solved}  q={np.round(self.last_q, 3)}')
             self.solved = self.clamped = 0
             self.residual.clear()
@@ -227,8 +300,10 @@ def main():
     parser.add_argument('--urdf-cache', default=str(Path(__file__).resolve().parent / 'x5_kin.urdf'))
     parser.add_argument('--dt', type=float, default=1 / 100.0,
                         help='solver integration step; roughly the VR message period')
+    parser.add_argument('--auto-engage', action='store_true',
+                        help='follow the absolute VR pose once it is near the arm, instead of waiting for the engage service')
     parser.add_argument('--engage-distance', type=float, default=0.05,
-                        help='m; the target must come this close to the arm before anything is published')
+                        help='m; with --auto-engage, the target must come this close to the arm first')
     parser.add_argument('--engage-angle', type=float, default=20.0, help='deg; orientation counterpart of --engage-distance')
     parser.add_argument('--max-velocity', type=float, default=1.5,
                         help='rad/s per joint, applied per message using the measured interval')
