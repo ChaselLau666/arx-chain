@@ -749,6 +749,22 @@ class TerminalKeyReaderIntegrationTests(unittest.TestCase):
 
 
 class RecorderTimelineIntegrationTests(unittest.TestCase):
+    def test_only_superseded_policy_acceptance_is_unbound(self):
+        for name, epoch, expected_frame in (
+            ("POLICY_ACTION_ACCEPTED", 1, -1),
+            ("POLICY_ACTION_ACCEPTED", 2, 192),
+            ("POLICY_ACTION_ACCEPTED", 3, 192),
+            ("CONTROL_GATE", 1, 192),
+            ("HUMAN_ACTIVE", 1, 192),
+        ):
+            with self.subTest(name=name, epoch=epoch):
+                event = types.SimpleNamespace(name=name, control_epoch=epoch,
+                                              timestamp_ns=123, detail="original")
+                _, records = _timeline_event_records([event], None, 192, frame_epoch=2)
+                self.assertEqual(records[0]["frame"], expected_frame)
+                self.assertEqual(records[0]["epoch"], epoch)
+                self.assertEqual(records[0]["detail"], "original")
+
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.output_dir = Path(self.temp_dir.name)
@@ -853,15 +869,31 @@ class RecorderTimelineIntegrationTests(unittest.TestCase):
 
         harness.clock.advance()
         harness.install_inputs()
+        # Reproduce a model result accepted before Space is processed in the
+        # same tick. The candidate must never become the published command.
+        old_epoch = policy.snapshot.control_epoch
+        accepted_ns = harness.clock.now_ns
+        self.assertTrue(harness.core.submit_policy_action(
+            PolicyActionPacket(old_epoch, 1, accepted_ns,
+                              measured_joint_action(accepted_ns)), accepted_ns,
+        ))
         harness.core.handle_key(" ", harness.clock.now_ns)
         to_human = harness.core.tick(harness.clock.now_ns)
+        self.assertEqual(to_human.command.source, CommandSource.HOLD)
         human_request = event_time(to_human, TimelineEventName.TAKEOVER_REQUEST)
         human_gate = event_time(to_human, TimelineEventName.CONTROL_GATE)
         handoff_pending, event_records = _timeline_event_records(
             to_human.events,
             None,
             1,
+            frame_epoch=to_human.snapshot.control_epoch,
         )
+        accepted = [row for row in event_records if row["event"] == "POLICY_ACTION_ACCEPTED"]
+        self.assertEqual(len(accepted), 1)
+        self.assertEqual((accepted[0]["frame"], accepted[0]["epoch"], accepted[0]["request_ns"]),
+                         (-1, old_epoch, accepted_ns))
+        gate = next(row for row in event_records if row["event"] == "CONTROL_GATE")
+        self.assertEqual((gate["frame"], gate["epoch"]), (1, old_epoch + 1))
         for event_record in event_records:
             recorder.record_event(**event_record)
         self.append_result(
@@ -984,6 +1016,49 @@ class RecorderTimelineIntegrationTests(unittest.TestCase):
             np.testing.assert_array_equal(
                 [row["epoch"] for row in handoff_events], [2, 3]
             )
+
+    def test_space_interrupts_start_and_resume_without_invalidating_recording(self) -> None:
+        harness = CoreHarness()
+        harness.install_inputs()
+        harness.core.mark_precheck_complete(harness.clock.now_ns)
+        harness.core.tick(harness.clock.now_ns)
+        recorder = HumanDaggerRecorder(
+            self.output_dir, "episode_cancelled_policy", camera_names=CAMERAS,
+            image_capacity=64, metadata={"task": "cancelled_policy_test"},
+        )
+        pending = None
+        modes = [
+            ControlMode.HANDOFF_TO_POLICY, ControlMode.HANDOFF_TO_HUMAN, ControlMode.HUMAN,
+            ControlMode.HANDOFF_TO_POLICY, ControlMode.HANDOFF_TO_HUMAN, ControlMode.HUMAN,
+        ]
+        for frame, (key, mode) in enumerate(zip(("r", " ", None, "p", " ", None), modes)):
+            harness.clock.advance()
+            harness.install_inputs()
+            if key is not None:
+                harness.core.handle_key(key, harness.clock.now_ns)
+            result = harness.core.tick(harness.clock.now_ns)
+            self.assertEqual(result.snapshot.state.value, mode.name)
+            pending, records = _timeline_event_records(result.events, pending, frame)
+            for event in records:
+                recorder.record_event(**event)
+            self.append_result(recorder, harness, result, mode, frame)
+            if mode is ControlMode.HANDOFF_TO_HUMAN:
+                self.assertEqual(result.command.source, CommandSource.HOLD)
+                self.assertTrue(harness.core.acknowledge_handoff_hold_published(
+                    result.snapshot.control_epoch, harness.clock.now_ns,
+                ))
+        self.assertIsNone(pending)
+        path = recorder.finalize()
+        validation = validate_episode(path)
+        self.assertTrue(validation.valid, validation.errors)
+        with h5py.File(path, "r") as root:
+            np.testing.assert_array_equal(root["/dagger/control_mode"][:], modes)
+            np.testing.assert_array_equal(
+                root["/dagger/supervision_valid"][:], [False, False, True, False, False, False],
+            )
+            events = [row["event"].decode().rstrip("\x00") for row in root["/dagger/events"][:]]
+            self.assertEqual(events.count(EventType.HANDOFF_TO_HUMAN), 2)
+            self.assertNotIn(EventType.HANDOFF_TO_POLICY, events)
 
     def test_ended_incomplete_handoff_raw_events_finalize_and_validate(self) -> None:
         harness = CoreHarness()

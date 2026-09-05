@@ -35,7 +35,24 @@ control:
   # Maximum joint/gripper change emitted per 60 Hz tick while resuming policy.
   policy_slew_step_per_arm: [0.05, 0.05, 0.03, 0.05, 0.05, 0.05, 0.2]
   future_timestamp_tolerance_ms: 5
-  gripper_delta_scale: -0.68
+  # Hold-to-engage takeover from a VR button channel. Disabled until the
+  # button-to-mode mapping has been measured on this headset: mode1/mode2
+  # are parsed inside a closed-source library, and mode1 is also consumed
+  # by the body controller as a chassis command. Only TAKEOVER is
+  # automated; returning to the policy stays on the P key.
+  vr_engage_enabled: true
+  vr_engage_field: mode1
+  vr_engage_side: left
+  vr_engage_active_value: 1
+  # HUMAN drives the gripper as an absolute binary target: release the
+  # trigger to open, squeeze it to close, regardless of where the policy
+  # left the jaw before the takeover.  The band between the two trigger
+  # thresholds is hysteretic and holds the current endpoint.
+  # Raw VR trigger travel is 0 (released) to 5 (fully squeezed).
+  gripper_trigger_open_below: 2.0
+  gripper_trigger_close_above: 3.0
+  gripper_open_value: 0.0
+  gripper_closed_value: -3.384
   # One Euro smoothing of the HUMAN-mode target (teleop feel). Strong smoothing
   # at rest kills tracker noise and the 60Hz-sampling stutter; smoothing fades
   # automatically as hand speed rises. Set human_filter_min_cutoff_hz: 0 to

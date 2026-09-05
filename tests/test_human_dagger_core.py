@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import sys
+from dataclasses import replace
 import threading
 import unittest
 from pathlib import Path
@@ -169,6 +170,47 @@ class CoreFixture(unittest.TestCase):
 
 
 class StateMachineTests(CoreFixture):
+    def test_space_cancels_cold_start_and_moving_policy_handoff(self):
+        for moving in (False, True):
+            with self.subTest(moving=moving):
+                self.setUp()
+                epoch = self.begin_policy_handoff()
+                if moving:
+                    self.clock.now_ns += MS
+                    self.install_inputs()
+                    self.core.acknowledge_policy_reset(epoch, self.clock.now_ns)
+                    self.core.submit_policy_action(
+                        PolicyActionPacket(epoch, 0, self.clock.now_ns, policy_action(5)),
+                        self.clock.now_ns,
+                    )
+                    self.assertEqual(self.core.tick().command.source, CommandSource.POLICY_SLEW)
+                self.core.handle_key(" ", self.clock.now_ns)
+                held = self.core.tick()
+                self.assertEqual(held.snapshot.state, ControlState.HANDOFF_TO_HUMAN)
+                self.assertEqual(held.command.source, CommandSource.HOLD)
+                self.assertGreater(held.snapshot.control_epoch, epoch)
+                self.assertIsNone(held.snapshot.pending_policy_reset_epoch)
+                self.assertFalse(self.core.acknowledge_policy_reset(epoch, self.clock.now_ns))
+                self.assertFalse(self.core.submit_policy_action(
+                    PolicyActionPacket(epoch, 1, self.clock.now_ns, (float("nan"),) * 14),
+                    self.clock.now_ns,
+                ))
+                self.core.handle_key(" ", self.clock.now_ns)
+                self.assertEqual(self.core.tick().command.source, CommandSource.HOLD)
+                self.core.acknowledge_handoff_hold_published(held.snapshot.control_epoch, self.clock.now_ns)
+                self.clock.now_ns += MS
+                self.install_inputs()
+                human = self.core.tick()
+                self.assertEqual(human.snapshot.state, ControlState.HUMAN)
+                self.assertEqual(human.command.left.end_pos, arm_feedback(self.clock.now_ns).eef_pose)
+                # Absolute binary gripper: the left trigger is at 2.0, on the
+                # open threshold, so the jaw opens regardless of the -1.2 the
+                # feedback carried.
+                self.assertEqual(
+                    human.command.left.gripper, self.config.gripper_open_value
+                )
+                self.assertTrue(human.snapshot.intervention_occurred)
+
     def test_all_required_states_are_explicit(self):
         self.assertEqual(
             {state.value for state in ControlState},
@@ -626,10 +668,17 @@ class HumanRebaseTests(CoreFixture):
         self.assertEqual(result.snapshot.state, ControlState.HUMAN)
         self.assertEqual(result.command.left.end_pos, left_feedback.eef_pose)
         self.assertEqual(result.command.right.end_pos, right_feedback.eef_pose)
-        self.assertEqual(result.command.left.gripper, left_feedback.gripper)
-        self.assertEqual(result.command.right.gripper, right_feedback.gripper)
+        # The pose is exactly continuous, but the gripper is absolute: both
+        # triggers (3.3 and 4.1) are above the close threshold, so both jaws
+        # close instead of inheriting the -1.7 / -2.4 feedback values.
+        self.assertEqual(
+            result.command.left.gripper, self.config.gripper_closed_value
+        )
+        self.assertEqual(
+            result.command.right.gripper, self.config.gripper_closed_value
+        )
 
-    def test_se3_delta_and_gripper_scale_are_applied(self):
+    def test_se3_delta_and_binary_gripper_are_applied(self):
         self.enter_policy()
         self.clock.now_ns += MS
         anchor_time = self.clock.now_ns
@@ -709,14 +758,119 @@ class HumanRebaseTests(CoreFixture):
         actual_rotation = Rotation.from_euler("xyz", result.command.left.end_pos[3:])
         angular_error = (expected_rotation.inv() * actual_rotation).magnitude()
         self.assertLess(angular_error, 1e-10)
-        self.assertAlmostEqual(result.command.left.gripper, -1.0 - 3.4 / 5.0)
-        self.assertAlmostEqual(result.command.right.gripper, -2.0 + 0.5 * 3.4 / 5.0)
+        # Gripper is absolute and binary, independent of the anchor: the left
+        # trigger at 3.0 is on the close threshold, the right at 2.5 sits in
+        # the hysteresis band and so holds its current closed endpoint.
+        self.assertAlmostEqual(
+            result.command.left.gripper, self.config.gripper_closed_value
+        )
+        self.assertAlmostEqual(
+            result.command.right.gripper, self.config.gripper_closed_value
+        )
         self.assertEqual(result.snapshot.latest_rebased_expert, (
             *result.command.left.end_pos,
             result.command.left.gripper,
             *result.command.right.end_pos,
             result.command.right.gripper,
         ))
+
+
+    def test_released_trigger_opens_a_jaw_the_policy_had_closed(self):
+        """The regression this binary mapping exists for.
+
+        Under the old anchor-relative delta, taking over from a policy that had
+        closed the gripper left both the jaw and the trigger on their own lower
+        endpoints, so no trigger travel could reopen the jaw.
+        """
+        self.enter_policy()
+        self.clock.now_ns += MS
+        stamp = self.clock.now_ns
+        closed = self.config.gripper_closed_value
+        # Policy has driven both jaws fully closed.
+        self.core.update_feedback(
+            arm_feedback(stamp, offset=0.0, gripper=closed),
+            arm_feedback(stamp, offset=1.0, gripper=closed),
+        )
+        # The operator's hands are resting, both triggers fully released.
+        self.core.update_vr(
+            vr_pose(stamp, gripper=0.0),
+            vr_pose(stamp, gripper=0.0),
+        )
+        self.core.handle_key(" ", stamp)
+        held = self.core.tick(stamp)
+        self.assertEqual(held.command.source, CommandSource.HOLD)
+        self.clock.now_ns += MS
+        self.assertTrue(
+            self.core.acknowledge_handoff_hold_published(
+                held.snapshot.control_epoch,
+                self.clock.now_ns,
+            )
+        )
+        stamp = self.clock.now_ns
+        self.core.update_feedback(
+            arm_feedback(stamp, offset=0.0, gripper=closed),
+            arm_feedback(stamp, offset=1.0, gripper=closed),
+        )
+        self.core.update_vr(
+            vr_pose(stamp, gripper=0.0),
+            vr_pose(stamp, gripper=0.0),
+        )
+        result = self.core.tick(stamp)
+        self.assertEqual(result.snapshot.state, ControlState.HUMAN)
+        self.assertEqual(
+            result.command.left.gripper, self.config.gripper_open_value
+        )
+        self.assertEqual(
+            result.command.right.gripper, self.config.gripper_open_value
+        )
+
+    def test_gripper_endpoints_are_not_smoothed_by_the_human_filter(self):
+        """A binary transition must reach its endpoint on the same tick."""
+        config = replace(
+            self.config,
+            human_filter_min_cutoff_hz=1.0,
+            human_filter_beta=0.15,
+            human_filter_d_cutoff_hz=1.0,
+        )
+        core = HumanDaggerCore(config, clock_ns=self.clock)
+        self.core = core
+        self.enter_policy()
+        self.clock.now_ns += MS
+        stamp = self.clock.now_ns
+        closed = config.gripper_closed_value
+        core.update_feedback(
+            arm_feedback(stamp, offset=0.0, gripper=closed),
+            arm_feedback(stamp, offset=1.0, gripper=closed),
+        )
+        core.update_vr(vr_pose(stamp, gripper=5.0), vr_pose(stamp, gripper=5.0))
+        core.handle_key(" ", stamp)
+        held = core.tick(stamp)
+        self.clock.now_ns += MS
+        self.assertTrue(
+            core.acknowledge_handoff_hold_published(
+                held.snapshot.control_epoch, self.clock.now_ns
+            )
+        )
+        stamp = self.clock.now_ns
+        core.update_feedback(
+            arm_feedback(stamp, offset=0.0, gripper=closed),
+            arm_feedback(stamp, offset=1.0, gripper=closed),
+        )
+        core.update_vr(vr_pose(stamp, gripper=5.0), vr_pose(stamp, gripper=5.0))
+        self.assertEqual(core.tick(stamp).snapshot.state, ControlState.HUMAN)
+
+        # Release both triggers: the jaws must land exactly on the open endpoint
+        # on this tick, not ramp toward it.
+        self.clock.now_ns += 16 * MS
+        stamp = self.clock.now_ns
+        core.update_feedback(
+            arm_feedback(stamp, offset=0.0, gripper=closed),
+            arm_feedback(stamp, offset=1.0, gripper=closed),
+        )
+        core.update_vr(vr_pose(stamp, gripper=0.0), vr_pose(stamp, gripper=0.0))
+        result = core.tick(stamp)
+        self.assertEqual(result.command.left.gripper, config.gripper_open_value)
+        self.assertEqual(result.command.right.gripper, config.gripper_open_value)
 
 
 class CommandSafetyAndFaultTests(CoreFixture):

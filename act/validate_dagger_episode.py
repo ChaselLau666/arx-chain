@@ -329,6 +329,7 @@ def _validate_modes_and_masks(
         int(ControlMode.HANDOFF_TO_POLICY): {
             int(ControlMode.HANDOFF_TO_POLICY),
             int(ControlMode.POLICY),
+            int(ControlMode.HANDOFF_TO_HUMAN),
             int(ControlMode.FAULT_HOLD),
         },
         int(ControlMode.FAULT_HOLD): {int(ControlMode.FAULT_HOLD)},

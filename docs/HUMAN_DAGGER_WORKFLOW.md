@@ -65,7 +65,7 @@ PID 清单同时保存 supervisor、coordinator、policy、writer 以及各 ROS 
 就绪后机械臂处于 HOLD。先在 `MANUAL_RESET` 中将场景恢复到起始状态，然后使用单键操作（均不需要回车）：
 
 - `R`：启动 policy 并开始录制。
-- `Space`：从 policy 请求人工接管；重复按不会切回 policy。
+- `Space`：从 policy 请求人工接管；`R` / `P` 后的冷启动和渐进衔接期间也可接管，重复按不会切回 policy。
 - `P`：从人工控制请求重新启动 policy。
 - `E`：结束当前 episode。
 - 有人工介入时，审核阶段按 `S` 保存、`D` 丢弃、`Q` 丢弃并退出。
@@ -76,22 +76,34 @@ PID 清单同时保存 supervisor、coordinator、policy、writer 以及各 ROS 
 
 程序退出或启动后预检失败时，启动脚本会尝试请求 HOLD，但不会直接停止高位的 body。必须继续执行安全关停流程。
 
+### Tau0VLA 后端
+
+在机器人本地终端运行当前仓库的 `tools/05_tau0vla_pickplace.sh`，它会选择 Tau0VLA 后端并调用同一采集入口。模型服务器由 `MODEL_SERVER_URL` 指定，任务文本由 `TASK_INSTRUCTION` 指定，无需本地 ACT checkpoint。
+
+Tau0VLA 动作轨迹按独立的 **30 Hz** 时间槽推进；控制与录制默认仍为 **60 Hz**，中间周期沿用当前目标，不会把模型的动作块加倍速播放。人工遥操作不经过 policy 的频率限制或夹爪滤波。
+
+启动脚本的 Tau0VLA 平滑参数与 `03_tau0vla_inference.sh` 对齐：`CHUNK_BLEND_STEPS=6`、`GRIPPER_BLEND_STEPS=0`、`GRIPPER_DEBOUNCE_FRAMES=12`、`ARM_EMA_ALPHA=0.6`、`GRIPPER_EMA_ALPHA=0.6`。夹爪阈值为 `-2.1/-1.05`，输出端点为 `-3.384/0.0`；可通过对应的 `GRIPPER_LOW/HIGH_THRESHOLD` 与 `GRIPPER_LOW/HIGH_VALUE` 环境变量调整。12 帧确认约为 0.4 秒，会有意过滤短暂的夹爪开合意图。每次 `R` / `P` 都清空动作缓冲与滤波状态，并从最新反馈重新初始化。
+
+`REPLAN_STEPS=auto` 根据延迟选择重规划时机。手动设置时，数值表示消费多少步后请求下一块；必须让剩余动作时长覆盖实测 p99 RTT 与余量，过晚重规划会被拒绝。旧 epoch 的 HTTP 结果和异常都不会被新一轮 policy 采用。
+
 ## 4. 数据与校验
 
 默认正式文件写入（设置 `HUMAN_DAGGER_DATASET_DIR` 时以该目录为准）：
 
 ```text
-/home/arx/ROS2_LIFT_Play_wy_dev/act/dagger_datasets/episode_N.hdf5
+/home/arx/ROS2_LIFT_Play/dagger_datasets_YYYYMMDD_HHMMSS_NNNNNNNNN/episode_N.hdf5
 ```
 
-录制中先写为 `*.partial.hdf5`。控制、相机或写盘故障会进入 HOLD，并把未完成文件隔离到 `act/dagger_datasets/quarantine/`，不会混入正式数据。每个文件包含完整 policy/HUMAN/交接时间线和事件日志；`/dagger/supervision_valid[t]` 只标记人工实际拥有 `[t,t+1)` 控制权的下一帧关节监督。
+每次通过 `05_human_dagger.sh` 或其任务启动脚本启动时，按机器人本地时间创建一个新目录（末尾为纳秒，避免快速重启重名），从 `episode_0.hdf5` 开始；同一次启动的后续 episode 在该目录递增编号。实际路径会打印并记入 session manifest。旧数据不移动；显式设置 `HUMAN_DAGGER_DATASET_DIR` 时仍使用指定目录。直接运行 Python 入口时以 `--datasets` 为准。
+
+录制中先写为 `*.partial.hdf5`。控制、相机或写盘故障会进入 HOLD，并把未完成文件隔离到本次目录的 `quarantine/`，不会混入正式数据。每个文件包含完整 policy/HUMAN/交接时间线和事件日志；`/dagger/supervision_valid[t]` 只标记人工实际拥有 `[t,t+1)` 控制权的下一帧关节监督。
 
 保存后运行离线校验：
 
 ```bash
-cd /home/arx/ROS2_LIFT_Play_wy_dev
+cd /home/arx/ROS2_LIFT_Play
 /home/arx/miniconda3/envs/act/bin/python \
-  act/validate_dagger_episode.py act/dagger_datasets/episode_N.hdf5
+  act/validate_dagger_episode.py dagger_datasets_YYYYMMDD_HHMMSS_NNNNNNNNN/episode_N.hdf5
 ```
 
 需要机器可读结果时增加 `--json`。校验失败的文件不得加入后续训练数据。

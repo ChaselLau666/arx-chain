@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import unittest
+import tempfile
 from pathlib import Path
 
 
@@ -15,6 +17,34 @@ ENTRYPOINT = ROOT / 'act' / 'human_dagger.py'
 
 
 class HumanDaggerScriptTests(unittest.TestCase):
+    def test_timestamp_dataset_directory_is_new_and_override_is_preserved(self):
+        text = START.read_text()
+        assignment = next(line for line in text.splitlines() if line.startswith('DATASET_DIR='))
+        begin = text.index('if [[ -n "${HUMAN_DAGGER_DATASET_DIR:-}" ]]; then')
+        block = text[begin:text.index('[[ -w "$DATASET_DIR" ]]', begin)]
+        with tempfile.TemporaryDirectory() as directory:
+            env = os.environ.copy()
+            env.pop('HUMAN_DAGGER_DATASET_DIR', None)
+            env['repo_root'] = directory
+            def run(stamp, override=None):
+                current = env.copy()
+                if override is not None:
+                    current['HUMAN_DAGGER_DATASET_DIR'] = override
+                return subprocess.run(['bash', '-c',
+                    'set -euo pipefail\ndie() { exit 1; }\n'
+                    + f'date() {{ echo {stamp}; }}\n' + assignment + '\n' + block],
+                    env=current, capture_output=True, text=True)
+            first = '20260905_180000_000000001'
+            second = '20260905_180000_000000002'
+            self.assertEqual(run(first).returncode, 0)
+            self.assertNotEqual(run(first).returncode, 0)  # collision cannot reuse data
+            self.assertEqual(run(second).returncode, 0)
+            self.assertTrue((Path(directory) / ('dagger_datasets_' + first)).is_dir())
+            self.assertTrue((Path(directory) / ('dagger_datasets_' + second)).is_dir())
+            custom = str(Path(directory) / 'custom')
+            self.assertEqual(run(first, custom).returncode, 0)
+            self.assertEqual(run(second, custom).returncode, 0)
+
     @classmethod
     def setUpClass(cls):
         cls.start = START.read_text(encoding='utf-8')
@@ -182,7 +212,10 @@ class HumanDaggerScriptTests(unittest.TestCase):
     def test_hold_service_can_receive_post_publish_feedback(self):
         self.assertIn('ReentrantCallbackGroup', self.entrypoint)
         self.assertIn('callback_group=self.io_callback_group', self.entrypoint)
-        self.assertIn('callback_group=self.service_callback_group', self.entrypoint)
+        self.assertIn('callback_group=node.service_callback_group', self.entrypoint)
+        self.assertIn('hold_node.create_service(', self.entrypoint)
+        self.assertIn('hold_executor.add_node(hold_node)', self.entrypoint)
+        self.assertIn('target=hold_executor.spin', self.entrypoint)
         self.assertIn('external_hold_published_ns = monotonic_ns()', self.entrypoint)
         self.assertIn('_feedback_pair_acknowledges_hold(', self.entrypoint)
         self.assertIn('>= hold_published_ns', self.entrypoint)
@@ -198,7 +231,12 @@ class HumanDaggerScriptTests(unittest.TestCase):
             'vr_timeout_ms: 100',
             'policy_timeout_ms: 250',
             'handoff_timeout_s: 2.0',
-            'gripper_delta_scale: -0.68',
+            'vr_engage_enabled: true',
+            'vr_engage_field: mode1',
+            'gripper_trigger_open_below: 2.0',
+            'gripper_trigger_close_above: 3.0',
+            'gripper_open_value: 0.0',
+            'gripper_closed_value: -3.384',
             'dataset_dir: dagger_datasets',
             'quarantine_dir: dagger_datasets/quarantine',
         )
@@ -215,6 +253,36 @@ class HumanDaggerScriptTests(unittest.TestCase):
             '物理急停',
         ):
             self.assertIn(value, text)
+
+    def test_tau0vla_gripper_defaults_match_standalone_and_allow_overrides(self):
+        # Evaluate only the argument array, never the hardware startup script.
+        array = re.search(r'backend_args=\(\s*--policy-backend tau0vla.*?\n    \)', self.start, re.S)
+        self.assertIsNotNone(array)
+        defaults = {
+            'CHUNK_BLEND_STEPS': '6', 'GRIPPER_BLEND_STEPS': '0',
+            'GRIPPER_DEBOUNCE_FRAMES': '12', 'ARM_EMA_ALPHA': '0.6',
+            'GRIPPER_EMA_ALPHA': '0.6', 'GRIPPER_LOW_THRESHOLD': '-2.1',
+            'GRIPPER_HIGH_THRESHOLD': '-1.05', 'GRIPPER_LOW_VALUE': '-3.384',
+            'GRIPPER_HIGH_VALUE': '0.0',
+        }
+        standalone = (ROOT / 'tools' / '03_tau0vla_inference.sh').read_text()
+        for name, value in defaults.items():
+            self.assertIn('${' + name + ':=' + value + '}', standalone)
+        env = os.environ.copy()
+        for name in defaults:
+            env.pop(name, None)
+        env.update(MODEL_SERVER_URL='http://fake', TASK_INSTRUCTION='test task')
+        for overrides in ({}, {'GRIPPER_DEBOUNCE_FRAMES': '0', 'ARM_EMA_ALPHA': '1.0'}):
+            output = subprocess.check_output(
+                ['bash', '-c', array.group(0) + '\nprintf "%s\\n" "${backend_args[@]}"'],
+                env={**env, **overrides}, text=True,
+            ).splitlines()
+            args = dict(zip(output[::2], output[1::2]))
+            for name, value in {**defaults, **overrides}.items():
+                flag = '--' + name.lower().replace('_', '-')
+                self.assertEqual(args[flag], value)
+                field = name.lower()
+                self.assertIn(f'{field}=args.{field}', self.entrypoint)
 
 
 if __name__ == '__main__':

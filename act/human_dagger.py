@@ -118,6 +118,7 @@ def _timeline_event_records(
     events: Any,
     handoff_pending: dict[str, Any] | None,
     frame: int,
+    frame_epoch: int | None = None,
 ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
     """Expand core events into lossless raw rows plus completed handoffs.
 
@@ -199,6 +200,12 @@ def _timeline_event_records(
             ),
             "detail": event.detail,
         }
+        # Accepted into the candidate buffer is not the same as published.
+        # A takeover processed later in this tick can invalidate that candidate.
+        # Keep its original epoch/time, but do not bind it to the new-epoch frame.
+        if (event_name == "POLICY_ACTION_ACCEPTED" and frame_epoch is not None
+                and event.control_epoch < frame_epoch):
+            raw_record["frame"] = -1
         if event_name == "CONTROL_GATE":
             raw_record["gate_ns"] = event.timestamp_ns
         elif event_name in ack_event_names:
@@ -452,6 +459,7 @@ def _run_ros_control(
         ArmFeedback,
         CommandMode,
         CommandSource,
+        ControlEvent,
         ControlState,
         HumanDaggerConfig,
         HumanDaggerCore,
@@ -466,7 +474,7 @@ def _run_ros_control(
     from arm_control.msg import PosCmd
     from arx5_arm_msg.msg import RobotCmd, RobotStatus
     from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
-    from rclpy.executors import MultiThreadedExecutor
+    from rclpy.executors import MultiThreadedExecutor, SingleThreadedExecutor
     from rclpy.experimental.events_executor import EventsExecutor
     from rclpy.node import Node
     from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
@@ -524,7 +532,27 @@ def _run_ros_control(
     future_timestamp_tolerance_ns = int(
         float(control_config.get("future_timestamp_tolerance_ms", 5.0)) * 1_000_000
     )
-    gripper_delta_scale = float(control_config.get("gripper_delta_scale", -3.4 / 5.0))
+    # Hold-to-engage: a VR button channel can raise TAKEOVER so the operator
+    # never reaches for the keyboard to intervene. Only the takeover
+    # direction is automated; returning to the policy stays on the P key,
+    # because that direction slews the arms toward a freshly predicted
+    # target and must not fire on a momentary signal glitch.
+    vr_engage_enabled = bool(control_config.get("vr_engage_enabled", False))
+    vr_engage_field = str(control_config.get("vr_engage_field", "mode1"))
+    vr_engage_side = str(control_config.get("vr_engage_side", "left"))
+    vr_engage_active_value = int(control_config.get("vr_engage_active_value", 1))
+    if vr_engage_field not in ("mode1", "mode2"):
+        raise ValueError("vr_engage_field must be mode1 or mode2")
+    if vr_engage_side not in ("left", "right"):
+        raise ValueError("vr_engage_side must be left or right")
+    gripper_trigger_open_below = float(
+        control_config.get("gripper_trigger_open_below", 2.0)
+    )
+    gripper_trigger_close_above = float(
+        control_config.get("gripper_trigger_close_above", 3.0)
+    )
+    gripper_open_value = float(control_config.get("gripper_open_value", 0.0))
+    gripper_closed_value = float(control_config.get("gripper_closed_value", -3.384))
     human_filter_min_cutoff_hz = float(
         control_config.get("human_filter_min_cutoff_hz", 1.0)
     )
@@ -595,6 +623,11 @@ def _run_ros_control(
             self.external_hold_requested = threading.Event()
             self.external_hold_ack = threading.Event()
             self.external_hold_request_ns = 0
+            # Raw VR engage channel, newest sample only. The control loop
+            # owns edge detection so this callback stays a plain writer.
+            self.vr_engage: Any = None
+            self.vr_engage_field = vr_engage_field
+            self.vr_engage_side = vr_engage_side
             self.external_hold_published_ns = 0
             self.io_callback_group = ReentrantCallbackGroup()
             self.service_callback_group = MutuallyExclusiveCallbackGroup()
@@ -644,12 +677,6 @@ def _run_ros_control(
                 topic("state", ros_config.get("state_topic", "/human_dagger/state")),
                 state_qos,
             )
-            self.create_service(
-                Trigger,
-                topic("request_hold_service", ros_config.get("hold_service", "/human_dagger/request_hold")),
-                self._request_hold,
-                callback_group=self.service_callback_group,
-            )
 
         def _camera_callback(self, camera: str, message: Any) -> None:
             payload = bytes(message.data)
@@ -685,8 +712,17 @@ def _run_ros_control(
                 gripper=message.gripper,
                 timestamp_ns=monotonic_ns(),
             )
+            engage = None
+            if side == self.vr_engage_side:
+                # serial_port.cpp fills mode1/mode2 on the left message only.
+                engage = (
+                    int(getattr(message, self.vr_engage_field, 0)),
+                    sample.timestamp_ns,
+                )
             with self.sample_lock:
                 self.vr[side] = sample
+                if engage is not None:
+                    self.vr_engage = engage
                 self._diag_note_locked(f"vr_{side}", sample.timestamp_ns)
 
         def _body_callback(self, message: Any) -> None:
@@ -732,6 +768,7 @@ def _run_ros_control(
                     "cameras": dict(self.cameras),
                     "feedback": dict(self.feedback),
                     "vr": dict(self.vr),
+                    "vr_engage": self.vr_engage,
                     "body": self.body,
                 }
 
@@ -771,7 +808,10 @@ def _run_ros_control(
             policy_slew_duration_ns=policy_slew_ns,
             policy_slew_step_per_arm=policy_slew_steps,
             future_timestamp_tolerance_ns=future_timestamp_tolerance_ns,
-            gripper_delta_scale=gripper_delta_scale,
+            gripper_trigger_open_below=gripper_trigger_open_below,
+            gripper_trigger_close_above=gripper_trigger_close_above,
+            gripper_open_value=gripper_open_value,
+            gripper_closed_value=gripper_closed_value,
             human_filter_min_cutoff_hz=human_filter_min_cutoff_hz,
             human_filter_beta=human_filter_beta,
             human_filter_d_cutoff_hz=human_filter_d_cutoff_hz,
@@ -779,6 +819,18 @@ def _run_ros_control(
     )
     rclpy.init(args=[])
     node = HumanDaggerRosNode()
+    # HOLD waits for post-publish feedback. Never run this blocking callback on
+    # the EventsExecutor that must receive that feedback to acknowledge it.
+    hold_node = Node("human_dagger_hold_service")
+    hold_node.create_service(
+        Trigger,
+        topic("request_hold_service", ros_config.get("hold_service", "/human_dagger/request_hold")),
+        node._request_hold,
+        callback_group=node.service_callback_group,
+    )
+    hold_executor = SingleThreadedExecutor()
+    hold_executor.add_node(hold_node)
+    hold_thread = threading.Thread(target=hold_executor.spin, name="human-dagger-hold-spin", daemon=True)
     # DAGGER_EXECUTOR=classic restores the MultiThreadedExecutor if the
     # experimental one ever misbehaves; everything else is unchanged.
     if os.environ.get('DAGGER_EXECUTOR', 'events') == 'classic':
@@ -788,6 +840,7 @@ def _run_ros_control(
     executor.add_node(node)
     spin_thread = threading.Thread(target=executor.spin, name="human-dagger-ros-spin", daemon=True)
     spin_thread.start()
+    hold_thread.start()
 
     frame_period = 1.0 / float(args.frame_rate)
     start_ns = monotonic_ns()
@@ -803,6 +856,9 @@ def _run_ros_control(
     reset_request_epoch: int | None = None
     policy_observation_ready_epoch: int | None = None
     previous_state = core.state
+    # Last observed engage level, so only a rising edge raises TAKEOVER.
+    # None means no engage sample has been seen yet.
+    vr_engage_previous: Any = None
     last_state_revision = -1
     observation_seq = 0
     episode_index = next_episode_index(args.datasets, int(args.episode_idx))
@@ -1015,7 +1071,7 @@ def _run_ros_control(
             return "waiting for policy worker"
         return None
 
-    def record_timeline_events(events: Any) -> None:
+    def record_timeline_events(events: Any, frame_epoch: int) -> None:
         nonlocal handoff_pending
         if not recording_open:
             return
@@ -1023,6 +1079,7 @@ def _run_ros_control(
             events,
             handoff_pending,
             recorded_frames,
+            frame_epoch=frame_epoch,
         )
         for event_record in records:
             recorder_send({"kind": "event", "event": event_record})
@@ -1110,7 +1167,9 @@ def _run_ros_control(
                         shutdown_requested = True
                         core.request_fault("operator shutdown", timestamp_ns)
                     else:
-                        if key in {" ", "space"} and core.state is ControlState.POLICY:
+                        if key in {" ", "space"} and core.state in (
+                            ControlState.POLICY, ControlState.HANDOFF_TO_POLICY,
+                        ):
                             send_ui("state", state="TAKEOVER_REQUESTED", detail="gating policy")
                         elif key == "p" and core.state is ControlState.HUMAN:
                             send_ui("state", state="POLICY_REQUESTED", detail="gating human control")
@@ -1237,6 +1296,31 @@ def _run_ros_control(
             if set(samples["vr"]) == {"left", "right"}:
                 core.update_vr(samples["vr"]["left"], samples["vr"]["right"])
 
+            if vr_engage_enabled:
+                engage_sample = samples.get("vr_engage")
+                engage_level = (
+                    None if engage_sample is None else int(engage_sample[0])
+                )
+                if engage_level is not None:
+                    engaged = engage_level == vr_engage_active_value
+                    was_engaged = (
+                        None
+                        if vr_engage_previous is None
+                        else vr_engage_previous == vr_engage_active_value
+                    )
+                    # Rising edge only, and never on the first sample: a
+                    # button already held when the loop starts must not
+                    # take over by itself. The core ignores TAKEOVER in
+                    # every state other than POLICY/HANDOFF_TO_POLICY, so
+                    # holding the button through an episode is harmless.
+                    if engaged and was_engaged is False:
+                        core.submit_event(
+                            ControlEvent.TAKEOVER,
+                            int(engage_sample[1]),
+                            detail="vr engage",
+                        )
+                    vr_engage_previous = engage_level
+
             if review_reset_pending:
                 if core.state is ControlState.REVIEW_HOLD:
                     review_reset_pending, reset_completed = _retry_review_reset_after_close(
@@ -1351,7 +1435,7 @@ def _run_ros_control(
             ):
                 start_recording(now_ns)
 
-            record_timeline_events(result.events)
+            record_timeline_events(result.events, result.snapshot.control_epoch)
 
             if recording_open and result.snapshot.episode_active and observation is not None:
                 if recorder_send({"kind": "frame", "frame": frame_payload(observation, result)}):
@@ -1457,6 +1541,9 @@ def _run_ros_control(
         send_ui("fatal", error=repr(exc))
     finally:
         send_ui("exit")
+        hold_executor.shutdown(timeout_sec=2.0)
+        hold_thread.join(timeout=2.0)
+        hold_node.destroy_node()
         executor.shutdown(timeout_sec=1.0)
         node.destroy_node()
         # The exception path above may already have shut the context down; a
@@ -1537,6 +1624,12 @@ def run_supervisor(args: argparse.Namespace, runtime_config: dict[str, Any]) -> 
             task_instruction=args.task_instruction,
             replan_steps=str(args.replan_steps),
             chunk_blend_steps=args.chunk_blend_steps,
+            gripper_blend_steps=args.gripper_blend_steps,
+            gripper_debounce_frames=args.gripper_debounce_frames,
+            gripper_low_threshold=args.gripper_low_threshold,
+            gripper_high_threshold=args.gripper_high_threshold,
+            gripper_low_value=args.gripper_low_value,
+            gripper_high_value=args.gripper_high_value,
             arm_ema_alpha=args.arm_ema_alpha,
             gripper_ema_alpha=args.gripper_ema_alpha,
             # Kept coupled to the core's policy_timeout_ns on purpose, the
@@ -1711,6 +1804,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--task-instruction", default="")
     parser.add_argument("--replan-steps", default="auto")
     parser.add_argument("--chunk-blend-steps", type=int, default=6)
+    parser.add_argument("--gripper-blend-steps", type=int, default=None)
+    parser.add_argument("--gripper-debounce-frames", type=int, default=0)
+    parser.add_argument("--gripper-low-threshold", type=float, default=-2.1)
+    parser.add_argument("--gripper-high-threshold", type=float, default=-1.05)
+    parser.add_argument("--gripper-low-value", type=float, default=-3.384)
+    parser.add_argument("--gripper-high-value", type=float, default=0.0)
     parser.add_argument("--arm-ema-alpha", type=float, default=1.0)
     parser.add_argument("--gripper-ema-alpha", type=float, default=1.0)
     parser.add_argument("--mock-policy", action="store_true", help=argparse.SUPPRESS)

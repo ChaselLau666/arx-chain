@@ -257,9 +257,14 @@ class _OneEuroFilter:
     filtered value so a pi -> -pi step is not smoothed as a full turn), 6 is
     the gripper. First sample passes through unchanged, which keeps the
     exact-first-frame handoff equality intact.
+
+    The gripper channel is passed through unfiltered: it carries a binary
+    endpoint, and smoothing it would drag each transition through the very
+    intermediate openings the binary mapping exists to avoid.
     """
 
     _ANGLE_CHANNELS = (3, 4, 5)
+    _PASSTHROUGH_CHANNELS = (6,)
 
     def __init__(self, min_cutoff_hz: float, beta: float, d_cutoff_hz: float) -> None:
         self._min_cutoff = float(min_cutoff_hz)
@@ -294,6 +299,10 @@ class _OneEuroFilter:
         result = []
         for index, raw in enumerate(sample):
             prev = self._prev_value[index]
+            if index in self._PASSTHROUGH_CHANNELS:
+                self._prev_derivative[index] = 0.0
+                result.append(raw)
+                continue
             if index in self._ANGLE_CHANNELS:
                 # Shortest-path unwrap so wrap-around is not seen as motion.
                 raw = prev + math.atan2(math.sin(raw - prev), math.cos(raw - prev))
@@ -330,7 +339,17 @@ class HumanDaggerConfig:
         0.2,
     )
     future_timestamp_tolerance_ns: int = 5_000_000
-    gripper_delta_scale: float = -3.4 / 5.0
+    # The gripper is a single-sided bounded actuator, so HUMAN drives it as
+    # an absolute binary target rather than an anchor-relative delta.  A
+    # relative delta saturates whenever the anchor lands on an endpoint:
+    # taking over from a policy that had closed the gripper leaves the
+    # trigger already at its own lower endpoint, and no amount of trigger
+    # travel can reopen the jaw.  The thresholds are hysteretic so a hand
+    # resting mid-travel does not chatter between the two endpoints.
+    gripper_trigger_open_below: float = 2.0
+    gripper_trigger_close_above: float = 3.0
+    gripper_open_value: float = 0.0
+    gripper_closed_value: float = -3.384
     # One Euro smoothing of the HUMAN rebased target; min_cutoff <= 0 disables.
     # Disabled by default: the exact SE(3) rebase output is a tested contract.
     # The Human DAgger app opts in via human_dagger.yaml.
@@ -363,8 +382,19 @@ class HumanDaggerConfig:
             for step in self.policy_slew_step_per_arm
         ):
             raise ValueError("policy_slew_step_per_arm values must be finite and positive")
-        if not math.isfinite(self.gripper_delta_scale):
-            raise ValueError("gripper_delta_scale must be finite")
+        for field_name in (
+            "gripper_trigger_open_below",
+            "gripper_trigger_close_above",
+            "gripper_open_value",
+            "gripper_closed_value",
+        ):
+            if not math.isfinite(float(getattr(self, field_name))):
+                raise ValueError(f"{field_name} must be finite")
+        if self.gripper_trigger_open_below > self.gripper_trigger_close_above:
+            raise ValueError(
+                "gripper_trigger_open_below must not exceed "
+                "gripper_trigger_close_above"
+            )
         for field_name in (
             "human_filter_min_cutoff_hz",
             "human_filter_beta",
@@ -807,7 +837,7 @@ class HumanDaggerCore:
             return
 
         if event is ControlEvent.TAKEOVER:
-            if self._state is ControlState.POLICY:
+            if self._state in (ControlState.POLICY, ControlState.HANDOFF_TO_POLICY):
                 self._append_timeline_locked(
                     TimelineEventName.TAKEOVER_REQUEST,
                     queued.timestamp_ns,
@@ -1147,6 +1177,26 @@ class HumanDaggerCore:
             for side_filter in self._human_filters.values():
                 side_filter.reset()
 
+    def _resolve_gripper(self, current_command: float, trigger: float) -> float:
+        """Absolute binary gripper target from the raw VR trigger value.
+
+        ``current_command`` is only consulted inside the hysteresis band, so
+        a hand resting mid-travel holds the jaw where it is instead of
+        chattering.  Outside the band the trigger alone decides, which is
+        what makes "release to open" hold regardless of what the policy had
+        commanded before the takeover.
+        """
+        open_value = float(self.config.gripper_open_value)
+        closed_value = float(self.config.gripper_closed_value)
+        if trigger <= self.config.gripper_trigger_open_below:
+            return open_value
+        if trigger >= self.config.gripper_trigger_close_above:
+            return closed_value
+        # Inside the band: keep whichever endpoint the jaw is nearer to.
+        if abs(current_command - closed_value) <= abs(current_command - open_value):
+            return closed_value
+        return open_value
+
     def _rebase_one(
         self,
         feedback_anchor: ArmFeedback,
@@ -1162,11 +1212,14 @@ class HumanDaggerCore:
         # Avoid Euler canonicalisation changing an equivalent representation on
         # the very first HUMAN command.  Exact first-frame equality is useful to
         # both the hardware handoff and its acceptance test.
-        if (
-            vr_current.eef_pose == vr_anchor.eef_pose
-            and vr_current.gripper == vr_anchor.gripper
-        ):
-            return feedback_anchor.eef_pose, feedback_anchor.gripper
+        if vr_current.eef_pose == vr_anchor.eef_pose:
+            # The pose stays bit-exact, but the gripper is absolute: it must
+            # follow the trigger from the very first frame, otherwise a
+            # takeover that begins with the hand still would inherit the
+            # policy's closed jaw and never reopen.
+            return feedback_anchor.eef_pose, self._resolve_gripper(
+                feedback_anchor.gripper, vr_current.gripper
+            )
 
         robot_position = feedback_anchor.eef_pose[:3]
         robot_rpy = feedback_anchor.eef_pose[3:]
@@ -1189,9 +1242,8 @@ class HumanDaggerCore:
         command_rotation = robot_rotation * (anchor_rotation.inv() * current_rotation)
         command_rpy = command_rotation.as_euler("xyz")
         end_pos = _float_tuple((*position, *command_rpy))
-        gripper = feedback_anchor.gripper + (
-            (vr_current.gripper - vr_anchor.gripper)
-            * self.config.gripper_delta_scale
+        gripper = self._resolve_gripper(
+            feedback_anchor.gripper, vr_current.gripper
         )
         return end_pos, float(gripper)
 

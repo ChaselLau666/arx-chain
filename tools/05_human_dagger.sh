@@ -38,7 +38,8 @@ DAGGER_ROUND=${DAGGER_ROUND:-0}
 MAX_TIMESTEPS=${MAX_TIMESTEPS:-800}
 CONFIG_PATH=${HUMAN_DAGGER_CONFIG:-"${repo_root}/act/data/human_dagger.yaml"}
 ACT_PYTHON=${ACT_PYTHON:-/home/arx/miniconda3/envs/act/bin/python}
-DATASET_DIR=${HUMAN_DAGGER_DATASET_DIR:-"${repo_root}/act/dagger_datasets"}
+# Robot-local wall time, with nanoseconds to distinguish rapid restarts.
+DATASET_DIR=${HUMAN_DAGGER_DATASET_DIR:-"${repo_root}/dagger_datasets_$(date +%Y%m%d_%H%M%S_%N)"}
 MIN_FREE_GIB=${HUMAN_DAGGER_MIN_FREE_GIB:-5}
 
 lift_ws=/home/arx/LIFT/body/ROS2
@@ -245,7 +246,13 @@ for pattern in "${conflict_patterns[@]}"; do
   fi
 done
 
-mkdir -p "$DATASET_DIR"
+if [[ -n "${HUMAN_DAGGER_DATASET_DIR:-}" ]]; then
+  mkdir -p "$DATASET_DIR"
+else
+  # Never silently reuse a default session directory if its timestamp collides.
+  mkdir "$DATASET_DIR" || die "could not create a new dataset directory: ${DATASET_DIR}"
+fi
+echo "DAgger dataset directory: ${DATASET_DIR}"
 [[ -w "$DATASET_DIR" ]] || die "dataset directory is not writable: ${DATASET_DIR}"
 write_probe=$(mktemp "${DATASET_DIR}/.human_dagger_write_test.XXXXXX") || \
   die "could not create a write probe in ${DATASET_DIR}"
@@ -343,6 +350,7 @@ chmod 700 "$session_dir" "$log_dir"
   echo '# human_dagger_session_v1'
   printf '# session_id=%s\n' "$session_id"
   printf '# repo_root=%s\n' "$repo_root"
+  printf '# dataset_dir=%s\n' "$DATASET_DIR"
   printf '# started_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   printf '# hostname=%s\n' "$(hostname)"
   printf '# ros_domain_id=%s\n' "$ROS_DOMAIN_ID"
@@ -411,8 +419,14 @@ start_frontend() {
       --task-instruction "$TASK_INSTRUCTION"
       --replan-steps "${REPLAN_STEPS:-auto}"
       --chunk-blend-steps "${CHUNK_BLEND_STEPS:-6}"
-      --arm-ema-alpha "${ARM_EMA_ALPHA:-1.0}"
-      --gripper-ema-alpha "${GRIPPER_EMA_ALPHA:-1.0}"
+      --gripper-blend-steps "${GRIPPER_BLEND_STEPS:-0}"
+      --gripper-debounce-frames "${GRIPPER_DEBOUNCE_FRAMES:-12}"
+      --gripper-low-threshold "${GRIPPER_LOW_THRESHOLD:--2.1}"
+      --gripper-high-threshold "${GRIPPER_HIGH_THRESHOLD:--1.05}"
+      --gripper-low-value "${GRIPPER_LOW_VALUE:--3.384}"
+      --gripper-high-value "${GRIPPER_HIGH_VALUE:-0.0}"
+      --arm-ema-alpha "${ARM_EMA_ALPHA:-0.6}"
+      --gripper-ema-alpha "${GRIPPER_EMA_ALPHA:-0.6}"
     )
   fi
   "$ACT_PYTHON" "${repo_root}/act/human_dagger.py" \
