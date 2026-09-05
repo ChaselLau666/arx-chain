@@ -13,9 +13,10 @@ set -u
 runtime_root=${HUMAN_DAGGER_RUNTIME_DIR:-"${XDG_RUNTIME_DIR:-/tmp}/human_dagger-${UID}"}
 # HUMAN_DAGGER_AUTO_CONFIRM=1 (04_auto_shutdown.sh) answers the LOWER/LOW
 # prompts automatically. The height gate stays: wait_for_safe_height.py still
-# blocks on stable feedback <= 1.0. The legacy broad-match path is NEVER
-# auto-confirmed; it can kill another developer's processes.
+# blocks on stable feedback <= 1.0. Whole-stack shutdown is a separate explicit
+# opt-in used by 04_auto_shutdown.sh; interactive shutdown stays session-scoped.
 auto_confirm=${HUMAN_DAGGER_AUTO_CONFIRM:-0}
+shutdown_all=${HUMAN_DAGGER_SHUTDOWN_ALL:-0}
 active_manifest="${runtime_root}/active.manifest"
 
 proc_start_ticks() {
@@ -103,7 +104,10 @@ if [[ -e "$active_manifest" || -L "$active_manifest" ]]; then
   fi
 fi
 
-if [[ "$tracked_session" != true ]]; then
+if [[ "$shutdown_all" == 1 ]]; then
+  echo "WHOLE ROBOT STACK: skipping session ownership and PID confirmation."
+  echo "WARNING: all matching local robot processes will stop, including other developers' stacks."
+elif [[ "$tracked_session" != true ]]; then
   if [[ "${HUMAN_DAGGER_ALLOW_LEGACY_SHUTDOWN:-0}" != 1 ]]; then
     echo "Refused: no live, verified Human DAgger session manifest is available." >&2
     echo "Broad process matching could stop another developer's stack." >&2
@@ -127,6 +131,56 @@ if [[ "$tracked_session" != true ]]; then
     exit 1
   fi
 fi
+
+stop_pattern() {
+  local label=$1
+  local pattern=$2
+  local pids
+  pids=$(pgrep -f "${pattern}" || true)
+  if [[ -z "${pids}" ]]; then
+    echo "${label}: not running"
+    return
+  fi
+  echo "${label}: SIGINT -> ${pids//$'\n'/ }"
+  kill -INT ${pids} 2>/dev/null || true
+  for _ in $(seq 1 30); do
+    sleep 0.2
+    if ! pgrep -f "${pattern}" >/dev/null; then
+      return 0
+    fi
+  done
+  pids=$(pgrep -f "${pattern}" || true)
+  if [[ -n "${pids}" ]]; then
+    echo "${label}: SIGTERM -> ${pids//$'\n'/ }"
+    kill -TERM ${pids} 2>/dev/null || true
+  fi
+}
+
+stop_manifest_pid() {
+  local label=$1 pid=$2 ticks=$3 pgid signal_target
+  if ! manifest_entry_is_live "$pid" "$ticks"; then
+    echo "${label}: tracked PID is no longer the same process; skipped"
+    return 0
+  fi
+
+  pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')
+  signal_target=$pid
+  if [[ "$pgid" == "$pid" ]]; then
+    signal_target="-${pid}"
+  fi
+
+  echo "${label}: verified session PID ${pid}, SIGINT"
+  kill -INT -- "$signal_target" 2>/dev/null || true
+  for _ in $(seq 1 30); do
+    sleep 0.2
+    if ! manifest_entry_is_live "$pid" "$ticks"; then
+      return 0
+    fi
+  done
+
+  echo "${label}: verified session PID ${pid}, SIGTERM"
+  kill -TERM -- "$signal_target" 2>/dev/null || true
+}
 
 dagger_process_running=false
 if pgrep -f '[p]ython(3)? .*[/]human_dagger.py' >/dev/null 2>&1; then
@@ -163,8 +217,49 @@ else
   echo "Human DAgger service is not active; continuing with legacy-stack shutdown checks."
 fi
 
+# HOME must complete before lowering the platform. Never start a stopped driver.
+if pgrep -f '/arx_x5_controller/X5Controller' >/dev/null; then
+  if [[ "$shutdown_all" != 1 && "$tracked_session" == true ]]; then
+    if ! manifest_has_live_label "$resolved_manifest" arm_left \
+      || ! manifest_has_live_label "$resolved_manifest" arm_right; then
+      echo 'Refused: HOME requires both live arms owned by this session.' >&2
+      exit 1
+    fi
+  fi
+  echo "Arms will move to the driver's HOME pose BEFORE the platform lowers."
+  echo "Clear both arm paths and keep the physical emergency stop reachable."
+  if [[ "$auto_confirm" != 1 ]]; then
+    read -r -p 'Type HOME AND SHUTDOWN to continue: ' home_confirmation
+    [[ "$home_confirmation" == 'HOME AND SHUTDOWN' ]] || exit 1
+  fi
+  if [[ "$tracked_session" == true ]]; then
+    while IFS=$'\t' read -r label pid ticks; do
+      case "$label" in
+        frontend|coordinator|policy|writer|vr_serial|vr_filter)
+          stop_manifest_pid "$label" "$pid" "$ticks" ;;
+      esac
+    done < "$resolved_manifest"
+  fi
+  if [[ "$shutdown_all" == 1 || "$tracked_session" != true ]]; then
+    stop_pattern "Human DAgger frontend" '[p]ython(3)? .*[/]human_dagger.py'
+    stop_pattern "collector" '[p]ython(3)? .*collect.py'
+    stop_pattern "inference" '[p]ython(3)? .*inference.py'
+    stop_pattern "Tau0VLA inference" '[p]ython(3)? .*tau0vla_client.py'
+    stop_pattern "replay" '[p]ython(3)? .*replay.py'
+    stop_pattern "VR serial launcher" '/opt/ros/jazzy/bin/ros2 run serial_port serial_port_node'
+    stop_pattern "VR serial node" '/serial_port_node([[:space:]]|$)'
+    stop_pattern "VR pose filter" '[/]act/vr_pose_filter\.py'
+  fi
+  set +u
+  source /home/arx/LIFT/ARX_X5/ROS2/X5_ws/install/setup.bash
+  set -u
+  /home/arx/miniconda3/envs/act/bin/python "${repo_root}/act/shutdown_arm_home.py"
+else
+  echo "Arms are not running; HOME skipped (drivers are not restarted)."
+fi
+
 if ros2 node list 2>/dev/null | grep -qx '/lift'; then
-  if [[ "$tracked_session" == true ]] \
+  if [[ "$shutdown_all" != 1 && "$tracked_session" == true ]] \
     && ! manifest_has_live_label "$resolved_manifest" body; then
     echo "Refused: /lift is visible, but it is not the live body PID recorded by this session." >&2
     echo "This may be another developer's stack; no height command was sent." >&2
@@ -244,56 +339,6 @@ else
   fi
 fi
 
-stop_pattern() {
-  local label=$1
-  local pattern=$2
-  local pids
-  pids=$(pgrep -f "${pattern}" || true)
-  if [[ -z "${pids}" ]]; then
-    echo "${label}: not running"
-    return
-  fi
-  echo "${label}: SIGINT -> ${pids//$'\n'/ }"
-  kill -INT ${pids} 2>/dev/null || true
-  for _ in $(seq 1 30); do
-    sleep 0.2
-    if ! pgrep -f "${pattern}" >/dev/null; then
-      return 0
-    fi
-  done
-  pids=$(pgrep -f "${pattern}" || true)
-  if [[ -n "${pids}" ]]; then
-    echo "${label}: SIGTERM -> ${pids//$'\n'/ }"
-    kill -TERM ${pids} 2>/dev/null || true
-  fi
-}
-
-stop_manifest_pid() {
-  local label=$1 pid=$2 ticks=$3 pgid signal_target
-  if ! manifest_entry_is_live "$pid" "$ticks"; then
-    echo "${label}: tracked PID is no longer the same process; skipped"
-    return 0
-  fi
-
-  pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')
-  signal_target=$pid
-  if [[ "$pgid" == "$pid" ]]; then
-    signal_target="-${pid}"
-  fi
-
-  echo "${label}: verified session PID ${pid}, SIGINT"
-  kill -INT -- "$signal_target" 2>/dev/null || true
-  for _ in $(seq 1 30); do
-    sleep 0.2
-    if ! manifest_entry_is_live "$pid" "$ticks"; then
-      return 0
-    fi
-  done
-
-  echo "${label}: verified session PID ${pid}, SIGTERM"
-  kill -TERM -- "$signal_target" 2>/dev/null || true
-}
-
 stop_active_manifest() {
   local resolved_manifest label pid ticks index
   local -a entries=()
@@ -338,19 +383,20 @@ stop_active_manifest() {
 }
 
 if [[ "$tracked_session" == true ]]; then
-  # The manifest records PID plus /proc start time. Stop only this developer's
-  # verified session; never broad-match another user's robot processes.
+  # Reap known worker children using their recorded identity first. The default
+  # interactive path stops here; whole-stack mode also covers untracked nodes.
   stop_active_manifest
-else
-  echo "No verified Human DAgger manifest; using the legacy stack shutdown path."
+fi
+if [[ "$shutdown_all" == 1 || "$tracked_session" != true ]]; then
+  echo "Stopping all matching local robot-stack processes."
   stop_pattern "Human DAgger frontend" '[p]ython(3)? .*[/]human_dagger.py'
-  stop_pattern "collector" '[p]ython .*collect.py'
-  stop_pattern "inference" '[p]ython .*inference.py'
-  stop_pattern "Tau0VLA inference" '[p]ython .*tau0vla_client.py'
-  stop_pattern "replay" '[p]ython .*replay.py'
+  stop_pattern "collector" '[p]ython(3)? .*collect.py'
+  stop_pattern "inference" '[p]ython(3)? .*inference.py'
+  stop_pattern "Tau0VLA inference" '[p]ython(3)? .*tau0vla_client.py'
+  stop_pattern "replay" '[p]ython(3)? .*replay.py'
   stop_pattern "VR diagnostics" 'ros2 topic (echo|hz) /ARX_VR_[LR]'
   stop_pattern "VR serial launcher" '/opt/ros/jazzy/bin/ros2 run serial_port serial_port_node'
-  stop_pattern "VR serial node" '/serial_port_node$'
+  stop_pattern "VR serial node" '/serial_port_node([[:space:]]|$)'
   # Between the VR serial node and the arms, so it is stopped with the stream
   # it filters. Left out, it survives shutdown and the next launch refuses.
   stop_pattern "VR pose filter" '[/]act/vr_pose_filter\.py'
