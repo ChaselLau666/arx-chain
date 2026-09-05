@@ -21,6 +21,7 @@ from tau0vla_protocol import (
     FPS,
     ActionEMA,
     ActionChunk,
+    BinaryGripperStabilizer,
     ChunkScheduler,
     Observation,
     ProtocolError,
@@ -33,7 +34,7 @@ from utils.setup_loader import setup_loader
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parent
-DEFAULT_TASK = "Pick up the handle and place it into the tray."
+DEFAULT_TASK = "Pick up the tool and place it into the tray."
 
 
 def create_observation_node(config: dict, *, max_observation_age_ms: float, max_camera_skew_ms: float):
@@ -302,8 +303,14 @@ def run(args) -> None:
             task_instruction=args.task_instruction,
             execute=args.execute,
             blend_steps=args.chunk_blend_steps,
+            gripper_blend_steps=args.gripper_blend_steps,
             arm_ema_alpha=args.arm_ema_alpha,
             gripper_ema_alpha=args.gripper_ema_alpha,
+            gripper_debounce_frames=args.gripper_debounce_frames,
+            gripper_low_threshold=args.gripper_low_threshold,
+            gripper_high_threshold=args.gripper_high_threshold,
+            gripper_low_value=args.gripper_low_value,
+            gripper_high_value=args.gripper_high_value,
         )
 
         request_id, latencies = benchmark(
@@ -319,9 +326,25 @@ def run(args) -> None:
 
         request_id += 1
         first = client.infer(wait_for_observation(node, 5.0), request_id)
-        scheduler = ChunkScheduler(replan_steps, blend_steps=args.chunk_blend_steps)
+        scheduler = ChunkScheduler(
+            replan_steps,
+            blend_steps=args.chunk_blend_steps,
+            gripper_blend_steps=args.gripper_blend_steps,
+        )
+        gripper_stabilizer = BinaryGripperStabilizer(
+            args.gripper_debounce_frames,
+            low_threshold=args.gripper_low_threshold,
+            high_threshold=args.gripper_high_threshold,
+            low_value=args.gripper_low_value,
+            high_value=args.gripper_high_value,
+        )
         ema = ActionEMA(args.arm_ema_alpha, args.gripper_ema_alpha)
-        ema.reset(node.current_qpos())
+        initial_qpos = node.current_qpos()
+        gripper_stabilizer.reset(initial_qpos)
+        # Preserve measured arm positions while starting gripper EMA from the
+        # accepted training endpoint instead of an out-of-distribution encoder
+        # value (observed as low as -6.77 on the tool-yipan rollout).
+        ema.reset(gripper_stabilizer.apply(initial_qpos))
         first_info = scheduler.adopt(first, initial=True, arrival_monotonic_ns=time.monotonic_ns())
         trace.adoption(first.request_id, first_info)
 
@@ -336,6 +359,8 @@ def run(args) -> None:
             print(
                 "EXECUTE mode: publishing finite 14D Tau0VLA actions "
                 f"with blend_steps={args.chunk_blend_steps}, arm_ema_alpha={args.arm_ema_alpha}, "
+                f"gripper_blend_steps={args.gripper_blend_steps}, "
+                f"gripper_debounce_frames={args.gripper_debounce_frames}, "
                 f"gripper_ema_alpha={args.gripper_ema_alpha}."
             )
         else:
@@ -383,7 +408,8 @@ def run(args) -> None:
                     trace.starvation(time.monotonic_ns(), step)
                     starvation_logged = True
                 continue
-            action = ema.apply(scheduled.action)
+            stabilized = gripper_stabilizer.apply(scheduled.action)
+            action = ema.apply(stabilized)
             trace.tick(
                 monotonic_ns=time.monotonic_ns(),
                 control_step=step,
@@ -391,6 +417,7 @@ def run(args) -> None:
                 command=action,
                 feedback=node.current_qpos(),
                 execute=args.execute,
+                gripper_stabilizer=gripper_stabilizer.snapshot(),
             )
             if args.execute:
                 node.publish_action(action)
@@ -436,14 +463,25 @@ def parse_args():
     parser.add_argument("--max-observation-age-ms", type=float, default=100.0)
     parser.add_argument("--max-camera-skew-ms", type=float, default=50.0)
     parser.add_argument("--request-timeout", type=float, default=5.0)
-    parser.add_argument("--max-response-age-ms", type=float, default=5000.0)
+    parser.add_argument("--max-response-age-ms", type=float, default=500.0)
     parser.add_argument("--latency-margin-ms", type=float, default=100.0)
     parser.add_argument("--benchmark-warmup", type=int, default=3)
     parser.add_argument("--benchmark-requests", type=int, default=30)
     parser.add_argument("--replan-steps", default="auto")
     parser.add_argument("--chunk-blend-steps", type=int, default=6)
+    parser.add_argument(
+        "--gripper-blend-steps",
+        type=int,
+        default=None,
+        help="Separate gripper cross-fade length; omission preserves legacy all-dimension blending.",
+    )
     parser.add_argument("--arm-ema-alpha", type=float, default=1.0)
     parser.add_argument("--gripper-ema-alpha", type=float, default=1.0)
+    parser.add_argument("--gripper-debounce-frames", type=int, default=0)
+    parser.add_argument("--gripper-low-threshold", type=float, default=-2.1)
+    parser.add_argument("--gripper-high-threshold", type=float, default=-1.05)
+    parser.add_argument("--gripper-low-value", type=float, default=-3.384)
+    parser.add_argument("--gripper-high-value", type=float, default=0.0)
     parser.add_argument("--trace-path", type=Path, default=None)
     parser.add_argument("--max-steps", type=int, default=10000)
     parser.add_argument("--execute", action="store_true")
@@ -454,6 +492,25 @@ def parse_args():
         parser.error("HTTP timeouts must be positive")
     if not 0 <= args.chunk_blend_steps < ACTION_HORIZON:
         parser.error(f"--chunk-blend-steps must be in [0, {ACTION_HORIZON - 1}]")
+    if args.gripper_blend_steps is not None and not 0 <= args.gripper_blend_steps < ACTION_HORIZON:
+        parser.error(f"--gripper-blend-steps must be in [0, {ACTION_HORIZON - 1}]")
+    if args.gripper_debounce_frames < 0:
+        parser.error("--gripper-debounce-frames must be non-negative")
+    gripper_values = np.asarray(
+        [
+            args.gripper_low_threshold,
+            args.gripper_high_threshold,
+            args.gripper_low_value,
+            args.gripper_high_value,
+        ],
+        dtype=np.float32,
+    )
+    if not np.isfinite(gripper_values).all():
+        parser.error("gripper thresholds/endpoints must be finite")
+    if not args.gripper_low_threshold < args.gripper_high_threshold:
+        parser.error("--gripper-low-threshold must be less than --gripper-high-threshold")
+    if not args.gripper_low_value < args.gripper_high_value:
+        parser.error("--gripper-low-value must be less than --gripper-high-value")
     for name in ("arm_ema_alpha", "gripper_ema_alpha"):
         if not 0.0 < getattr(args, name) <= 1.0:
             parser.error(f"--{name.replace('_', '-')} must be in (0, 1]")

@@ -28,6 +28,7 @@ from copy import deepcopy
 
 from utils.ros_operator import Rate, RosOperator
 from utils.setup_loader import setup_loader
+from collection_paths import normalize_task_name, task_dataset_dir
 from collection_ui import TerminalKeyReader, prompt_episode_decision, prompt_start_decision
 from lift_height import configure_fixed_height
 
@@ -82,7 +83,7 @@ def collect_information(args, ros_operator, voice_engine, key_reader):
     gripper_close = -2.1
 
     print('RECORDING: press [e] to end and review this episode.')
-    while (count < args.max_timesteps) and rclpy.ok():
+    while rclpy.ok():
         key = key_reader.poll_key()
         if key == 'e':
             print('\n[e] received; recording stopped for review.')
@@ -126,9 +127,6 @@ def collect_information(args, ros_operator, voice_engine, key_reader):
             exit(-1)
 
         rate.sleep()
-
-    if count >= args.max_timesteps:
-        print(f'Hard limit reached at {args.max_timesteps} frames; entering review.')
 
     print(f"\nlen(timesteps): {len(timesteps)}")
     print(f"len(actions)  : {len(actions)}")
@@ -302,7 +300,11 @@ def main(args):
     if settled_height is not None:
         print(f'Fixed lift ready: command={args.height:.6f}, feedback={settled_height:.6f}')
 
-    datasets_dir = args.datasets if sys.stdin.isatty() else Path.joinpath(ROOT, args.datasets)
+    datasets_root = Path(args.datasets)
+    if not sys.stdin.isatty() and not datasets_root.is_absolute():
+        datasets_root = ROOT / datasets_root
+    datasets_dir = task_dataset_dir(datasets_root, args.task)
+    print(f'Dataset directory: {datasets_dir}')
 
     num_episodes = 1000 if args.episode_idx == -1 else 1
     current_episode = 0 if args.episode_idx == -1 else args.episode_idx
@@ -370,7 +372,8 @@ def parse_arguments(known=False):
     parser.add_argument('--datasets', type=str, default=Path.joinpath(ROOT, 'datasets'),
                         help='dataset dir')
     parser.add_argument('--episode_idx', type=int, default=0, help='episode index')
-    parser.add_argument('--max_timesteps', type=int, default=800, help='max timesteps')
+    parser.add_argument('--max_timesteps', type=int, default=None,
+                        help=argparse.SUPPRESS)  # Deprecated and intentionally ignored.
     parser.add_argument('--frame_rate', type=int, default=60, help='frame rate')
 
     # 配置文件
@@ -395,7 +398,8 @@ def parse_arguments(known=False):
     parser.add_argument('--height', type=float, default=None,
                         help='fixed lift command in [0, 20]; omitted means follow VR height')
 
-    parser.add_argument('--task', type=str, default='', help='task name')
+    parser.add_argument('--task', type=normalize_task_name, required=True,
+                        help='task name and dataset subdirectory')
 
     return parser.parse_known_args()[0] if known else parser.parse_args()
 

@@ -10,6 +10,13 @@ declare -A CAMS=(
   [camera_r]="260422272473"
 )
 
+# Keep each robot's physical camera mapping when sharing the main branch.
+if [[ "$(hostname -s)" == "ark-1" ]]; then
+  CAMS[camera_h]="260422272688"
+  CAMS[camera_l]="260422274927"
+  CAMS[camera_r]="260522274175"
+fi
+
 COLOR_PROFILE="640x480x90"
 DEPTH_PROFILE="640x480x90"
 

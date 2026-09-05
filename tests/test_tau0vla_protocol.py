@@ -18,6 +18,7 @@ from tau0vla_protocol import (  # noqa: E402
     PROTOCOL_VERSION,
     ActionEMA,
     ActionChunk,
+    BinaryGripperStabilizer,
     ChunkScheduler,
     Observation,
     ProtocolError,
@@ -85,6 +86,22 @@ class ChunkSchedulerTest(unittest.TestCase):
         np.testing.assert_array_equal(step.raw_action, replacement.actions[3])
         self.assertLess(info.blended_boundary_jump_max, info.raw_boundary_jump_max)
 
+    def test_gripper_blend_can_be_disabled_without_disabling_arm_blend(self):
+        scheduler = ChunkScheduler(replan_steps=10, blend_steps=6, gripper_blend_steps=0)
+        first = _chunk(0.0)
+        scheduler.adopt(first, initial=True)
+        for _ in range(10):
+            scheduler.next_action()
+        replacement = _chunk(100.0, base=1000.0)
+        info = scheduler.adopt(replacement)
+        step = scheduler.next_action()
+        self.assertEqual(info.blended_steps, 6)
+        self.assertEqual(info.gripper_blended_steps, 0)
+        self.assertLess(step.blend_alpha, 1.0)
+        self.assertEqual(step.gripper_blend_alpha, 1.0)
+        np.testing.assert_array_equal(step.action[[6, 13]], replacement.actions[3, [6, 13]])
+        self.assertFalse(np.array_equal(step.action[[0, 7]], replacement.actions[3, [0, 7]]))
+
     def test_delayed_short_replacement_prefetches_immediately(self):
         scheduler = ChunkScheduler(replan_steps=15)
         scheduler.adopt(_chunk(0.0), initial=True)
@@ -123,6 +140,43 @@ class ChunkSchedulerTest(unittest.TestCase):
         result = filtered.apply(action1)
         np.testing.assert_allclose(result[[0, 5, 7, 12]], 0.4)
         np.testing.assert_allclose(result[[6, 13]], 1.0)
+
+    def test_binary_gripper_stabilizer_debounces_and_emits_training_endpoints(self):
+        initial = np.zeros(ACTION_DIM, dtype=np.float32)
+        initial[[6, 13]] = -3.5
+        stabilizer = BinaryGripperStabilizer(confirm_frames=3)
+        stabilizer.reset(initial)
+
+        high = np.arange(ACTION_DIM, dtype=np.float32)
+        high[[6, 13]] = 0.0
+        for _ in range(2):
+            output = stabilizer.apply(high)
+            np.testing.assert_allclose(output[[6, 13]], -3.384)
+            np.testing.assert_array_equal(output[[0, 5, 7, 12]], high[[0, 5, 7, 12]])
+        output = stabilizer.apply(high)
+        np.testing.assert_allclose(output[[6, 13]], 0.0)
+
+        neutral = high.copy()
+        neutral[[6, 13]] = -1.5
+        np.testing.assert_allclose(stabilizer.apply(neutral)[[6, 13]], 0.0)
+
+    def test_disabled_gripper_stabilizer_is_exact_identity(self):
+        action = np.linspace(-4.0, 1.0, ACTION_DIM, dtype=np.float32)
+        stabilizer = BinaryGripperStabilizer(confirm_frames=0)
+        np.testing.assert_array_equal(stabilizer.apply(action), action)
+
+    def test_gripper_ema_does_not_initialize_from_out_of_range_feedback(self):
+        feedback = np.zeros(ACTION_DIM, dtype=np.float32)
+        feedback[[6, 13]] = -6.77
+        stabilizer = BinaryGripperStabilizer(confirm_frames=12)
+        stabilizer.reset(feedback)
+        ema = ActionEMA(arm_alpha=0.6, gripper_alpha=0.6)
+        ema.reset(stabilizer.apply(feedback))
+
+        target = feedback.copy()
+        target[[6, 13]] = -3.6
+        command = ema.apply(stabilizer.apply(target))
+        np.testing.assert_allclose(command[[6, 13]], -3.384, atol=1e-6)
 
     def test_trace_reports_boundary_and_tracking_metrics(self):
         with tempfile.TemporaryDirectory() as directory:

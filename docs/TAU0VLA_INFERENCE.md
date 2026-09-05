@@ -15,9 +15,9 @@ publication local. This is an independent inference path and does not modify
 - base motion: disabled.
 
 The client rejects malformed, non-finite, stale, timed-out, or out-of-session
-responses. It deliberately does not apply joint limits, per-step clipping, or
-left-arm replacement. In execute mode the model's finite 14D values are sent
-directly to the two arm command topics.
+responses. It deliberately does not apply arm joint limits, per-step clipping,
+or left-arm replacement. The tool-yipan launcher treats each gripper as a
+binary actuator and debounces its state intent as described below.
 
 ## Start
 
@@ -43,12 +43,22 @@ REPLAN_STEPS=10 ./03_tau0vla_inference.sh
 ```
 
 The default `CHUNK_BLEND_STEPS=6` performs a smoothstep transition between
-time-aligned old and new chunk tails instead of replacing the active plan in
-one control tick. `ARM_EMA_ALPHA=1.0` and `GRIPPER_EMA_ALPHA=1.0` leave EMA
-disabled. For a second-stage arm-only smoothing trial, set
-`ARM_EMA_ALPHA=0.4`; keep the gripper at `1.0` unless its timing is separately
-validated. Every run writes a JSONL command/feedback trace beside the client
-log; summarize it with `python act/tau0vla_trace.py TRACE.jsonl`.
+time-aligned old and new arm tails. Binary grippers do not use that linear
+cross-fade (`GRIPPER_BLEND_STEPS=0`): interpolating two disagreeing open/close
+plans can create extra threshold crossings.
+
+The tool-yipan defaults are `ARM_EMA_ALPHA=0.6`,
+`GRIPPER_EMA_ALPHA=0.6`, and `GRIPPER_DEBOUNCE_FRAMES=12`. A gripper target at
+or below `-2.1` votes for the low endpoint (`-3.384`); a target at or above
+`-1.05` votes for the high endpoint (`0.0`); the middle gap retains the current
+state. Twelve consecutive opposite votes are required before switching. EMA
+then smooths that one accepted transition. Set `GRIPPER_DEBOUNCE_FRAMES=0` to
+restore the exact model-valued path for an explicit A/B test.
+
+The default task text matches the single-task training data exactly:
+`Pick up the tool and place it into the tray.` Every run writes a JSONL
+command/feedback trace beside the client log; summarize it with
+`python act/tau0vla_trace.py TRACE.jsonl`.
 
 The launcher refuses a direct URL unless `ip route get 192.168.50.2` resolves
 through `enp130s0` with source `192.168.50.1`. Wi-Fi is an explicit diagnostic

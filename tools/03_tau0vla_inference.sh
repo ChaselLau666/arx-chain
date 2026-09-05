@@ -8,12 +8,19 @@ export ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-62}
 : "${DIRECT_INTERFACE:=enp130s0}"
 : "${DIRECT_CLIENT_IP:=192.168.50.1}"
 : "${ALLOW_NON_DIRECT_MODEL_SERVER:=0}"
-: "${TASK_INSTRUCTION:=Pick up the handle and place it into the tray.}"
+: "${TASK_INSTRUCTION:=Pick up the tool and place it into the tray.}"
 : "${LIFT_HEIGHT:=15.5}"
-: "${REPLAN_STEPS:=auto}"
+: "${REPLAN_STEPS:=15}"
 : "${CHUNK_BLEND_STEPS:=6}"
-: "${ARM_EMA_ALPHA:=1.0}"
-: "${GRIPPER_EMA_ALPHA:=1.0}"
+: "${GRIPPER_BLEND_STEPS:=0}"
+: "${ARM_EMA_ALPHA:=0.6}"
+: "${GRIPPER_EMA_ALPHA:=0.6}"
+: "${GRIPPER_DEBOUNCE_FRAMES:=12}"
+: "${GRIPPER_LOW_THRESHOLD:=-2.1}"
+: "${GRIPPER_HIGH_THRESHOLD:=-1.05}"
+: "${GRIPPER_LOW_VALUE:=-3.384}"
+: "${GRIPPER_HIGH_VALUE:=0.0}"
+: "${MAX_RESPONSE_AGE_MS:=500}"
 : "${LOG_DIR:=/home/arx/logs/tau0vla}"
 
 set +u
@@ -121,8 +128,15 @@ task_q=$(printf '%q' "${TASK_INSTRUCTION}")
 height_q=$(printf '%q' "${LIFT_HEIGHT}")
 replan_q=$(printf '%q' "${REPLAN_STEPS}")
 blend_q=$(printf '%q' "${CHUNK_BLEND_STEPS}")
+gripper_blend_q=$(printf '%q' "${GRIPPER_BLEND_STEPS}")
 arm_ema_q=$(printf '%q' "${ARM_EMA_ALPHA}")
 gripper_ema_q=$(printf '%q' "${GRIPPER_EMA_ALPHA}")
+gripper_debounce_q=$(printf '%q' "${GRIPPER_DEBOUNCE_FRAMES}")
+gripper_low_threshold_q=$(printf '%q' "${GRIPPER_LOW_THRESHOLD}")
+gripper_high_threshold_q=$(printf '%q' "${GRIPPER_HIGH_THRESHOLD}")
+gripper_low_value_q=$(printf '%q' "${GRIPPER_LOW_VALUE}")
+gripper_high_value_q=$(printf '%q' "${GRIPPER_HIGH_VALUE}")
+max_response_age_q=$(printf '%q' "${MAX_RESPONSE_AGE_MS}")
 mkdir -p "${LOG_DIR}"
 log_file="${LOG_DIR}/client_$(date +%Y%m%d_%H%M%S).log"
 trace_file="${LOG_DIR}/trace_$(date +%Y%m%d_%H%M%S).jsonl"
@@ -137,10 +151,21 @@ gnome-terminal --title="tau0vla-inference" -- bash -ic \
   "set -o pipefail; cd ${repo_root}/act; conda activate act; python tau0vla_client.py \
     --server-url ${server_q} --task-instruction ${task_q} \
     --expected-height ${height_q} --replan-steps ${replan_q} \
-    --chunk-blend-steps ${blend_q} --arm-ema-alpha ${arm_ema_q} \
-    --gripper-ema-alpha ${gripper_ema_q} --trace-path ${trace_q}${extra_args_q} \
+    --chunk-blend-steps ${blend_q} --gripper-blend-steps ${gripper_blend_q} \
+    --arm-ema-alpha ${arm_ema_q} --gripper-ema-alpha ${gripper_ema_q} \
+    --gripper-debounce-frames ${gripper_debounce_q} \
+    --gripper-low-threshold ${gripper_low_threshold_q} \
+    --gripper-high-threshold ${gripper_high_threshold_q} \
+    --gripper-low-value ${gripper_low_value_q} \
+    --gripper-high-value ${gripper_high_value_q} \
+    --max-response-age-ms ${max_response_age_q} \
+    --trace-path ${trace_q}${extra_args_q} \
     2>&1 | tee -a ${log_q}; exec bash"
 
-echo "Tau0VLA inference terminal launched. Default mode is DRY-RUN; no action publisher is created."
+if [[ " $* " == *" --execute "* ]]; then
+  echo "Tau0VLA EXECUTE candidate launched; no publisher is created until the in-terminal confirmation."
+else
+  echo "Tau0VLA DRY-RUN launched; no action publisher is created."
+fi
 echo "Client log: ${log_file}"
 echo "Action trace: ${trace_file}"

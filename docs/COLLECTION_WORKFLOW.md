@@ -41,7 +41,7 @@ export TASK_NAME=pickplace_right_to_bowl
 ```
 
 - `LIFT_HEIGHT`：传给 body 的固定高度命令，范围 `[0,20]`。命令值和实际反馈可能存在校准偏差。
-- `TASK_NAME`：写入 HDF5 的 `task` 属性。
+- `TASK_NAME`：同时作为数据子目录名并写入 HDF5 的 `task` 属性。例如上述任务保存到 `act/datasets/pickplace_right_to_bowl/`。
 - 不传 `--use_base`：底盘不作为模型输入/action；HDF5 中对应 base 数组保持 0。
 
 当前脚本实际启动 collector 的等价命令为：
@@ -56,10 +56,9 @@ python collect.py \
 重要参数：
 
 - `--episode_idx -1`：连续采集，从数据目录现有最大编号加一开始。
-- `--max_timesteps 800`：单条最多 800 帧。
 - `--frame_rate 60`：采集器名义频率 60 FPS。
 - `--height`：固定高度命令。
-- `--task`：任务名称。
+- `--task`：必填任务名称；每个任务使用独立的数据子目录。任务名只能是单个目录名，不能包含 `/`。
 - `--key_collect`：仅为旧命令兼容保留；当前默认始终使用单键状态机。
 
 ## 3. 启动完整链路
@@ -110,7 +109,7 @@ RECORDING: press [e] to end and review this episode.
 
 - 单按 `E`：结束记录并进入审核；机械臂复位不再自动结束。
 - 即使相机或双臂同步失败、当前有效帧数为 0，`E` 也必须立即生效；0 帧 episode 禁止保存，只能丢弃或丢弃并退出。
-- 达到 `--max_timesteps`（默认 800 帧）时仍会强制结束并进入审核，防止无限录制。
+- 单条采集没有最大帧数限制，只在操作者按 `E` 或 ROS 停止时结束。
 - 录制期间其他按键会被忽略，不能误保存或误开始下一条。
 
 结束后程序不会立即保存，而是显示：
@@ -177,7 +176,7 @@ q
 查看文件：
 
 ```bash
-ls -lh /home/arx/ROS2_LIFT_Play/act/datasets/episode_*.hdf5
+ls -lh /home/arx/ROS2_LIFT_Play/act/datasets/${TASK_NAME}/episode_*.hdf5
 ```
 
 可视化一条：
@@ -185,18 +184,18 @@ ls -lh /home/arx/ROS2_LIFT_Play/act/datasets/episode_*.hdf5
 ```bash
 cd /home/arx/ROS2_LIFT_Play/act
 conda activate act
-python visualize.py --datasets ./datasets --episode_idx 9
+python visualize.py --datasets "./datasets/${TASK_NAME}" --episode_idx 9
 ```
 
 输出包括：
 
 ```text
-datasets/episode_9_video.mp4
-datasets/episode_9_qpos.png
-datasets/episode_9_qvel.png
-datasets/episode_9_eef.png
-datasets/episode_9_action_base.png
-datasets/episode_9_action_velocity.png
+datasets/pickplace_right_to_bowl/episode_9_video.mp4
+datasets/pickplace_right_to_bowl/episode_9_qpos.png
+datasets/pickplace_right_to_bowl/episode_9_qvel.png
+datasets/pickplace_right_to_bowl/episode_9_eef.png
+datasets/pickplace_right_to_bowl/episode_9_action_base.png
+datasets/pickplace_right_to_bowl/episode_9_action_velocity.png
 ```
 
 ## 9. 当前数据语义说明
@@ -228,7 +227,7 @@ python collect.py \
   --task pickplace_right_to_bowl
 ```
 
-collector 会从当前最大 HDF5 编号加一继续。
+collector 会在 `datasets/pickplace_right_to_bowl/` 中从当前最大 HDF5 编号加一继续。
 
 ### 10.2 完整关闭所有控制程序
 

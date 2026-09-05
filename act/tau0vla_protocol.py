@@ -17,6 +17,8 @@ ACTION_DIM = 14
 ACTION_HORIZON = 30
 ACTION_SEMANTICS = "state_t_plus_1"
 CAMERA_NAMES = ("head", "left_wrist", "right_wrist")
+ARM_INDICES = np.asarray([0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12])
+GRIPPER_INDICES = np.asarray([6, 13])
 JOINT_NAMES = tuple(
     [f"left_j{i}" for i in range(6)]
     + ["left_gripper"]
@@ -50,6 +52,7 @@ class ActionChunk:
 class AdoptionInfo:
     skipped: int
     blended_steps: int
+    gripper_blended_steps: int
     age_ms: float
     raw_boundary_jump_max: float
     blended_boundary_jump_max: float
@@ -63,6 +66,7 @@ class ScheduledAction:
     source_index: int
     skipped: int
     blend_alpha: float
+    gripper_blend_alpha: float
     round_trip_ms: float
 
 
@@ -207,13 +211,23 @@ def recommended_replan_steps(
 class ChunkScheduler:
     """Single-request buffer with time alignment and smooth chunk handoff."""
 
-    def __init__(self, replan_steps: int, blend_steps: int = 6):
+    def __init__(
+        self,
+        replan_steps: int,
+        blend_steps: int = 6,
+        gripper_blend_steps: int | None = None,
+    ):
         if not 1 <= int(replan_steps) < ACTION_HORIZON:
             raise ValueError(f"replan_steps must be in [1, {ACTION_HORIZON - 1}]")
         if not 0 <= int(blend_steps) < ACTION_HORIZON:
             raise ValueError(f"blend_steps must be in [0, {ACTION_HORIZON - 1}]")
+        if gripper_blend_steps is not None and not 0 <= int(gripper_blend_steps) < ACTION_HORIZON:
+            raise ValueError(f"gripper_blend_steps must be in [0, {ACTION_HORIZON - 1}]")
         self.replan_steps = int(replan_steps)
         self.blend_steps = int(blend_steps)
+        self.gripper_blend_steps = (
+            self.blend_steps if gripper_blend_steps is None else int(gripper_blend_steps)
+        )
         self._steps: list[ScheduledAction] = []
         self._index = 0
         self._published_since_adopt = 0
@@ -255,14 +269,28 @@ class ChunkScheduler:
         fresh = actions[skipped:]
         old_steps = self._steps[self._index :]
         overlap = 0 if initial else min(self.blend_steps, len(old_steps), len(fresh))
+        gripper_overlap = (
+            0 if initial else min(self.gripper_blend_steps, len(old_steps), len(fresh))
+        )
         scheduled: list[ScheduledAction] = []
         for offset, raw_action in enumerate(fresh):
             alpha = 1.0
+            gripper_alpha = 1.0
             action = raw_action.copy()
             if offset < overlap:
                 progress = (offset + 1) / overlap
                 alpha = progress * progress * (3.0 - 2.0 * progress)
-                action = (1.0 - alpha) * old_steps[offset].action + alpha * raw_action
+                action[ARM_INDICES] = (
+                    (1.0 - alpha) * old_steps[offset].action[ARM_INDICES]
+                    + alpha * raw_action[ARM_INDICES]
+                )
+            if offset < gripper_overlap:
+                progress = (offset + 1) / gripper_overlap
+                gripper_alpha = progress * progress * (3.0 - 2.0 * progress)
+                action[GRIPPER_INDICES] = (
+                    (1.0 - gripper_alpha) * old_steps[offset].action[GRIPPER_INDICES]
+                    + gripper_alpha * raw_action[GRIPPER_INDICES]
+                )
             scheduled.append(
                 ScheduledAction(
                     action=np.asarray(action, dtype=np.float32),
@@ -271,6 +299,7 @@ class ChunkScheduler:
                     source_index=skipped + offset,
                     skipped=skipped,
                     blend_alpha=float(alpha),
+                    gripper_blend_alpha=float(gripper_alpha),
                     round_trip_ms=float(chunk.round_trip_ms),
                 )
             )
@@ -285,6 +314,7 @@ class ChunkScheduler:
         return AdoptionInfo(
             skipped=skipped,
             blended_steps=overlap,
+            gripper_blended_steps=gripper_overlap,
             age_ms=age_ms,
             raw_boundary_jump_max=raw_jump,
             blended_boundary_jump_max=blended_jump,
@@ -298,6 +328,103 @@ class ChunkScheduler:
         self._published_since_adopt += 1
         self._last_action = step.action.copy()
         return step
+
+
+class BinaryGripperStabilizer:
+    """Debounce binary-like gripper intent and emit canonical training endpoints.
+
+    A value at or below ``low_threshold`` votes for the low endpoint; a value at
+    or above ``high_threshold`` votes for the high endpoint. Values in the gap
+    retain the current state. An opposite state must persist for
+    ``confirm_frames`` consecutive control ticks before it is accepted.
+    ``confirm_frames=0`` preserves the input exactly for backwards compatibility.
+    """
+
+    def __init__(
+        self,
+        confirm_frames: int = 0,
+        *,
+        low_threshold: float = -2.1,
+        high_threshold: float = -1.05,
+        low_value: float = -3.384,
+        high_value: float = 0.0,
+    ):
+        if int(confirm_frames) < 0:
+            raise ValueError("confirm_frames must be non-negative")
+        values = np.asarray([low_threshold, high_threshold, low_value, high_value], dtype=np.float32)
+        if not np.isfinite(values).all():
+            raise ValueError("gripper stabilizer thresholds/endpoints must be finite")
+        if not float(low_threshold) < float(high_threshold):
+            raise ValueError("low_threshold must be less than high_threshold")
+        if not float(low_value) < float(high_value):
+            raise ValueError("low_value must be less than high_value")
+        self.confirm_frames = int(confirm_frames)
+        self.low_threshold = float(low_threshold)
+        self.high_threshold = float(high_threshold)
+        self.low_value = float(low_value)
+        self.high_value = float(high_value)
+        self._states: list[str] | None = None
+        self._candidates = ["", ""]
+        self._candidate_counts = [0, 0]
+
+    def _initial_state(self, value: float) -> str:
+        if value <= self.low_threshold:
+            return "low"
+        if value >= self.high_threshold:
+            return "high"
+        return "low" if abs(value - self.low_value) <= abs(value - self.high_value) else "high"
+
+    def reset(self, action: np.ndarray) -> None:
+        value = np.asarray(action, dtype=np.float32)
+        if value.shape != (ACTION_DIM,) or not np.isfinite(value).all():
+            raise ProtocolError("gripper stabilizer initial action must be a finite 14-vector")
+        self._states = [self._initial_state(float(value[index])) for index in GRIPPER_INDICES]
+        self._candidates = list(self._states)
+        self._candidate_counts = [0, 0]
+
+    def _desired_state(self, value: float, current: str) -> str:
+        if value <= self.low_threshold:
+            return "low"
+        if value >= self.high_threshold:
+            return "high"
+        return current
+
+    def apply(self, action: np.ndarray) -> np.ndarray:
+        value = np.asarray(action, dtype=np.float32)
+        if value.shape != (ACTION_DIM,) or not np.isfinite(value).all():
+            raise ProtocolError("gripper stabilizer input must be a finite 14-vector")
+        if self.confirm_frames == 0:
+            return value.copy()
+        if self._states is None:
+            self.reset(value)
+        assert self._states is not None
+        output = value.copy()
+        for slot, index in enumerate(GRIPPER_INDICES):
+            current = self._states[slot]
+            desired = self._desired_state(float(value[index]), current)
+            if desired == current:
+                self._candidates[slot] = current
+                self._candidate_counts[slot] = 0
+            else:
+                if self._candidates[slot] == desired:
+                    self._candidate_counts[slot] += 1
+                else:
+                    self._candidates[slot] = desired
+                    self._candidate_counts[slot] = 1
+                if self._candidate_counts[slot] >= self.confirm_frames:
+                    self._states[slot] = desired
+                    self._candidates[slot] = desired
+                    self._candidate_counts[slot] = 0
+            output[index] = self.low_value if self._states[slot] == "low" else self.high_value
+        return output
+
+    def snapshot(self) -> dict:
+        return {
+            "enabled": self.confirm_frames > 0,
+            "states": list(self._states or ()),
+            "candidate_states": list(self._candidates),
+            "candidate_counts": list(self._candidate_counts),
+        }
 
 
 class ActionEMA:
@@ -336,9 +463,12 @@ __all__ = [
     "ActionEMA",
     "ActionChunk",
     "AdoptionInfo",
+    "ARM_INDICES",
+    "BinaryGripperStabilizer",
     "CAMERA_NAMES",
     "ChunkScheduler",
     "FPS",
+    "GRIPPER_INDICES",
     "JOINT_NAMES",
     "Observation",
     "PROTOCOL_VERSION",

@@ -44,6 +44,7 @@ class TraceWriter:
                 "request_id": int(request_id),
                 "skipped": info.skipped,
                 "blended_steps": info.blended_steps,
+                "gripper_blended_steps": info.gripper_blended_steps,
                 "age_ms": info.age_ms,
                 "raw_boundary_jump_max": info.raw_boundary_jump_max,
                 "blended_boundary_jump_max": info.blended_boundary_jump_max,
@@ -59,24 +60,27 @@ class TraceWriter:
         command: np.ndarray,
         feedback: np.ndarray,
         execute: bool,
+        gripper_stabilizer: dict[str, Any] | None = None,
     ) -> None:
-        self._write(
-            {
-                "event": "tick",
-                "monotonic_ns": int(monotonic_ns),
-                "control_step": int(control_step),
-                "execute": bool(execute),
-                "request_id": scheduled.request_id,
-                "source_index": scheduled.source_index,
-                "skipped": scheduled.skipped,
-                "blend_alpha": scheduled.blend_alpha,
-                "round_trip_ms": scheduled.round_trip_ms,
-                "raw_action": scheduled.raw_action.tolist(),
-                "scheduled_action": scheduled.action.tolist(),
-                "command": np.asarray(command, dtype=np.float32).tolist(),
-                "feedback": np.asarray(feedback, dtype=np.float32).tolist(),
-            }
-        )
+        payload = {
+            "event": "tick",
+            "monotonic_ns": int(monotonic_ns),
+            "control_step": int(control_step),
+            "execute": bool(execute),
+            "request_id": scheduled.request_id,
+            "source_index": scheduled.source_index,
+            "skipped": scheduled.skipped,
+            "blend_alpha": scheduled.blend_alpha,
+            "gripper_blend_alpha": scheduled.gripper_blend_alpha,
+            "round_trip_ms": scheduled.round_trip_ms,
+            "raw_action": scheduled.raw_action.tolist(),
+            "scheduled_action": scheduled.action.tolist(),
+            "command": np.asarray(command, dtype=np.float32).tolist(),
+            "feedback": np.asarray(feedback, dtype=np.float32).tolist(),
+        }
+        if gripper_stabilizer is not None:
+            payload["gripper_stabilizer"] = gripper_stabilizer
+        self._write(payload)
 
     def starvation(self, monotonic_ns: int, control_step: int) -> None:
         self._write(
