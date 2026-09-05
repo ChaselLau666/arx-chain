@@ -16,6 +16,9 @@ set -Eeuo pipefail
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/.." && pwd)"
 
+source "${repo_root}/realsense/camera_serials.sh"
+load_camera_serials standard
+
 # The domain is this robot's identity and must come from the machine
 # (/etc/environment). Defaulting it once drove another robot's arms on a shared
 # LAN, so this refuses rather than guesses.
@@ -246,16 +249,12 @@ if (( ! COLLECTOR_ONLY )); then
     if (( SKIP_CAMERAS )); then
         echo "  SKIP_CAMERAS=1: no cameras started; the episodes will carry no images"
     else
-        # realsense.sh opens a gnome-terminal per camera, which cannot work once this
-        # script is detached from a display. The serials still come from that file, so
-        # it stays the one place they are configured.
-        declare -A CAMERA_SERIAL
-        while read -r name serial; do
-            [[ -n "$name" ]] && CAMERA_SERIAL["$name"]="$serial"
-        done < <(sed -n 's/^ *\[\([a-z_]*\)\]="\([0-9]*\)".*/\1 \2/p' \
-                 "${repo_root}/realsense/realsense.sh")
-        (( ${#CAMERA_SERIAL[@]} == 3 )) \
-            || die "expected 3 camera serials in realsense/realsense.sh, found ${#CAMERA_SERIAL[@]}"
+        # Share the evaluated host configuration with the graphical launcher.
+        declare -A CAMERA_SERIAL=(
+            [camera_h]="$CAMERA_H_SERIAL"
+            [camera_l]="$CAMERA_L_SERIAL"
+            [camera_r]="$CAMERA_R_SERIAL"
+        )
 
         for camera in camera_h camera_l camera_r; do
             serial=${CAMERA_SERIAL[$camera]:-}

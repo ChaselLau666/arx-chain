@@ -4,18 +4,14 @@ shell_type=${SHELL##*/}
 shell_config="source ./install/setup.$shell_type"
 shell_exec="exec $shell_type"
 
+camera_config_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${camera_config_dir}/camera_serials.sh" || exit 1
+load_camera_serials standard || exit 1
 declare -A CAMS=(
-  [camera_h]="260422273990"
-  [camera_l]="260422273222"
-  [camera_r]="260422272473"
+  [camera_h]="$CAMERA_H_SERIAL"
+  [camera_l]="$CAMERA_L_SERIAL"
+  [camera_r]="$CAMERA_R_SERIAL"
 )
-
-# Keep each robot's physical camera mapping when sharing the main branch.
-if [[ "$(hostname -s)" == "ark-1" ]]; then
-  CAMS[camera_h]="260422272688"
-  CAMS[camera_l]="260422274927"
-  CAMS[camera_r]="260522274175"
-fi
 
 COLOR_PROFILE="640x480x90"
 DEPTH_PROFILE="640x480x90"

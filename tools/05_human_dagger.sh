@@ -4,6 +4,9 @@ set -Eeuo pipefail
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/.." && pwd)"
 
+source "${repo_root}/realsense/camera_serials.sh"
+load_camera_serials dagger
+
 # The ROS domain is this robot's identity and must come from the machine
 # (/etc/environment), never from the repo: hardcoding it once drove another
 # robot's lift on a shared LAN.
@@ -494,9 +497,6 @@ start_component arm_right \
   -p arm_pub_topic_name:=/human_dagger/arm/right/status \
   -p arm_sub_topic_name:=/human_dagger/arm/right/command
 
-CAMERA_H_SERIAL=${CAMERA_H_SERIAL:-260522275257}
-CAMERA_L_SERIAL=${CAMERA_L_SERIAL:-260422273222}
-CAMERA_R_SERIAL=${CAMERA_R_SERIAL:-260422272473}
 COLOR_PROFILE=${COLOR_PROFILE:-640x480x90}
 DEPTH_PROFILE=${DEPTH_PROFILE:-640x480x90}
 # Nothing consumes depth (use_depth_image: false; the frontend and recorder
