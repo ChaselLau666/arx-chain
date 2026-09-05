@@ -27,17 +27,33 @@ service rather than a controller button:
     ros2 service call /vr_ik_r/disengage std_srvs/srv/Trigger
     ros2 service call /vr_ik_r/home std_srvs/srv/Trigger
 
---auto-engage is the vendor workflow, with the controller's own buttons: the
-headset app handles trigger, release and reset itself by changing the pose
-it sends - zeroed onto the arm, frozen, or walking home - so following the
-absolute pose reproduces all three. The pose is followed once it comes
-within --engage-distance / --engage-angle of where the arm actually is, or
-of the home pose (which is what the app's reset sends); a parked
-controller's pose is near neither and is ignored.
+--engage picks what starts and stops tracking:
+
+  absolute  (default) the vendor's rule: follow the pose as sent, whenever
+            the arm can reach it. X5Controller in vr_slave mode hands the
+            VR pose straight to its solver; the one thing its closed solver
+            adds is that it does not move for a target it cannot reach, so a
+            parked controller's pose leaves the arm still. That is
+            reproduced by converging a scratch solver on each target first.
+            The app expresses the hand in an arm-aligned frame with a fixed
+            origin, not zeroed onto the arm, so the operator has to bring
+            the hand to where the arm is before holding the trigger - a hand
+            at chest height maps 80 cm from the base and is out of reach.
+            The app's trigger, release and reset all arrive as pose changes
+            and work as they do with the vendor stack.
+  motion    the trigger from the stream itself. The app streams the tracked
+            pose only while the index trigger is held and repeats the last
+            pose bit-for-bit once released, so the pose starting to change
+            engages, relative to the arm's pose at that instant, and the
+            pose freezing for --release-window disengages. Independent of
+            where the app's frame sits.
+  service   engage and disengage only on request (the services above).
+
+The app's reset button reaches the robot only as a pose, so it works in
+absolute mode; in the other modes use the /home service.
 
   WAITING   no arm feedback yet; nothing published
-  ARMED     feedback present; holding, waiting for engage (or, with
-            --auto-engage, for the target to come within reach)
+  ARMED     feedback present; holding, waiting to engage as --engage says
   TRACKING  solving and publishing. Each joint moves at most --max-velocity,
             using the measured message interval, so a far target is walked
             toward rather than lunged at. Two things end it: a target that
@@ -99,9 +115,16 @@ def build_node(args):
             self.task.configure(EE_FRAME, 'soft', 1.0, 1.0)
             self.solver.add_regularization_task(1e-5)
             self.solver.dt = args.dt
-            # FK of the feedback for gating and engaging, without touching the solver.
+            # A second model for FK of the feedback and for probing reachability,
+            # so neither disturbs the tracking solver's state.
             self.fk_robot = placo.RobotWrapper(str(urdf), placo.Flags.ignore_collisions)
-            self.T_home = self.fk_of(HOME_Q)
+            self.probe_solver = placo.KinematicsSolver(self.fk_robot)
+            self.probe_solver.mask_fbase(True)
+            self.probe_solver.enable_joint_limits(True)
+            self.probe_task = self.probe_solver.add_frame_task(EE_FRAME, np.eye(4))
+            self.probe_task.configure(EE_FRAME, 'soft', 1.0, 1.0)
+            self.probe_solver.add_regularization_task(1e-5)
+            self.probe_solver.dt = 0.05
 
             self.state = WAITING
             self.q_feedback = None
@@ -116,6 +139,8 @@ def build_node(args):
             self.vr_recent = collections.deque()         # (t, p) over the last second
             self.origin = None                           # (p_arm0, R_arm0, p_vr0, R_vr0) set at engage
             self.p_target_prev = None                    # last target position, for the jump guard
+            self.vr_prev = None                          # last raw pose tuple, to tell a frozen stream
+            self.t_last_change = None                    # when the raw pose last differed from the one before
             self.last_gripper = 5.0 * GRIPPER_SCALE      # what the idle VR stream commands: open
 
             self.pub = self.create_publisher(RobotStatus, args.out_topic, 10) if args.execute else None
@@ -128,10 +153,11 @@ def build_node(args):
             # which may be exactly what has gone away.
             self.create_timer(args.dt, self.homing_tick)
             self.create_timer(args.report_period, self.report)
-            mode = ('auto-engage on the absolute VR pose within '
-                    f'{args.engage_distance * 1000:.0f} mm / {args.engage_angle:.0f} deg'
-                    if args.auto_engage else
-                    f'relative to the pose at engage; call /{args.node_name}/engage')
+            mode = {
+                'motion': f'engage when the VR pose starts moving, hold when it freezes for {args.release_window:.1f} s',
+                'service': f'engage on request; call /{args.node_name}/engage',
+                'absolute': 'follow the VR pose as sent whenever the arm can reach it (vendor behaviour)',
+            }[args.engage]
             self.get_logger().info(
                 f'{args.in_topic} -> IK -> {args.out_topic}  '
                 f'{"PUBLISHING" if args.execute else "DRY-RUN, pass --execute to publish"}; {mode}; '
@@ -152,28 +178,43 @@ def build_node(args):
             while self.vr_recent and now - self.vr_recent[0][0] > 1.0:
                 self.vr_recent.popleft()
             self.last_gripper = float(msg.gripper) * GRIPPER_SCALE
+            # The app repeats the last pose bit-for-bit while the trigger is up, so
+            # "changed since the previous message" is the trigger being down.
+            raw = (msg.x, msg.y, msg.z, msg.roll, msg.pitch, msg.yaw)
+            changed = self.vr_prev is not None and raw != self.vr_prev
+            self.vr_prev = raw
+            if changed:
+                self.t_last_change = now
             if self.state in (WAITING, HOMING):
                 return
 
             if self.state == ARMED:
-                if not args.auto_engage:
+                if args.engage == 'service':
                     return
-                # The app-zeroed stream is accepted when it is near where the arm
-                # is (the trigger was pressed with the arm at rest under the hand)
-                # or near the home pose (the app's reset sends the arm home from
-                # wherever it is). A parked controller's pose is near neither.
-                T_arm = self.fk_of(self.q_feedback)
-                near_arm = (float(np.linalg.norm(self.vr_p - T_arm[:3, 3])), rotation_angle_deg(self.vr_R, T_arm[:3, :3]))
-                near_home = (float(np.linalg.norm(self.vr_p - self.T_home[:3, 3])), rotation_angle_deg(self.vr_R, self.T_home[:3, :3]))
-                self.gate = min(near_arm, near_home)
-                ok = lambda g: g[0] <= args.engage_distance and g[1] <= args.engage_angle
-                if not (ok(near_arm) or ok(near_home)):
+                if args.engage == 'motion':
+                    if changed:
+                        self.engage('VR pose started moving (trigger down)', now)
+                    else:
+                        return
+            if self.state == ARMED:   # absolute: the vendor's rule, follow it if the arm can reach it
+                ok, res = self.reachable(T_vr, self.q_feedback)
+                self.gate = res
+                if not ok:
                     return
-                where = 'the arm' if ok(near_arm) else 'home'
-                g = near_arm if ok(near_arm) else near_home
-                self.engage(f'target within {g[0] * 1000:.0f} mm / {g[1]:.0f} deg of {where}', now)
+                self.engage(f'target is reachable (probe residual {res * 1000:.0f} mm)', now)
+            elif args.engage == 'absolute':
+                ok, res = self.reachable(T_vr, self.last_q)
+                if not ok:
+                    self.gate = res
+                    self.disengage(f'target went out of reach (probe residual {res * 1000:.0f} mm)')
+                    return
 
-            if self.origin is None:          # auto-engage: follow the absolute pose
+            if args.engage == 'motion' and self.t_last_change is not None \
+                    and now - self.t_last_change > args.release_window:
+                self.disengage('VR pose froze (trigger up)')
+                return
+
+            if self.origin is None:          # absolute: follow the pose as sent
                 T = T_vr
             else:                            # relative: VR motion since engage, applied to the arm's pose then
                 p_arm0, R_arm0, p_vr0, R_vr0 = self.origin
@@ -262,7 +303,7 @@ def build_node(args):
             self.t_prev_msg = now
             self.res_hist.clear()
             self.p_target_prev = None
-            if not args.auto_engage:
+            if args.engage != 'absolute':
                 T_arm = self.fk_of(self.q_feedback)
                 self.origin = (T_arm[:3, 3].copy(), T_arm[:3, :3].copy(), self.vr_p.copy(), self.vr_R.copy())
             self.set_state(TRACKING, why)
@@ -330,6 +371,19 @@ def build_node(args):
             self.fk_robot.update_kinematics()
             return np.array(self.fk_robot.get_T_world_frame(EE_FRAME))
 
+        def reachable(self, T, q_seed):
+            """Converge a scratch solver on T from q_seed; the vendor arm does not
+            move for a target it cannot reach, and neither should this one -
+            the tracking solver would otherwise walk the arm to its joint
+            limits and leave it pinned there, as it did on the first dry run."""
+            self.fk_of(q_seed)
+            self.probe_task.T_world_frame = T
+            for _ in range(args.probe_iterations):
+                self.probe_solver.solve(True)
+                self.fk_robot.update_kinematics()
+            res = float(np.linalg.norm(np.array(self.fk_robot.get_T_world_frame(EE_FRAME))[:3, 3] - T[:3, 3]))
+            return res <= args.max_residual, res
+
         def current_q(self):
             return np.array([self.robot.get_joint(n) for n in JOINTS])
 
@@ -355,10 +409,12 @@ def build_node(args):
                 else:
                     moving = self.vr_motion_mm()
                     vr = f'VR pose {"moving" if moving > 1 else "NOT moving"} ({moving:.0f} mm/s)'
-                    if args.auto_engage and self.gate is not None:
+                    if args.engage == 'absolute' and self.gate is not None:
                         self.get_logger().info(
-                            f'ARMED: {vr}; target is {self.gate[0] * 1000:.0f} mm / {self.gate[1]:.0f} deg from the nearer of '
-                            f'the arm and home, need < {args.engage_distance * 1000:.0f} mm / {args.engage_angle:.0f} deg')
+                            f'ARMED: {vr}; target is OUT OF REACH (probe residual {self.gate * 1000:.0f} mm). '
+                            f'Bring the hand to where the arm is, then hold the trigger.')
+                    elif args.engage == 'motion':
+                        self.get_logger().info(f'ARMED: {vr}; holding. Hold the trigger and move the hand to engage.')
                     else:
                         self.get_logger().info(
                             f'ARMED: {vr}; holding. Engage with: '
@@ -386,11 +442,13 @@ def main():
     parser.add_argument('--urdf-cache', default=str(Path(__file__).resolve().parent / 'x5_kin.urdf'))
     parser.add_argument('--dt', type=float, default=1 / 100.0,
                         help='solver integration step; roughly the VR message period')
-    parser.add_argument('--auto-engage', action='store_true',
-                        help='follow the absolute VR pose once it is near the arm, instead of waiting for the engage service')
-    parser.add_argument('--engage-distance', type=float, default=0.05,
-                        help='m; with --auto-engage, the target must come this close to the arm first')
-    parser.add_argument('--engage-angle', type=float, default=20.0, help='deg; orientation counterpart of --engage-distance')
+    parser.add_argument('--engage', choices=['absolute', 'motion', 'service'], default='absolute',
+                        help='what starts tracking: the pose being reachable (vendor behaviour), the pose starting '
+                             'to move (trigger down), or a service call; see the module docstring')
+    parser.add_argument('--release-window', type=float, default=0.3,
+                        help='s; in motion mode, a pose frozen this long means the trigger is up: hold')
+    parser.add_argument('--probe-iterations', type=int, default=20,
+                        help='solver iterations used to decide whether a target is reachable')
     parser.add_argument('--max-velocity', type=float, default=1.5,
                         help='rad/s per joint, applied per message using the measured interval')
     parser.add_argument('--max-residual', type=float, default=0.03,

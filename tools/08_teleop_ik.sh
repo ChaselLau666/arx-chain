@@ -28,9 +28,7 @@ repo_root="$(cd "${script_dir}/.." && pwd)"
 SMOOTH_TAU=${SMOOTH_TAU:-0.05}
 IK_SIDE=${IK_SIDE:-right}                    # right | left | both
 IK_DRY_RUN=${IK_DRY_RUN:-0}                   # 1: solve and report, publish nothing
-IK_AUTO_ENGAGE=${IK_AUTO_ENGAGE:-0}           # 1: follow the absolute VR pose once near the arm (needs the app to have zeroed it)
-IK_ENGAGE_MM=${IK_ENGAGE_MM:-50}              # with IK_AUTO_ENGAGE, how close the target must come
-IK_ENGAGE_DEG=${IK_ENGAGE_DEG:-20}
+IK_ENGAGE=${IK_ENGAGE:-absolute}              # absolute (vendor: follow when reachable) | motion | service
 IK_MAX_VEL=${IK_MAX_VEL:-1.5}                 # rad/s per joint
 IK_MAX_RESIDUAL_MM=${IK_MAX_RESIDUAL_MM:-30}  # above this the target is treated as unreachable
 IK_DT=${IK_DT:-0.01}                          # solver step, about the VR message period
@@ -233,10 +231,9 @@ fi
 stop_matching "previous IK node(s)" '^[^ ]*python[0-9.]* [^ ]*vr_ik_node\.py( |$)'
 
 ik_args=(--dt "${IK_DT}" --max-velocity "${IK_MAX_VEL}"
-         --engage-distance "$(awk "BEGIN{print ${IK_ENGAGE_MM}/1000}")" --engage-angle "${IK_ENGAGE_DEG}"
          --max-residual "$(awk "BEGIN{print ${IK_MAX_RESIDUAL_MM}/1000}")")
 (( IK_DRY_RUN )) || ik_args+=(--execute)
-(( IK_AUTO_ENGAGE )) && ik_args+=(--auto-engage)
+ik_args+=(--engage "${IK_ENGAGE}")
 
 sides=()
 case "$IK_SIDE" in right) sides=(right);; left) sides=(left);; both) sides=(left right);; esac
@@ -254,9 +251,13 @@ trap - EXIT
 echo
 if (( IK_DRY_RUN )); then
     echo "IK is in DRY-RUN: solving and reporting, publishing nothing. The arms hold."
-elif (( IK_AUTO_ENGAGE )); then
-    echo "IK is live for the ${IK_SIDE} arm(s). Nothing moves until the VR target comes within"
-    echo "${IK_ENGAGE_MM} mm / ${IK_ENGAGE_DEG} deg of where the arm is; the log says how far it is."
+elif [[ "$IK_ENGAGE" == absolute ]]; then
+    echo "IK is live for the ${IK_SIDE} arm(s), vendor behaviour: the arm follows the VR pose whenever it"
+    echo "can reach it. Bring the hand down to where the arm is before holding the trigger - a hand"
+    echo "at chest height is out of reach and the arm will not move. The log says which it is."
+elif [[ "$IK_ENGAGE" == motion ]]; then
+    echo "IK is live for the ${IK_SIDE} arm(s). Hold the trigger and move: the arm follows the hand's"
+    echo "motion from where the arm is; release, and it holds."
 else
     echo "IK is live for the ${IK_SIDE} arm(s) and HOLDING. Put the controller where you want to"
     echo "start from, then engage; the arm follows the controller's motion from that moment:"
