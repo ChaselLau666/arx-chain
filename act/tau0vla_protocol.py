@@ -134,6 +134,8 @@ class Tau0VLAHttpClient:
         return payload
 
     def infer(self, observation: Observation, request_id: int) -> ActionChunk:
+        from requests import HTTPError
+
         if self.session_id is None:
             raise ProtocolError("create_session must be called before infer")
         state = np.asarray(observation.qpos, dtype=np.float32)
@@ -160,7 +162,13 @@ class Tau0VLAHttpClient:
             timeout=(1.0, self.request_timeout),
         )
         round_trip_ms = (time.monotonic() - started) * 1000.0
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except HTTPError as exc:
+            raise ProtocolError(
+                f"action-chunks HTTP {response.status_code}; session={self.session_id}; "
+                f"request_id={request_id}; body={response.text[:2000]!r}"
+            ) from exc
         if round_trip_ms > self.max_response_age_ms:
             raise ProtocolError(f"response age {round_trip_ms:.1f} ms exceeds {self.max_response_age_ms:.1f} ms")
         payload = response.json()
@@ -206,6 +214,25 @@ def recommended_replan_steps(
         )
     available_steps = math.floor(ACTION_HORIZON - (p99_ms + margin_ms) * FPS / 1000.0)
     return max(1, min(int(maximum), available_steps)), p99_ms
+
+
+def resolve_replan_steps(
+    value: str, latencies: Sequence[float], margin_ms: float
+) -> tuple[int, float]:
+    """Use the same latency budget for standalone and DAgger inference."""
+    automatic, p99_ms = recommended_replan_steps(latencies, margin_ms=margin_ms)
+    if value == "auto":
+        return automatic, p99_ms
+    selected = int(value)
+    if not 1 <= selected < ACTION_HORIZON:
+        raise ValueError(f"replan_steps must be auto or an integer in [1, {ACTION_HORIZON - 1}]")
+    available_ms = (ACTION_HORIZON - selected) * 1000.0 / FPS
+    if p99_ms + margin_ms >= available_ms:
+        raise ProtocolError(
+            f"replan_steps={selected} leaves {available_ms:.1f} ms, below "
+            f"p99 RTT + margin={p99_ms + margin_ms:.1f} ms"
+        )
+    return selected, p99_ms
 
 
 class ChunkScheduler:

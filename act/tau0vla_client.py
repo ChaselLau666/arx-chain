@@ -26,7 +26,7 @@ from tau0vla_protocol import (
     Observation,
     ProtocolError,
     Tau0VLAHttpClient,
-    recommended_replan_steps,
+    resolve_replan_steps as _resolve_replan_steps,
 )
 from tau0vla_trace import TraceWriter, analyze_trace
 from utils.setup_loader import setup_loader
@@ -239,22 +239,6 @@ def benchmark(client: Tau0VLAHttpClient, node, request_id: int, warmup: int, sam
             f"RTT={result.round_trip_ms:.1f} ms, inference={result.inference_ms:.1f} ms"
         )
     return request_id, latencies
-
-
-def _resolve_replan_steps(value: str, latencies: list[float], margin_ms: float) -> tuple[int, float]:
-    automatic, p99_ms = recommended_replan_steps(latencies, margin_ms=margin_ms)
-    if value == "auto":
-        return automatic, p99_ms
-    selected = int(value)
-    if not 1 <= selected < ACTION_HORIZON:
-        raise ValueError(f"--replan-steps must be auto or an integer in [1, {ACTION_HORIZON - 1}]")
-    available_ms = (ACTION_HORIZON - selected) * 1000.0 / FPS
-    if p99_ms + margin_ms >= available_ms:
-        raise ProtocolError(
-            f"replan_steps={selected} leaves {available_ms:.1f} ms, below "
-            f"p99 RTT + margin={p99_ms + margin_ms:.1f} ms"
-        )
-    return selected, p99_ms
 
 
 def run(args) -> None:

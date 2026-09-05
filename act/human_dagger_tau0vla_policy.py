@@ -9,8 +9,9 @@ The difference is inference topology. ACT runs a CUDA forward per observation;
 Tau0VLA lives on a dedicated-link HTTP server and answers with a 30-step,
 30 Hz action chunk. The worker therefore keeps a ChunkScheduler buffer
 (tau0vla_protocol) filled by a single in-flight background request, and each
-incoming observation pulls ONE buffered step as its action. The control side's
-one-observation-in-flight credit makes this pull rate track the control loop,
+incoming observation may pull ONE buffered step, at most once per 30 Hz slot.
+Early observations return their credit without advancing the trajectory; the
+60 Hz controller continues publishing its current target and servicing keys,
 and the core's policy_timeout_ns freshness check remains the safety backstop:
 if the buffer starves for longer than that window while POLICY is active, the
 core faults to HOLD, which is the intended failure behavior.
@@ -38,12 +39,14 @@ import numpy as np
 from tau0vla_protocol import (
     ACTION_DIM,
     ActionEMA,
+    BinaryGripperStabilizer,
     CAMERA_NAMES,
+    FPS,
     ChunkScheduler,
     Observation,
     ProtocolError,
     Tau0VLAHttpClient,
-    recommended_replan_steps,
+    resolve_replan_steps,
 )
 
 
@@ -55,6 +58,12 @@ class Tau0VLAWorkerConfig:
     max_response_age_ms: float = 2000.0
     replan_steps: str = "auto"
     chunk_blend_steps: int = 6
+    gripper_blend_steps: int | None = None
+    gripper_debounce_frames: int = 0
+    gripper_low_threshold: float = -2.1
+    gripper_high_threshold: float = -1.05
+    gripper_low_value: float = -3.384
+    gripper_high_value: float = 0.0
     arm_ema_alpha: float = 1.0
     gripper_ema_alpha: float = 1.0
     benchmark_warmup: int = 3
@@ -128,9 +137,14 @@ class _Tau0VLARuntime:
         # The real session; garbage actions from calibration are gone with
         # the calibration session.
         self.client.create_session(config.task_instruction)
+        # Request IDs are session-local and consecutive; calibration used a
+        # different session. reset() for R/P keeps this session and its counter.
+        self._request_id = 0
 
         self.scheduler: Optional[ChunkScheduler] = None
         self.ema: Optional[ActionEMA] = None
+        self.gripper: Optional[BinaryGripperStabilizer] = None
+        self.filters_seeded = False
 
     def next_request_id(self) -> int:
         self._request_id += 1
@@ -144,31 +158,29 @@ class _Tau0VLARuntime:
             chunk = self.client.infer(observation, self.next_request_id())
             if index >= self.config.benchmark_warmup:
                 rtts.append(chunk.round_trip_ms)
-        auto_steps, self.p99_ms = recommended_replan_steps(
-            rtts,
-            margin_ms=self.config.latency_margin_ms,
+        steps, self.p99_ms = resolve_replan_steps(
+            str(self.config.replan_steps), rtts, self.config.latency_margin_ms,
         )
-        if str(self.config.replan_steps) == "auto":
-            return auto_steps
-        explicit = int(self.config.replan_steps)
-        if explicit < auto_steps:
-            # A shorter interval than latency-derived only adds server load; a
-            # longer one risks starvation. Refuse only the risky direction.
-            raise ProtocolError(
-                f"replan_steps={explicit} cannot cover measured "
-                f"p99 {self.p99_ms:.1f} ms (needs >= {auto_steps})"
-            )
-        return explicit
+        return steps
 
     def reset(self) -> None:
         self.scheduler = ChunkScheduler(
             self.replan_steps,
             blend_steps=self.config.chunk_blend_steps,
+            gripper_blend_steps=self.config.gripper_blend_steps,
         )
         self.ema = ActionEMA(
             arm_alpha=self.config.arm_ema_alpha,
             gripper_alpha=self.config.gripper_ema_alpha,
         )
+        self.gripper = BinaryGripperStabilizer(
+            self.config.gripper_debounce_frames,
+            low_threshold=self.config.gripper_low_threshold,
+            high_threshold=self.config.gripper_high_threshold,
+            low_value=self.config.gripper_low_value,
+            high_value=self.config.gripper_high_value,
+        )
+        self.filters_seeded = False
 
 
 def tau0vla_policy_worker_main(
@@ -193,6 +205,9 @@ def tau0vla_policy_worker_main(
     action_seq = 0  # global, never reset: the core requires monotone sequences
     pending: Optional[Future] = None
     pending_epoch: Optional[int] = None
+    # Integer wall-clock slots, not observation count: the ROS loop is 60 Hz.
+    action_origin_ns: int | None = None
+    last_action_slot = -1
 
     def drop(epoch: int) -> None:
         status_queue.put(
@@ -222,6 +237,8 @@ def tau0vla_policy_worker_main(
             continue
         if kind == "reset":
             runtime.reset()
+            action_origin_ns = None
+            last_action_slot = -1
             active_epoch = int(message["control_epoch"])
             status_queue.put(
                 {
@@ -245,24 +262,36 @@ def tau0vla_policy_worker_main(
             drop(active_epoch)
             continue
 
+        now_ns = time.monotonic_ns()
+        if action_origin_ns is not None:
+            slot = (now_ns - action_origin_ns) * FPS // 1_000_000_000
+            if slot <= last_action_slot:
+                drop(active_epoch)
+                continue
+
         try:
             protocol_observation = _worker_observation(message["observation"])
             scheduler = runtime.scheduler
             ema = runtime.ema
-            if scheduler is None or ema is None:
+            gripper = runtime.gripper
+            if scheduler is None or ema is None or gripper is None:
                 raise ProtocolError("observation before any reset")
+            if not runtime.filters_seeded:
+                gripper.reset(protocol_observation.qpos)
+                ema.reset(gripper.apply(protocol_observation.qpos))
+                runtime.filters_seeded = True
 
             if pending is not None and pending.done():
                 future, pending = pending, None
                 adopted_epoch, pending_epoch = pending_epoch, None
-                chunk = future.result()  # raises on protocol/network failure
                 if adopted_epoch == active_epoch:
+                    chunk = future.result()  # only current-epoch errors may fault
                     scheduler.adopt(
                         chunk,
                         initial=False,
                         arrival_monotonic_ns=time.monotonic_ns(),
                     )
-                # A response from a gated epoch is discarded untouched.
+                # Do not even unwrap a gated future: its exception is stale too.
 
             if scheduler.remaining == 0 and pending is None:
                 # Cold start after reset, or recovery after a stall: fetch
@@ -291,11 +320,15 @@ def tau0vla_policy_worker_main(
                 drop(active_epoch)
                 continue
 
-            action = np.asarray(ema.apply(scheduled.action), dtype=np.float64)
+            action = np.asarray(ema.apply(gripper.apply(scheduled.action)), dtype=np.float64)
             if action.shape != (ACTION_DIM,) or not np.all(np.isfinite(action)):
                 raise ProtocolError("scheduled action is not a finite 14-vector")
 
             action_seq += 1
+            generated_ns = time.monotonic_ns()
+            if action_origin_ns is None:
+                action_origin_ns = generated_ns
+            last_action_slot = (generated_ns - action_origin_ns) * FPS // 1_000_000_000
             result_queue.put(
                 {
                     "kind": "policy_action",
@@ -303,7 +336,7 @@ def tau0vla_policy_worker_main(
                     "control_epoch": active_epoch,
                     "observation_seq": int(message["observation_seq"]),
                     "action_seq": action_seq,
-                    "generated_ns": time.monotonic_ns(),
+                    "generated_ns": generated_ns,
                     "observation_ns": observation_ns,
                     "policy_basis_ns": policy_basis_ns,
                     "action": action,

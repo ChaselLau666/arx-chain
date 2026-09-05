@@ -203,6 +203,30 @@ class ChunkSchedulerTest(unittest.TestCase):
 
 
 class HttpClientTest(unittest.TestCase):
+    def test_inference_http_error_preserves_server_detail_and_request_identity(self):
+        from unittest.mock import Mock
+        import requests
+
+        response = requests.Response()
+        response.status_code = 409
+        response._content = b'{"detail":"request_id 34 does not follow 0"}'
+        client = Tau0VLAHttpClient("http://server")
+        client.session_id = "diagnostic-session"
+        client.session = Mock()
+        client.session.post.return_value = response
+        observation = Observation(
+            qpos=np.zeros(14, dtype=np.float32),
+            images={name: b"jpeg" for name in ("head", "left_wrist", "right_wrist")},
+            sample_monotonic_ns=123,
+        )
+        with self.assertRaises(ProtocolError) as caught:
+            client.infer(observation, 34)
+        message = str(caught.exception)
+        for detail in ("HTTP 409", "diagnostic-session", "request_id=34", "does not follow 0"):
+            self.assertIn(detail, message)
+        self.assertIsInstance(caught.exception.__cause__, requests.HTTPError)
+        client.session.post.assert_called_once()
+
     def test_health_contract_session_and_chunk(self):
         class Response:
             def __init__(self, payload):
