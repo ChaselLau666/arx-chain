@@ -186,6 +186,12 @@ fi
 # it makes things worse - two processes contend for the same tty and neither
 # delivers - which is exactly how the VR stream died once. So a stale node is
 # stopped and replaced rather than joined.
+#
+# A headset that is silent right now is not a reason to refuse, though. The
+# operator puts it on and takes it off all the time, and the stream stops
+# whenever it is off. Refusing here tore the serial node down and left
+# nothing listening when the headset came back. The node is brought up and
+# left waiting instead; vr_ik reports "no VR pose for N s" until it arrives.
 vr_alive() { timeout 3 ros2 topic echo --once "$1" >/dev/null 2>&1; }
 
 if vr_alive /ARX_VR_R; then
@@ -196,7 +202,12 @@ else
     start_component vr_serial ros2 run serial_port serial_port_node
     wait_for_topic /ARX_VR_L 25
     wait_for_topic /ARX_VR_R 25
-    vr_alive /ARX_VR_R || die "serial_port_node is up but publishes nothing; is the headset on and its USB cable in? see ${LOG_DIR}/vr_serial.log"
+    if vr_alive /ARX_VR_R; then
+        echo "  VR stream is up"
+    else
+        echo "  WARNING: serial_port_node is up but the headset is not sending. Put the headset on"
+        echo "  and open X5_MR_Control; the IK log will say 'no VR pose' until it does."
+    fi
 fi
 
 if topic_up "$FILTERED_L" && topic_up "$FILTERED_R"; then
