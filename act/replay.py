@@ -32,8 +32,9 @@ from functools import partial
 from utils.ros_operator import RosOperator, Rate
 from utils.setup_loader import setup_loader
 from lift_height import configure_fixed_height
-from replay_support import (episode_start_pose, resolve_replay_height, tracking_report,
-                            smooth_causal)
+from replay_support import (build_poscmd_start_ramp, episode_start_pose,
+                            resolve_replay_height, select_replay_trajectory,
+                            split_bimanual_frame, tracking_report, smooth_causal)
 
 
 def load_yaml(yaml_file):
@@ -62,6 +63,7 @@ def load_hdf5(dataset_path):
             eefs = root.get('/observations/eef')
             actions = root.get('/action')
             actions_eefs = root.get('/action_eef')
+            actions_poscmd = root.get('/action_poscmd')
             action_base = root.get('/action_base')
             action_velocity = root.get('/action_velocity')
 
@@ -76,23 +78,27 @@ def load_hdf5(dataset_path):
                 raise ValueError(f"Missing datasets in HDF5 file: {', '.join(missing_datasets)}")
 
             recorded_height = root.attrs.get('height_command')
+            poscmd_topics = (
+                root.attrs.get('action_poscmd_left_topic'),
+                root.attrs.get('action_poscmd_right_topic'),
+            )
 
             return (qposes[()], eefs[()], actions[()], actions_eefs[()],
                     action_base[()], action_velocity[()],
-                    None if recorded_height is None else float(recorded_height))
+                    None if recorded_height is None else float(recorded_height),
+                    None if actions_poscmd is None else actions_poscmd[()], poscmd_topics)
     except Exception as e:
         raise RuntimeError(f"Error occurred while loading the HDF5 file: {e}")
 
 
 def robot_action(ros_operator, args, action, action_base, actions_velocity):
-    gripper_idx = [6, 13]
+    left_action, right_action = split_bimanual_frame(
+        action, name=f'{args.replay_mode} action')
 
-    left_action = action[:gripper_idx[0] + 1]  # 取8维度
-    right_action = action[gripper_idx[0] + 1:gripper_idx[1] + 1]  # action[7:14]
-
-    print(f'{left_action=}')
-
-    ros_operator.follow_arm_publish(left_action, right_action)  # follow_arm_publish_continuous_thread
+    if args.replay_mode == 'poscmd':
+        ros_operator.poscmd_publish(left_action, right_action)
+    else:
+        ros_operator.follow_arm_publish(left_action, right_action)
 
     if args.use_base:
         ros_operator.set_robot_base_target(np.concatenate([action_base, actions_velocity]))
@@ -108,7 +114,17 @@ def current_qpos(ros_operator):
     return np.concatenate([list(left[-1].joint_pos)[:7], list(right[-1].joint_pos)[:7]])
 
 
-def init_robot(ros_operator, use_base, start_pose):
+def current_eef(ros_operator):
+    """Latest measured [left xyz/rpy, right xyz/rpy], or None before feedback."""
+    left = ros_operator.follow_left_arm_deque
+    right = ros_operator.follow_right_arm_deque
+    if not left or not right:
+        return None
+
+    return np.concatenate([list(left[-1].end_pos)[:6], list(right[-1].end_pos)[:6]])
+
+
+def init_joint_robot(ros_operator, use_base, start_pose):
     left_start, right_start = start_pose
 
     ros_operator.follow_arm_publish_continuous(left_start, right_start)
@@ -118,6 +134,27 @@ def init_robot(ros_operator, use_base, start_pose):
 
         ros_operator.start_base_control_thread()
         ros_operator.follow_arm_publish_continuous(left_start, right_start)
+
+
+def init_poscmd_robot(ros_operator, args, first_command, feedback_timeout=5.0):
+    """Approach the first Cartesian command without one large first-frame jump."""
+    deadline = time.monotonic() + feedback_timeout
+    measured = current_eef(ros_operator)
+    while measured is None and time.monotonic() < deadline and not stop_requested.is_set():
+        time.sleep(0.01)
+        measured = current_eef(ros_operator)
+    if measured is None:
+        raise RuntimeError('Cartesian arm feedback unavailable; vr_slave must be running')
+
+    ramp = build_poscmd_start_ramp(measured, first_command)
+    rate = Rate(args.frame_rate)
+    print(f'Approaching first PosCmd in {len(ramp)} bounded Cartesian steps.')
+    for frame in ramp:
+        if stop_requested.is_set():
+            raise RuntimeError('replay stopped while approaching the first PosCmd')
+        left, right = split_bimanual_frame(frame, name='PosCmd ramp frame')
+        ros_operator.poscmd_publish(left, right)
+        rate.sleep()
 
 
 stop_requested = threading.Event()
@@ -164,7 +201,23 @@ def summarise_tracking(args, times, command, actual):
     print(f'raw log saved to {args.record_actual}')
 
 
+def save_poscmd_run(args, times, command_poscmd, actual_qpos):
+    """Save unlike representations without reporting a meaningless joint RMSE."""
+    elapsed = times[-1] - times[0]
+    achieved = (len(times) - 1) / elapsed if elapsed > 0 else float('nan')
+    print('\n--- PosCmd replay report ---')
+    print(f'frames recorded : {len(times)}')
+    print(f'replay rate     : {achieved:.2f} Hz measured vs {args.frame_rate} Hz requested')
+    print('tracking RMSE   : not reported (command is Cartesian PosCmd; feedback is joint qpos)')
+    os.makedirs(os.path.dirname(os.path.abspath(args.record_actual)) or '.', exist_ok=True)
+    np.savez(args.record_actual, t=times, command_poscmd=command_poscmd,
+             actual_qpos=actual_qpos, replay_mode='poscmd',
+             frame_rate=args.frame_rate, episode=str(args.episode_path))
+    print(f'raw log saved to {args.record_actual}')
+
+
 def main(args):
+    stop_requested.clear()
     armed = bool(args.execute)
     if armed:
         confirmation = input('Type EXECUTE REPLAY to publish arm targets: ')
@@ -176,7 +229,22 @@ def main(args):
     setup_loader(ROOT)
 
     (qpoes, eefs, actions, actions_eefs, action_base, actions_velocity,
-     recorded_height) = load_hdf5(args.episode_path)
+     recorded_height, actions_poscmd, recorded_poscmd_topics) = load_hdf5(
+         args.episode_path)
+
+    replay_actions = select_replay_trajectory(
+        args.replay_mode, qpoes, actions, actions_poscmd,
+        states_replay=args.states_replay)
+    if args.replay_mode == 'poscmd':
+        if args.states_replay:
+            raise ValueError('--states_replay only applies to --replay-mode joint')
+        if args.smooth_tau > 0:
+            raise ValueError(
+                '--smooth-tau is a joint replay filter; recorded filtered PosCmd must not '
+                'be filtered a second time')
+        print('Recorded PosCmd source topics: '
+              f'{recorded_poscmd_topics[0] or "<unknown>"} / '
+              f'{recorded_poscmd_topics[1] or "<unknown>"}')
 
     # Resolve the height before the node is built. RosOperator only subscribes
     # to /body_information when args.height is set, and configure_fixed_height
@@ -207,11 +275,6 @@ def main(args):
     else:
         print(f'DRY-RUN: would set /lift fixed_height to {args.height:.6f}')
 
-    if args.states_replay:
-        replay_actions = actions
-    else:
-        replay_actions = qpoes
-
     if args.smooth_tau > 0:
         raw = replay_actions
         replay_actions = smooth_causal(replay_actions, args.smooth_tau, 1.0 / args.frame_rate)
@@ -222,7 +285,12 @@ def main(args):
 
     start_pose = episode_start_pose(replay_actions)
     if armed:
-        init_robot(ros_operator, args.use_base, start_pose)
+        if args.replay_mode == 'poscmd':
+            init_poscmd_robot(ros_operator, args, replay_actions[0])
+            if args.use_base:
+                ros_operator.start_base_control_thread()
+        else:
+            init_joint_robot(ros_operator, args.use_base, start_pose)
     else:
         print('DRY-RUN start pose:')
         print(f'  left : {np.round(start_pose[0], 4)}')
@@ -253,7 +321,12 @@ def main(args):
         print(f'Replay finished: {total} frames.')
 
     if armed and args.record_actual and len(log_cmd) >= 2:
-        summarise_tracking(args, np.array(log_t), np.array(log_cmd), np.array(log_actual))
+        if args.replay_mode == 'poscmd':
+            save_poscmd_run(
+                args, np.array(log_t), np.array(log_cmd), np.array(log_actual))
+        else:
+            summarise_tracking(
+                args, np.array(log_t), np.array(log_cmd), np.array(log_actual))
 
     ros_operator.base_enable = False
 
@@ -274,6 +347,9 @@ def parse_args(known=False):
                         help='record data')
 
     parser.add_argument('--states_replay', action='store_true', help='use qpos replay')
+    parser.add_argument('--replay-mode', choices=['joint', 'poscmd'], default='joint',
+                        help='joint replays measured qpos through remote_slave (legacy default); '
+                             'poscmd replays /action_poscmd through vr_slave')
     parser.add_argument('--height', type=float, default=None,
                         help='fixed lift command in [0, 20]; defaults to the recorded height_command')
     parser.add_argument('--execute', action='store_true',

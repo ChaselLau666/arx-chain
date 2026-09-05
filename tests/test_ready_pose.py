@@ -124,6 +124,7 @@ class LauncherWiringTests(unittest.TestCase):
         self.assertIn('-p arm_sub_topic_name:=${ARM_POSE_L#/}', self.text)
         self.assertIn('-p arm_sub_topic_name:=${ARM_POSE_R#/}', self.text)
         self.assertIn('--ready_pose_topics ${ARM_POSE_L} ${ARM_POSE_R}', self.text)
+        self.assertIn('--poscmd-topics ${ARM_POSE_L} ${ARM_POSE_R}', self.text)
 
     def test_each_filter_reads_the_arm_on_its_own_side(self):
         # The offset a filter carries is that arm's; crossing them re-aims the

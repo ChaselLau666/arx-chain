@@ -144,10 +144,14 @@ class RosOperator(Node):
             'follow_arm_left_feedback': ('follow_arm_left_feedback_topic', self.robot_status),
             'follow_arm_right_feedback': ('follow_arm_right_feedback_topic', self.robot_status),
         }
+        poscmd_topics = getattr(self.args, 'poscmd_topics', None)
+        poscmd_topic_override = dict(zip(
+            ('controller_left', 'controller_right'), poscmd_topics or []))
         for key, (topic_key, msg_type) in arm_topics.items():
             try:
                 self.create_subscription(msg_type,
-                                         self.config['arm_config'][topic_key],
+                                         poscmd_topic_override.get(
+                                             key, self.config['arm_config'][topic_key]),
                                          getattr(self, f"{key}_callback"),
                                          2)
             except KeyError as e:
@@ -194,16 +198,24 @@ class RosOperator(Node):
 
         # 推理模式相关发布
         if not self.in_collect and getattr(self.args, 'execute', True):
-            self.follow_arm_left_publisher = self.create_publisher(
-                self.robot_status,
-                self.config['arm_config']['follow_arm_left_cmd_topic'],
-                10
-            )
-            self.follow_arm_right_publisher = self.create_publisher(
-                self.robot_status,
-                self.config['arm_config']['follow_arm_right_cmd_topic'],
-                10
-            )
+            if getattr(self.args, 'replay_mode', 'joint') == 'poscmd':
+                topics = getattr(
+                    self.args, 'poscmd_output_topics', ['/ARX_VR_L', '/ARX_VR_R'])
+                self.poscmd_left_publisher = self.create_publisher(
+                    self.pos_cmd, topics[0], 10)
+                self.poscmd_right_publisher = self.create_publisher(
+                    self.pos_cmd, topics[1], 10)
+            else:
+                self.follow_arm_left_publisher = self.create_publisher(
+                    self.robot_status,
+                    self.config['arm_config']['follow_arm_left_cmd_topic'],
+                    10
+                )
+                self.follow_arm_right_publisher = self.create_publisher(
+                    self.robot_status,
+                    self.config['arm_config']['follow_arm_right_cmd_topic'],
+                    10
+                )
             if self.args.use_base:
                 self.base_actuator_publisher = self.create_publisher(
                     self.pos_cmd,
@@ -255,6 +267,21 @@ class RosOperator(Node):
         if len(right) != 0:
             joint_state_msg.joint_pos[:7] = right
             self.follow_arm_right_publisher.publish(joint_state_msg)  # /joint_control2
+
+    def poscmd_publish(self, left, right):
+        """Publish one recorded Cartesian command to each vr_slave arm."""
+        if len(left) != 7 or len(right) != 7:
+            raise ValueError(
+                f'expected two 7-D PosCmd blocks, got {len(left)} and {len(right)}')
+
+        fields = ('x', 'y', 'z', 'roll', 'pitch', 'yaw', 'gripper')
+        for values, publisher in (
+                (left, self.poscmd_left_publisher),
+                (right, self.poscmd_right_publisher)):
+            message = self.pos_cmd()
+            for field, value in zip(fields, values):
+                setattr(message, field, float(value))
+            publisher.publish(message)
 
     def init_robot_base_pose(self):
         if len(self.robot_base_origin) == 0:
@@ -664,6 +691,9 @@ class RosOperator(Node):
         action_dict['action_qvel'] = np.zeros((joints_dim * 2,))
         action_dict['action_eef'] = np.concatenate((control_left_arm_eef,
                                                     control_right_arm_eef), axis=0)
+        # Kept separate from action_eef: action_eef historically means measured
+        # end-effector state, while this is the PosCmd input to vr_slave.
+        action_dict['action_poscmd'] = action_dict['action_eef'].copy()
         action_dict['action_base'] = np.zeros((13,))  # waiting for the obersevation
 
         return action_dict

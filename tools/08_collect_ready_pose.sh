@@ -178,4 +178,4 @@ lift_height_q=$(printf '%q' "${LIFT_HEIGHT}")
 task_name_q=$(printf '%q' "${TASK_NAME}")
 ready_args="--ready_pose --ready_pose_topics ${ARM_POSE_L} ${ARM_POSE_R}"
 (( SKIP_FILTER )) && ready_args=""
-gnome-terminal --title="collect" -x $shell_type -i -c "cd ${repo_root}/act; conda activate ${ACT_ENV}; python collect.py --episode_idx -1 ${ready_args} --height ${lift_height_q} --task ${task_name_q}; $shell_exec"
+gnome-terminal --title="collect" -x $shell_type -i -c "cd ${repo_root}/act; conda activate ${ACT_ENV}; python collect.py --episode_idx -1 ${ready_args} --poscmd-topics ${ARM_POSE_L} ${ARM_POSE_R} --height ${lift_height_q} --task ${task_name_q}; $shell_exec"

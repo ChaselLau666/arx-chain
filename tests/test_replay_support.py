@@ -11,7 +11,9 @@ sys.path.insert(0, str(ROOT / 'act'))
 
 from replay_support import (episode_start_pose, resolve_replay_height,
                             best_lag, tracking_report, ARM_INDICES,
-                            GRIPPER_INDICES, ema_alpha, smooth_causal)
+                            GRIPPER_INDICES, ema_alpha, smooth_causal,
+                            select_replay_trajectory, split_bimanual_frame,
+                            build_poscmd_start_ramp)
 
 
 class ReplayStartPoseTests(unittest.TestCase):
@@ -39,6 +41,81 @@ class ReplayStartPoseTests(unittest.TestCase):
     def test_wrong_width_is_refused(self):
         with self.assertRaises(ValueError):
             episode_start_pose(np.zeros((3, 7), dtype=np.float32))
+
+    def test_poscmd_frame_uses_the_same_left_right_layout(self):
+        left, right = split_bimanual_frame(np.arange(14), name='PosCmd frame')
+        self.assertEqual(left, [float(v) for v in range(7)])
+        self.assertEqual(right, [float(v) for v in range(7, 14)])
+
+
+class ReplayTrajectorySelectionTests(unittest.TestCase):
+    def setUp(self):
+        self.qpos = np.full((3, 14), 1.0)
+        self.action = np.full((3, 14), 2.0)
+        self.poscmd = np.full((3, 14), 3.0)
+
+    def test_joint_mode_keeps_the_legacy_default(self):
+        np.testing.assert_array_equal(
+            select_replay_trajectory('joint', self.qpos, self.action, self.poscmd),
+            self.qpos,
+        )
+
+    def test_states_replay_still_selects_joint_action(self):
+        np.testing.assert_array_equal(
+            select_replay_trajectory(
+                'joint', self.qpos, self.action, self.poscmd, states_replay=True),
+            self.action,
+        )
+
+    def test_poscmd_mode_selects_only_the_recorded_command(self):
+        np.testing.assert_array_equal(
+            select_replay_trajectory('poscmd', self.qpos, self.action, self.poscmd),
+            self.poscmd,
+        )
+
+    def test_legacy_episode_is_refused_in_poscmd_mode(self):
+        with self.assertRaisesRegex(ValueError, '/action_poscmd'):
+            select_replay_trajectory('poscmd', self.qpos, self.action, None)
+
+    def test_bad_poscmd_width_is_refused(self):
+        with self.assertRaisesRegex(ValueError, r'\(T, 14\)'):
+            select_replay_trajectory('poscmd', self.qpos, self.action, np.zeros((3, 12)))
+
+
+class PosCmdStartRampTests(unittest.TestCase):
+    def test_translation_and_rotation_steps_are_bounded(self):
+        current = np.zeros(12)
+        target = np.zeros(14)
+        target[:6] = [0.02, -0.01, 0.0, 0.0, 0.0, 0.12]
+        target[6] = 4.5
+        target[7:13] = [-0.01, 0.0, 0.0, 0.06, 0.0, 0.0]
+        target[13] = 1.5
+
+        ramp = build_poscmd_start_ramp(current, target)
+        self.assertEqual(ramp.shape, (4, 14))
+        self.assertLessEqual(np.max(np.abs(np.diff(
+            np.vstack([np.zeros(14), ramp]), axis=0)[:, [0, 1, 2, 7, 8, 9]])),
+            0.005 + 1e-12)
+        self.assertLessEqual(np.max(np.abs(np.diff(
+            np.vstack([np.zeros(14), ramp]), axis=0)[:, [3, 4, 5, 10, 11, 12]])),
+            0.03 + 1e-12)
+        self.assertTrue(np.all(ramp[:, 6] == 4.5))
+        self.assertTrue(np.all(ramp[:, 13] == 1.5))
+
+    def test_angle_wrap_takes_the_short_direction(self):
+        current = np.zeros(12)
+        current[5] = np.pi - 0.01
+        target = np.zeros(14)
+        target[5] = -np.pi + 0.01
+        ramp = build_poscmd_start_ramp(current, target)
+        self.assertEqual(len(ramp), 1)
+        self.assertAlmostEqual(ramp[-1, 5], np.pi + 0.01, places=9)
+
+    def test_bad_shapes_are_refused(self):
+        with self.assertRaises(ValueError):
+            build_poscmd_start_ramp(np.zeros(14), np.zeros(14))
+        with self.assertRaises(ValueError):
+            build_poscmd_start_ramp(np.zeros(12), np.zeros(12))
 
 
 class ReplayHeightTests(unittest.TestCase):

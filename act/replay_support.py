@@ -5,6 +5,15 @@ from __future__ import annotations
 import numpy as np
 
 
+def split_bimanual_frame(frame, name='frame'):
+    """Split one [left 7, right 7] frame after validating its shape."""
+    frame = np.asarray(frame, dtype=float)
+    if frame.shape != (14,):
+        raise ValueError(f'expected a 14-D {name}, got shape {frame.shape}')
+
+    return frame[:7].tolist(), frame[7:14].tolist()
+
+
 def episode_start_pose(trajectory):
     """Split the first recorded frame into per-arm 7-DoF start targets.
 
@@ -15,11 +24,73 @@ def episode_start_pose(trajectory):
     if len(trajectory) == 0:
         raise ValueError('episode contains no frames; nothing to replay')
 
-    first = np.asarray(trajectory[0], dtype=float)
-    if first.shape != (14,):
-        raise ValueError(f'expected a 14-D recorded frame, got shape {first.shape}')
+    return split_bimanual_frame(trajectory[0], name='recorded frame')
 
-    return first[:7].tolist(), first[7:14].tolist()
+
+def select_replay_trajectory(mode, qpos, action, action_poscmd, states_replay=False):
+    """Select a trajectory without silently crossing action representations.
+
+    Legacy episodes have no ``/action_poscmd`` and remain valid for joint
+    replay. PosCmd replay is deliberately strict because measured EEF is not a
+    substitute for the Cartesian command that originally entered ``vr_slave``.
+    """
+    if mode == 'joint':
+        return np.asarray(action if states_replay else qpos)
+    if mode == 'poscmd':
+        if action_poscmd is None:
+            raise ValueError(
+                'episode has no /action_poscmd; recollect it with a filtered collection '
+                'launcher before using --replay-mode poscmd')
+        trajectory = np.asarray(action_poscmd)
+        if trajectory.ndim != 2 or trajectory.shape[1] != 14:
+            raise ValueError(
+                f'expected /action_poscmd shape (T, 14), got {trajectory.shape}')
+        return trajectory
+
+    raise ValueError(f'unknown replay mode: {mode}')
+
+
+def build_poscmd_start_ramp(current_eef, target_poscmd,
+                            max_xyz_step=0.005, max_angle_step=0.03):
+    """Interpolate measured EEF pose to the first recorded PosCmd.
+
+    ``current_eef`` contains two measured xyz/rpy blocks (12 values), while the
+    command contains two xyz/rpy/gripper blocks (14 values). Euler deltas take
+    the equivalent shortest wrapped direction. The recorded gripper command is
+    held throughout because measured gripper feedback uses motor units, not the
+    VR command units stored in PosCmd.
+    """
+    current = np.asarray(current_eef, dtype=float)
+    target = np.asarray(target_poscmd, dtype=float)
+    if current.shape != (12,):
+        raise ValueError(f'expected 12-D measured EEF, got shape {current.shape}')
+    if target.shape != (14,):
+        raise ValueError(f'expected 14-D PosCmd target, got shape {target.shape}')
+    if max_xyz_step <= 0 or max_angle_step <= 0:
+        raise ValueError('PosCmd ramp step limits must be positive')
+
+    starts, deltas = [], []
+    steps = 1
+    for arm in range(2):
+        measured = current[arm * 6:(arm + 1) * 6]
+        command = target[arm * 7:arm * 7 + 6]
+        delta = command - measured
+        delta[3:6] = np.arctan2(np.sin(delta[3:6]), np.cos(delta[3:6]))
+        starts.append(measured)
+        deltas.append(delta)
+        steps = max(
+            steps,
+            int(np.ceil(np.max(np.abs(delta[:3])) / max_xyz_step)),
+            int(np.ceil(np.max(np.abs(delta[3:6])) / max_angle_step)),
+        )
+
+    ramp = np.repeat(target[None, :], steps, axis=0)
+    fractions = np.arange(1, steps + 1, dtype=float) / steps
+    for arm in range(2):
+        pose_columns = slice(arm * 7, arm * 7 + 6)
+        ramp[:, pose_columns] = starts[arm] + fractions[:, None] * deltas[arm]
+
+    return ramp
 
 
 def resolve_replay_height(recorded, requested):

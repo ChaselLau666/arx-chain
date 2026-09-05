@@ -73,6 +73,7 @@ def collect_information(args, ros_operator, voice_engine, key_reader):
     timesteps = []
     actions = []
     actions_eef = []
+    actions_poscmd = []
     action_bases = []
     action_velocities = []
     count = 0
@@ -107,6 +108,10 @@ def collect_information(args, ros_operator, voice_engine, key_reader):
         # 获取动作和观察值
         action = deepcopy(obs_dict['qpos'])
         action_eef = deepcopy(obs_dict['eef'])
+        # This is the Cartesian command that actually enters vr_slave. Filtered
+        # collection launchers point RosOperator at /ARX_VR_*_filtered, while
+        # the vendor baseline leaves it on the raw /ARX_VR_* topics.
+        action_poscmd = deepcopy(action_dict['action_poscmd'])
         action_base = obs_dict['robot_base']
         action_velocity = obs_dict['base_velocity']
 
@@ -120,6 +125,7 @@ def collect_information(args, ros_operator, voice_engine, key_reader):
         timesteps.append(obs_dict)
         actions.append(action)
         actions_eef.append(action_eef)
+        actions_poscmd.append(action_poscmd)
         action_bases.append(action_base)
         action_velocities.append(action_velocity)
 
@@ -134,7 +140,7 @@ def collect_information(args, ros_operator, voice_engine, key_reader):
     print(f"\nlen(timesteps): {len(timesteps)}")
     print(f"len(actions)  : {len(actions)}")
 
-    return timesteps, actions, actions_eef, action_bases, action_velocities
+    return timesteps, actions, actions_eef, actions_poscmd, action_bases, action_velocities
 
 
 def compress_and_pad_images(data_dict, camera_names, use_depth, quality=50):
@@ -181,6 +187,11 @@ def create_and_write_hdf5(args, data_dict, dataset_path, data_size, padded_size,
             root.attrs['no_images'] = True
         if args.height is not None:
             root.attrs['height_command'] = float(args.height)
+        root.attrs['frame_rate'] = int(args.frame_rate)
+        root.attrs['action_poscmd_left_topic'] = str(args.poscmd_topics[0])
+        root.attrs['action_poscmd_right_topic'] = str(args.poscmd_topics[1])
+        root.attrs['action_poscmd_layout'] = \
+            '[left x,y,z,roll,pitch,yaw,gripper; right x,y,z,roll,pitch,yaw,gripper]'
 
         obs_dict = root.create_group('observations')
         image = obs_dict.create_group('images')
@@ -203,7 +214,8 @@ def create_and_write_hdf5(args, data_dict, dataset_path, data_size, padded_size,
         eef_dim = 14
         obs_specs = {'qpos': state_dim, 'eef': eef_dim, 'qvel': state_dim, 'effort': state_dim,
                      'robot_base': 6, 'base_velocity': 4}
-        act_specs = {'action': state_dim, 'action_eef': eef_dim, 'action_base': 6, 'action_velocity': 4}
+        act_specs = {'action': state_dim, 'action_eef': eef_dim,
+                     'action_poscmd': eef_dim, 'action_base': 6, 'action_velocity': 4}
 
         for name, dim in obs_specs.items():
             obs_dict.create_dataset(name, (data_size, dim))
@@ -335,7 +347,8 @@ def return_to_ready(ros_operator, timeout=12.0, min_wait=1.0, settle_window=0.4,
 
 
 # 保存数据函数
-def save_data(args, timesteps, actions, actions_eef, action_bases, action_velocities, ros_operator, dataset_path):
+def save_data(args, timesteps, actions, actions_eef, actions_poscmd,
+              action_bases, action_velocities, ros_operator, dataset_path):
     data_size = len(actions)
 
     # 数据字典
@@ -347,6 +360,7 @@ def save_data(args, timesteps, actions, actions_eef, action_bases, action_veloci
         '/observations/robot_base': [],
         '/action': [],
         '/action_eef': [],
+        '/action_poscmd': [],
         '/action_base': [],
         '/action_velocity': [],
     }
@@ -361,6 +375,7 @@ def save_data(args, timesteps, actions, actions_eef, action_bases, action_veloci
     while actions and rclpy.ok():
         action = actions.pop(0)  # 动作  当前动作
         action_eef = actions_eef.pop(0)
+        action_poscmd = actions_poscmd.pop(0)
         action_base = action_bases.pop(0)
         action_velocity = action_velocities.pop(0)
         ts = timesteps.pop(0)  # 奖励  前一帧
@@ -373,6 +388,7 @@ def save_data(args, timesteps, actions, actions_eef, action_bases, action_veloci
         data_dict['/observations/robot_base'].append(ts['robot_base'])
         data_dict['/action'].append(action)
         data_dict['/action_eef'].append(action_eef)
+        data_dict['/action_poscmd'].append(action_poscmd)
         data_dict['/action_base'].append(action_base)
         data_dict['/action_velocity'].append(action_velocity)
 
@@ -403,6 +419,13 @@ def main(args):
     rclpy.init()
 
     config = load_yaml(args.config)
+
+    if args.poscmd_topics is None:
+        args.poscmd_topics = [
+            config['arm_config']['controller_left_topic'],
+            config['arm_config']['controller_right_topic'],
+        ]
+    print(f'Recording arm PosCmd from: {args.poscmd_topics[0]} / {args.poscmd_topics[1]}')
 
     ros_operator = RosOperator(args, config, in_collect=True)
 
@@ -462,9 +485,10 @@ def main(args):
                 return_to_ready(ros_operator)
 
             print(f"Start recording episode {current_episode}")
-            timesteps, actions, actions_eef, action_bases, action_velocities = collect_information(
-                args, ros_operator, voice_engine, key_reader
-            )
+            (timesteps, actions, actions_eef, actions_poscmd,
+             action_bases, action_velocities) = collect_information(
+                 args, ros_operator, voice_engine, key_reader
+             )
 
             decision = prompt_episode_decision(
                 key_reader.read_key,
@@ -483,8 +507,8 @@ def main(args):
                 os.makedirs(datasets_dir)
 
             dataset_path = os.path.join(datasets_dir, "episode_" + str(current_episode))
-            save_data(args, timesteps, actions, actions_eef, action_bases, action_velocities,
-                      ros_operator, dataset_path)
+            save_data(args, timesteps, actions, actions_eef, actions_poscmd,
+                      action_bases, action_velocities, ros_operator, dataset_path)
 
             episode_num = episode_num + 1
             current_episode = current_episode + 1
@@ -540,6 +564,11 @@ def parse_arguments(known=False):
                         default=['/ARX_VR_L_filtered', '/ARX_VR_R_filtered'],
                         metavar=('LEFT', 'RIGHT'),
                         help='topics the arms subscribe to, left first')
+
+    parser.add_argument('--poscmd-topics', nargs=2, default=None,
+                        metavar=('LEFT', 'RIGHT'),
+                        help='PosCmd topics to save in /action_poscmd. Filtered launchers pass '
+                             'the exact topics consumed by vr_slave; defaults to config.yaml')
 
     parser.add_argument('--task', type=normalize_task_name, required=True,
                         help='task name and dataset subdirectory')

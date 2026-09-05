@@ -3,10 +3,10 @@ set -euo pipefail
 
 # Replay a recorded episode onto the arms.
 #
-# Unlike 01_collect.sh this script starts neither body nor VR. Replay is an
-# open-loop playback with nobody in the control loop, so every precondition is
-# checked and refused rather than repaired, and the replay itself runs in this
-# terminal so Ctrl+C reaches it directly.
+# Unlike 01_collect.sh this script never starts the physical VR producer or
+# cameras. It brings up body and exactly one arm stack when needed: remote_slave
+# for joint replay, or vr_slave for recorded PosCmd replay. The replay itself
+# runs in this terminal so Ctrl+C reaches it directly.
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # Domain must come from the machine (/etc/environment); see 03_inference.sh.
@@ -23,6 +23,42 @@ episode_path="${EPISODE}"
 if [[ ! -f "${episode_path}" ]]; then
   echo "Refused: episode not found: ${episode_path}" >&2
   exit 1
+fi
+
+# Read the mode early because it decides which mutually-exclusive arm stack to
+# start. replay.py validates the same value again through argparse.
+replay_mode=joint
+need_mode_value=false
+for arg in "$@"; do
+  if [[ "${need_mode_value}" == true ]]; then
+    replay_mode="${arg}"
+    need_mode_value=false
+    continue
+  fi
+  case "${arg}" in
+    --replay-mode) need_mode_value=true ;;
+    --replay-mode=*) replay_mode="${arg#*=}" ;;
+  esac
+done
+[[ "${need_mode_value}" == false ]] || {
+  echo "Refused: --replay-mode needs joint or poscmd." >&2; exit 1; }
+[[ "${replay_mode}" == joint || "${replay_mode}" == poscmd ]] || {
+  echo "Refused: unknown replay mode '${replay_mode}' (expected joint or poscmd)." >&2; exit 1; }
+echo "Replay mode: ${replay_mode}"
+
+# Refuse legacy or malformed episodes before CAN, body, or an arm controller is
+# started. Old episodes remain fully supported by the default joint mode.
+if [[ "${replay_mode}" == poscmd ]]; then
+  /home/arx/miniconda3/envs/act/bin/python -c '
+import h5py, sys
+with h5py.File(sys.argv[1], "r") as episode:
+    if "/action_poscmd" not in episode:
+        raise SystemExit(
+            "Refused: episode has no /action_poscmd; recollect it before PosCmd replay")
+    shape = episode["/action_poscmd"].shape
+    if len(shape) != 2 or shape[1] != 14 or shape[0] == 0:
+        raise SystemExit(f"Refused: /action_poscmd needs non-empty shape (T, 14), got {shape}")
+' "${episode_path}"
 fi
 
 # CAN first: body talks to the lift over can5, so it cannot come up before this.
@@ -89,64 +125,98 @@ else
   echo "Body is up."
 fi
 
-# VR must be absent. Its arm stack (v2_pos_control) subscribes to ARX_VR_* instead
-# of arm_master_*_status, so replay commands would be ignored while VR keeps
-# driving the same arms.
+# The physical VR producer must be absent in both modes. PosCmd replay owns the
+# raw ARX_VR_* topics itself; it reuses the vr_slave controllers, not the headset.
 if pgrep -f '/serial_port_node$' >/dev/null; then
   echo "Refused: the VR serial node is running; replay and VR would both drive the arms." >&2
   exit 1
 fi
-if ros2 topic info /ARX_VR_L 2>/dev/null | grep -qE 'Publisher count: [1-9]'; then
-  echo "Refused: /ARX_VR_L has a publisher. Stop VR before replaying." >&2
-  exit 1
-fi
-for vr_node in /vr_arm_l /vr_arm_r; do
-  if ros2 node list 2>/dev/null | grep -qx "${vr_node}"; then
-    echo "Refused: ${vr_node} is running, which is the VR teleop arm stack." >&2
-    echo "Replay needs the joint-command stack; stop v2_pos_control first." >&2
+for topic in /ARX_VR_L /ARX_VR_R; do
+  if ros2 topic info "${topic}" 2>/dev/null | grep -qE 'Publisher count: [1-9]'; then
+    echo "Refused: ${topic} has a publisher. Stop VR before replaying." >&2
     exit 1
   fi
 done
 
-# Joint-command arm stack: launch when absent, reuse when complete, refuse when partial.
+# Count both mutually-exclusive feedback pairs before choosing or launching a
+# controller. Never stop or replace a live arm stack from this script.
 arm_topics=0
 for topic in /arm_slave_l_status /arm_slave_r_status; do
   ros2 topic list 2>/dev/null | grep -qx "${topic}" && arm_topics=$((arm_topics + 1)) || true
 done
-if [[ ${arm_topics} -eq 0 ]]; then
-  # Started headless on purpose: this script must work over SSH, where a
-  # gnome-terminal launch fails with "cannot open display".
-  arm_log=/tmp/replay_arms.log
-  echo "Starting the joint-command arm stack; log: ${arm_log}"
-  echo "WARNING: the arms power up now and may home themselves. Stand clear."
-  setsid bash -c '
-    set +u
-    source /opt/ros/jazzy/setup.bash
-    source /home/arx/LIFT/ARX_X5/ROS2/X5_ws/install/setup.bash
-    set -u
-    exec ros2 launch arx_x5_controller v2_joint_control.launch.py
-  ' > "${arm_log}" 2>&1 < /dev/null &
+vr_arm_topics=0
+for topic in /arm_l_status_full /arm_r_status_full; do
+  ros2 topic list 2>/dev/null | grep -qx "${topic}" && vr_arm_topics=$((vr_arm_topics + 1)) || true
+done
 
+if [[ "${replay_mode}" == joint ]]; then
+  [[ ${vr_arm_topics} -eq 0 ]] || {
+    echo "Refused: a vr_slave arm stack is running (${vr_arm_topics}/2 feedback topics)." >&2
+    echo "Stop it safely before starting joint replay." >&2
+    exit 1
+  }
+  if [[ ${arm_topics} -eq 0 ]]; then
+    arm_log=/tmp/replay_arms.log
+    echo "Starting the joint-command arm stack; log: ${arm_log}"
+    echo "WARNING: the arms power up now and may home themselves. Stand clear."
+    setsid bash -c '
+      set +u
+      source /opt/ros/jazzy/setup.bash
+      source /home/arx/LIFT/ARX_X5/ROS2/X5_ws/install/setup.bash
+      set -u
+      exec ros2 launch arx_x5_controller v2_joint_control.launch.py
+    ' > "${arm_log}" 2>&1 < /dev/null &
+    expected_topics=(/arm_slave_l_status /arm_slave_r_status)
+  elif [[ ${arm_topics} -ne 2 ]]; then
+    echo "Refused: joint arm stack is partial (${arm_topics}/2 feedback topics)." >&2
+    exit 1
+  else
+    echo "Reusing the running joint-command arm stack."
+    expected_topics=()
+  fi
+else
+  [[ ${arm_topics} -eq 0 ]] || {
+    echo "Refused: a joint arm stack is running (${arm_topics}/2 feedback topics)." >&2
+    echo "Stop it safely before starting PosCmd replay." >&2
+    exit 1
+  }
+  if [[ ${vr_arm_topics} -eq 0 ]]; then
+    arm_log=/tmp/replay_poscmd_arms.log
+    echo "Starting the vr_slave PosCmd arm stack; log: ${arm_log}"
+    echo "WARNING: the arms power up now and may home themselves. Stand clear."
+    setsid bash -c '
+      set +u
+      source /opt/ros/jazzy/setup.bash
+      source /home/arx/LIFT/ARX_X5/ROS2/X5_ws/install/setup.bash
+      set -u
+      exec ros2 launch arx_x5_controller v2_pos_control.launch.py
+    ' > "${arm_log}" 2>&1 < /dev/null &
+    expected_topics=(/arm_l_status_full /arm_r_status_full)
+  elif [[ ${vr_arm_topics} -ne 2 ]]; then
+    echo "Refused: vr_slave arm stack is partial (${vr_arm_topics}/2 feedback topics)." >&2
+    exit 1
+  else
+    echo "Reusing the running vr_slave PosCmd arm stack."
+    expected_topics=()
+  fi
+fi
+
+if (( ${#expected_topics[@]} )); then
   ready=0
   for _ in $(seq 1 30); do
     sleep 1
     ready=0
-    for topic in /arm_slave_l_status /arm_slave_r_status; do
+    for topic in "${expected_topics[@]}"; do
       ros2 topic list 2>/dev/null | grep -qx "${topic}" && ready=$((ready + 1)) || true
     done
     [[ ${ready} -eq 2 ]] && break
   done
   if [[ ${ready} -ne 2 ]]; then
-    echo "Refused: arm stack did not come up (${ready}/2 feedback topics)." >&2
+    echo "Refused: ${replay_mode} arm stack did not come up (${ready}/2 feedback topics)." >&2
     echo "Check ${arm_log}" >&2
     exit 1
   fi
   echo "Arm stack is up."
-elif [[ ${arm_topics} -ne 2 ]]; then
-  echo "Refused: arm stack is partial (${arm_topics}/2 feedback topics)." >&2
-  exit 1
-else
-  echo "Reusing the running joint-command arm stack."
 fi
 
 # Cameras are intentionally not started: replay never reads images.
@@ -158,5 +228,6 @@ set -u
 
 echo "Episode: ${episode_path}"
 echo "Default mode is DRY-RUN; pass --execute to publish arm targets."
+echo "Default replay representation is joint; pass --replay-mode poscmd for newly recorded PosCmd."
 cd "${repo_root}/act"
 exec python replay.py --episode_path "${episode_path}" "$@"
