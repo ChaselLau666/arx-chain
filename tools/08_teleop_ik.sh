@@ -53,10 +53,27 @@ die() { echo "Refused: $*" >&2; exit 1; }
 
 cleanup_on_error() {
     local status=$?
-    if (( status != 0 )) && (( ${#pids[@]} )); then
-        echo "Startup failed; stopping what this script started." >&2
-        kill -INT "${pids[@]}" 2>/dev/null || true
-    fi
+    (( status != 0 )) && (( ${#pids[@]} )) || return 0
+    echo "Startup failed; stopping what this script started." >&2
+    # Each component was started with setsid, so its pid is also its process
+    # group: signalling the group reaches the ros2 launch/run wrapper and the
+    # controller binaries under it, which a signal to the wrapper alone does
+    # not. X5Controller and serial_port_node have been seen to ignore SIGINT
+    # and SIGTERM, so a failed launch used to leave half a stack behind.
+    local sig pid alive still
+    for sig in INT TERM KILL; do
+        alive=()
+        for pid in "${pids[@]}"; do kill -0 "$pid" 2>/dev/null && alive+=("$pid"); done
+        (( ${#alive[@]} )) || return 0
+        for pid in "${alive[@]}"; do kill "-$sig" -- "-$pid" 2>/dev/null || true; done
+        for _ in $(seq 1 10); do
+            sleep 0.3
+            still=0
+            for pid in "${alive[@]}"; do kill -0 "$pid" 2>/dev/null && still=1; done
+            (( still )) || return 0
+        done
+    done
+    echo "Some components did not stop even on SIGKILL: ${alive[*]}" >&2
 }
 trap cleanup_on_error EXIT
 
