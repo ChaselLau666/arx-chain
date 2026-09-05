@@ -178,6 +178,20 @@ class RosOperator(Node):
                                      self.config['robot_base_config']['robot_base_topic'],
                                      self.height_feedback_callback,
                                      10)
+        # 采集时的归位发布。X5Controller 无论 arm_control_type 是什么都会订阅
+        # /arx_joy（订阅建在模式分支外面），所以 vr_slave 模式下也能收到。
+        # 机器上没有别的东西发这个话题。
+        if self.in_collect and getattr(self.args, 'ready_pose', False):
+            self.arx_joy_publisher = self.create_publisher(Int32MultiArray, '/arx_joy', 10)
+            # vr_slave 模式的 X5Controller 只从一个话题读位姿，别的都不看，
+            # 所以不戴头显想命令一个位姿只能发到这里。发到哪取决于滤波节点起没起，
+            # 由 08_collect_ready_pose.sh 把它实际接的那一对传进来。
+            topics = getattr(self.args, 'ready_pose_topics',
+                             ['/ARX_VR_L_filtered', '/ARX_VR_R_filtered'])
+            self.ready_pose_publishers = [
+                self.create_publisher(self.pos_cmd, topic, 10) for topic in topics
+            ]
+
         # 推理模式相关发布
         if not self.in_collect and getattr(self.args, 'execute', True):
             self.follow_arm_left_publisher = self.create_publisher(
@@ -196,6 +210,36 @@ class RosOperator(Node):
                     self.config['robot_base_config']['robot_base_cmd_topic'],
                     10
                 )
+
+    def request_go_home(self):
+        """让每条手臂走向它启动时拿到的 go_home_position。
+
+        data[1] == 1 选 GO_HOME；data[0] 留 0，因为那里写 1 是重力补偿。
+        arxJoyCB 不检查长度就索引这两位，所以数组必须有两个元素。
+
+        发一条足够进入这个状态，但不足以留在里面：任何一帧 VR 消息都会把状态
+        恢复成 END_CONTROL。调用方要反复发直到手臂到位。
+        """
+        message = Int32MultiArray()
+        message.data = [0, 1]
+        self.arx_joy_publisher.publish(message)
+
+    def publish_ready_pose(self, poses):
+        """沿遥操本来的链路给每条手臂发一个末端位姿命令。
+
+        VrCmdCallback 每收到一条消息都会设 END_CONTROL，所以这既移动手臂，
+        又把它留在 VR 帧会留下的那个状态——不像 GO_HOME，下一帧 VR 就取消。
+        想按住某个位姿就反复发。
+
+        poses 是每条手臂一个 (xyzrpy, gripper) 对，左手在前。夹爪是 VR 单位：
+        控制器用之前会乘 -3.4/5。
+        """
+        for publisher, (pose, gripper) in zip(self.ready_pose_publishers, poses):
+            message = self.pos_cmd()
+            (message.x, message.y, message.z,
+             message.roll, message.pitch, message.yaw) = [float(v) for v in pose]
+            message.gripper = float(gripper)
+            publisher.publish(message)
 
     # 推理
     def follow_arm_publish(self, left, right):

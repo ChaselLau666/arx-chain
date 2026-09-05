@@ -10,10 +10,19 @@ change.
 Filtering here rather than on the recorded joint angles is what teleop-app
 does, and for the same reason: the pose is what feeds inverse kinematics, and a
 jump in the pose becomes a jump in the joint solution.
+
+It also carries the offset that makes the stream relative. The headset sends an
+absolute pose and is never told that anything else moved the arm, so on the
+first frame after the arm is parked it would command the arm to wherever the
+hand happens to be. Anchoring on the arm once, when a /arx_joy mute ends, and
+carrying the difference on everything after is the same trick Human DAgger plays
+on every takeover (_rebase_one in human_dagger_core.py): a still hand holds the
+arm where it is, a moving one carries on from there.
 """
 
 import os
 import sys
+import time
 
 from pathlib import Path
 
@@ -34,6 +43,8 @@ def build_node(args):
     import rclpy
     from rclpy.node import Node
     from arm_control.msg import PosCmd
+    from arx5_arm_msg.msg import RobotStatus
+    from std_msgs.msg import Int32MultiArray
     from scipy.spatial.transform import Rotation
 
     class VrPoseFilter(Node):
@@ -45,10 +56,56 @@ def build_node(args):
             self.passed = 0
             self.pub = self.create_publisher(PosCmd, args.out_topic, 10)
             self.create_subscription(PosCmd, args.in_topic, self.on_pose, 10)
+            # Stand aside while something is driving the arms home. data[1] == 1
+            # puts X5Controller in GO_HOME, but VrCmdCallback restores
+            # END_CONTROL on the very next pose published here, which cancels the
+            # move within a frame. Every message refreshes the window, so a mute
+            # lasts exactly as long as the sender keeps asking and no longer.
+            self.mute_until = 0.0
+            self.muted = False
+            self.create_subscription(Int32MultiArray, '/arx_joy', self.on_joy, 10)
+            # Where the arm actually is, which is the one thing the headset
+            # cannot know: the serial link carries nothing back to it.
+            self.arm_pos = None
+            self.arm_rot = None
+            self.offset_pos = np.zeros(3)
+            self.offset_rot = Rotation.identity()
+            if args.rebase:
+                self.create_subscription(RobotStatus, args.arm_status_topic,
+                                         self.on_arm_status, 10)
             self.create_timer(args.report_period, self.report)
             self.get_logger().info(
                 f'{args.in_topic} -> {args.out_topic}  tau={args.tau:.3f}s '
                 f'alpha={self.alpha:.4f} (cutoff {1 / (2 * np.pi * max(args.tau, 1e-9)):.2f} Hz)')
+
+        def on_joy(self, msg):
+            if len(msg.data) > 1 and msg.data[1] == 1:
+                if time.monotonic() >= self.mute_until:
+                    self.get_logger().info('/arx_joy GO_HOME: standing aside')
+                self.mute_until = time.monotonic() + args.home_mute
+
+        def on_arm_status(self, msg):
+            self.arm_pos = np.array(msg.end_pos[:3], dtype=float)
+            self.arm_rot = Rotation.from_euler('xyz', list(msg.end_pos[3:6]))
+
+        def rebase(self):
+            """Re-aim the stream at wherever the arm has just been left.
+
+            The rotation offset is applied on the right so that a rotation of
+            the hand becomes the same rotation of the tool: with
+            f(X) = X * P^-1 * R, f(P) is R and f(D * X) is D * f(X). Composing
+            on the left would satisfy the first and not the second.
+            """
+            if self.arm_pos is None or self.pos_prev is None:
+                self.get_logger().warn(
+                    f'nothing to re-aim against ({args.arm_status_topic} silent), '
+                    f'keeping the offset as it is')
+                return
+            self.offset_pos = self.arm_pos - self.pos_prev
+            self.offset_rot = self.rot_prev.inv() * self.arm_rot
+            self.get_logger().info(
+                f're-aimed onto the arm: {np.round(self.offset_pos * 1000, 1)} mm, '
+                f'{np.degrees(self.offset_rot.magnitude()):.1f} deg')
 
         def on_pose(self, msg):
             pos = np.array([msg.x, msg.y, msg.z], dtype=float)
@@ -72,8 +129,20 @@ def build_node(args):
                     setattr(out, field, getattr(msg, field))
             if hasattr(msg, 'temp_float_data'):
                 out.temp_float_data = msg.temp_float_data
-            out.x, out.y, out.z = (float(v) for v in self.pos_prev)
-            out.roll, out.pitch, out.yaw = (float(v) for v in self.rot_prev.as_euler('xyz'))
+            # Filter state above is kept current even while muted, so
+            # publishing resumes from where the hand is now rather than from a
+            # stale pose. The mute ending is what says the arm has been left
+            # somewhere new, so that is where the stream is re-aimed.
+            muted = time.monotonic() < self.mute_until
+            if self.muted and not muted and args.rebase:
+                self.rebase()
+            self.muted = muted
+            if muted:
+                return
+
+            out.x, out.y, out.z = (float(v) for v in self.pos_prev + self.offset_pos)
+            out.roll, out.pitch, out.yaw = (
+                float(v) for v in (self.rot_prev * self.offset_rot).as_euler('xyz'))
             self.pub.publish(out)
             self.passed += 1
 
@@ -104,6 +173,17 @@ def parse_args():
     parser.add_argument('--dt', type=float, default=1 / 60.0,
                         help='expected input period, used to derive alpha')
     parser.add_argument('--node-name', default='vr_pose_filter')
+    parser.add_argument('--home-mute', type=float, default=0.5,
+                        help='seconds to stop publishing after each /arx_joy GO_HOME message. '
+                             'Every message refreshes it, so whoever is driving the arms home '
+                             'sets the duration by how long it keeps asking')
+    parser.add_argument('--arm-status-topic', default='/arm_l_status_full',
+                        help='where the arm on this side reports its end-effector pose, read '
+                             'to re-aim the stream after the arm is parked')
+    parser.add_argument('--no-rebase', dest='rebase', action='store_false',
+                        help='forward poses as they come, without re-aiming them onto the '
+                             'arm when a mute ends. The arm is then pulled back to wherever '
+                             'the headset last commanded it')
     parser.add_argument('--report-period', type=float, default=2.0)
 
     return parser.parse_known_args()[0]

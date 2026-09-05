@@ -24,6 +24,7 @@ import pyttsx3
 
 import numpy as np
 
+from collections import deque
 from copy import deepcopy
 
 from utils.ros_operator import Rate, RosOperator
@@ -31,6 +32,8 @@ from utils.setup_loader import setup_loader
 from collection_paths import normalize_task_name, task_dataset_dir
 from collection_ui import TerminalKeyReader, prompt_episode_decision, prompt_start_decision
 from lift_height import configure_fixed_height
+from ready_pose import (READY_ARM_NODES, READY_GRIPPER, arms_have_arrived,
+                        joints_are_still, vr_gripper_command)
 
 np.set_printoptions(linewidth=200)
 
@@ -211,6 +214,126 @@ def create_and_write_hdf5(args, data_dict, dataset_path, data_size, padded_size,
             root[name][...] = arr
 
 
+# 归位到 ready pose ----------------------------------------------------------
+# 归位的目标只写在启动脚本里，由它传给 X5Controller 的 go_home_position，这里读回来
+# 用作校验，避免同一组数值在脚本和 Python 两处各存一份、改一处忘另一处。
+def read_ready_pose(node, arm_nodes=READY_ARM_NODES, timeout=4.0):
+    """把每条手臂启动时拿到的 go_home_position 读回来。
+
+    读不到就返回 None，此时调用方退化成只检查手臂停稳，并在日志里说清楚。
+    """
+    from rclpy.parameter_client import AsyncParameterClient
+
+    poses = []
+    for name in arm_nodes:
+        client = AsyncParameterClient(node, name)
+        if not client.wait_for_services(timeout_sec=timeout):
+            return None
+        future = client.get_parameters(['go_home_position'])
+        deadline = time.monotonic() + timeout
+        while not future.done() and rclpy.ok() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        if not future.done() or future.result() is None:
+            return None
+        values = future.result().values
+        if not values or not values[0].double_array_value:
+            return None
+        poses.append(np.array(values[0].double_array_value, dtype=float))
+    return np.concatenate(poses)
+
+
+def hold_ready_pose(ros_operator, seconds=0.4, period=0.02):
+    """把手臂刚到达的位姿按住，用遥操本来的命令方式。
+
+    GO_HOME 能把手臂送到位，但留下的状态会被下一帧 VR 消息取消。把它已经在的
+    位姿作为末端命令重发一遍，手臂就留在 END_CONTROL 按住不动，episode 从遥操
+    本来运行的状态开始，而不是从两种状态互相打架开始。
+
+    位姿是从手臂反馈读回来的，不在这里另写一份，所以它跟着 go_home_position 走。
+    """
+    poses = []
+    for arm, gripper in zip((ros_operator.follow_left_arm_deque,
+                             ros_operator.follow_right_arm_deque), READY_GRIPPER):
+        if not arm:
+            print('WARNING: 没有手臂反馈可以读回位姿，不按住。')
+            return False
+        poses.append((np.array(arm[-1].end_pos, dtype=float), vr_gripper_command(gripper)))
+
+    end = time.time() + seconds
+    while time.time() < end:
+        ros_operator.publish_ready_pose(poses)
+        time.sleep(period)
+    print(f'  已作为末端命令按住：左 {np.round(poses[0][0][:3], 4)} 右 {np.round(poses[1][0][:3], 4)}')
+    return True
+
+
+def return_to_ready(ros_operator, timeout=12.0, min_wait=1.0, settle_window=0.4,
+                    tolerance=0.004, arrival_tolerance=0.05):
+    """把两条手臂走到它们控制器启动时拿到的 go_home_position。
+
+    /arx_joy 要反复发，这一条消息干两件事：把手臂按在 GO_HOME 状态里，对抗每一帧
+    VR 消息都会恢复的 END_CONTROL；同时让 vr_pose_filter 静音，这样 VR 流不会和
+    归位打架。停止发布滤波器就恢复，所以静音时长正好等于归位耗时。目标写在每条
+    手臂的 go_home_position 参数里，由 tools/08_collect_ready_pose.sh 传入，这里
+    刻意不重复一份。
+
+    停下来不等于到位。静音没生效时——SKIP_FILTER=1 下没有滤波器可静音，或者跑的是
+    旧版滤波器——GO_HOME 和 END_CONTROL 会在半路打成僵持，把那当成成功就会让这个
+    episode 的第一帧和别的不一样却不说。所以只要能读到 go_home_position，就用它
+    判定是否真的到位。
+
+    返回 True 表示两条手臂都到了 ready pose 且已静止。
+    """
+    def joints():
+        both = []
+        for arm in (ros_operator.follow_left_arm_deque, ros_operator.follow_right_arm_deque):
+            if not arm:
+                return None
+            both.append(np.array(arm[-1].joint_pos[:6], dtype=float))
+        return np.concatenate(both)
+
+    target = read_ready_pose(ros_operator)
+    if target is None:
+        print('读不到手臂的 go_home_position，只能检查它们是否停稳。')
+
+    print('正在把手臂归位到 ready pose；请与手臂保持距离。')
+    start = time.time()
+    recent = deque()
+    while time.time() - start < timeout:
+        ros_operator.request_go_home()
+        time.sleep(0.05)
+        current = joints()
+        if current is None:
+            continue
+        now = time.time()
+        recent.append((now, current))
+        while recent and now - recent[0][0] > settle_window:
+            recent.popleft()
+        # min_wait 覆盖手臂还没开始动的情况：没有它，最初几个采样天然相同、
+        # 会被当成已经停稳。
+        if now - start < min_wait:
+            continue
+        if not joints_are_still(recent, tolerance, settle_window):
+            continue
+        if not arms_have_arrived(current, target, arrival_tolerance):
+            continue          # 停了，但不在它被要求去的地方
+        left, right = np.degrees(current[:6]), np.degrees(current[6:])
+        print(f'  手臂归位耗时 {now - start:.1f}s：左 {np.round(left, 1)} 右 {np.round(right, 1)}')
+        hold_ready_pose(ros_operator)
+        return True
+
+    current = joints()
+    where = np.round(np.degrees(current), 1) if current is not None else 'unknown'
+    if target is not None and current is not None:
+        gap = np.degrees(np.abs(current - target).max())
+        print(f'WARNING: {timeout:.0f}s 后手臂距 ready pose 还有 {gap:.1f} 度，停在 {where}。'
+              f'仍会录制，所以这个 episode 的起点和别的不一样。滤波节点是否在运行？')
+    else:
+        print(f'WARNING: {timeout:.0f}s 后手臂仍未停稳，在 {where}。仍会录制。'
+              f'滤波节点是否在运行可被 /arx_joy 静音，或有东西挡住手臂？')
+    return False
+
+
 # 保存数据函数
 def save_data(args, timesteps, actions, actions_eef, action_bases, action_velocities, ros_operator, dataset_path):
     data_size = len(actions)
@@ -332,6 +455,12 @@ def main(args):
                 print('Collection stopped while idle; no episode was recorded.')
                 break
 
+            # 放在这里而不是保存/丢弃之后：手臂一旦回到 ready pose，操作者下次
+            # 动手就会把它带走，所以只有在即将开始录制时归位，才真的让每个
+            # episode 的第一帧一致。
+            if args.ready_pose:
+                return_to_ready(ros_operator)
+
             print(f"Start recording episode {current_episode}")
             timesteps, actions, actions_eef, action_bases, action_velocities = collect_information(
                 args, ros_operator, voice_engine, key_reader
@@ -397,6 +526,20 @@ def parse_arguments(known=False):
                         help='deprecated compatibility flag; single-key collection is always enabled')
     parser.add_argument('--height', type=float, default=None,
                         help='fixed lift command in [0, 20]; omitted means follow VR height')
+
+    # 每个 episode 录制前把手臂归位到启动时设定的 go_home_position。默认关闭，
+    # 因为只有用 ros2 run 传了 go_home_position 的启动脚本（tools/08_）才有意义；
+    # 走厂商 v2_pos_control.launch.py 的 01_collect.sh 没有那个参数。
+    parser.add_argument('--ready_pose', action='store_true',
+                        help='park both arms at go_home_position before each episode records')
+    # An arm in vr_slave mode reads poses from exactly one topic, so commanding
+    # the ready pose means publishing where that arm is listening. Which topic
+    # that is depends on whether the pose filters were started, so the launcher
+    # passes the pair it actually wired.
+    parser.add_argument('--ready_pose_topics', nargs=2,
+                        default=['/ARX_VR_L_filtered', '/ARX_VR_R_filtered'],
+                        metavar=('LEFT', 'RIGHT'),
+                        help='topics the arms subscribe to, left first')
 
     parser.add_argument('--task', type=normalize_task_name, required=True,
                         help='task name and dataset subdirectory')
