@@ -21,6 +21,10 @@ EE_FRAME = 'link6'
 # FK result. Identical for both arms; per-frame spread over an episode is 0.
 HOME_EE = np.array([0.0952, 0.0010, 0.1565])
 
+# The home configuration the vendor app's "reset" returns to: every joint at
+# zero. Recorded episodes start within a few milliradians of this.
+HOME_Q = np.zeros(6)
+
 # Extrinsic xyz, i.e. scipy Rotation.from_euler('xyz', [roll, pitch, yaw]).
 # The "# eef:ZXY" comment in ros_operator.py is wrong; xyz matched to 0.000 deg.
 EULER = 'xyz'

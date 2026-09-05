@@ -25,6 +25,7 @@ service rather than a controller button:
 
     ros2 service call /vr_ik_r/engage std_srvs/srv/Trigger
     ros2 service call /vr_ik_r/disengage std_srvs/srv/Trigger
+    ros2 service call /vr_ik_r/home std_srvs/srv/Trigger
 
 --auto-engage restores the earlier behaviour for a stream the app has
 already zeroed: the absolute VR pose is followed, once it comes within
@@ -39,6 +40,9 @@ already zeroed: the absolute VR pose is followed, once it comes within
             that stops improving over --stall-window messages means the
             target left the workspace; publishing stops and the node
             returns to ARMED holding the last command.
+  HOMING    the vendor app's "reset": walking every joint to zero at
+            --max-velocity on a timer, ignoring the VR pose, then ARMED.
+            /disengage aborts it and holds where it is.
 
 The report line always says whether the VR pose has moved in the last
 second and how long since it was last received, because "is the controller
@@ -58,9 +62,10 @@ import numpy as np
 from scipy.spatial.transform import Rotation as R
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from x5_model import EE_FRAME, EULER, GRIPPER_SCALE, JOINTS, kinematic_urdf, target_transform  # noqa: E402
+from x5_model import EE_FRAME, GRIPPER_SCALE, HOME_Q, JOINTS, kinematic_urdf, target_transform  # noqa: E402
 
-WAITING, ARMED, TRACKING = 'WAITING', 'ARMED', 'TRACKING'
+WAITING, ARMED, TRACKING, HOMING = 'WAITING', 'ARMED', 'TRACKING', 'HOMING'
+HOME_TOLERANCE = np.radians(0.5)
 
 
 def rotation_angle_deg(a: np.ndarray, b: np.ndarray) -> float:
@@ -102,12 +107,17 @@ def build_node(args):
             self.vr_p = self.vr_R = None                 # latest VR pose, base frame
             self.vr_recent = collections.deque()         # (t, p) over the last second
             self.origin = None                           # (p_arm0, R_arm0, p_vr0, R_vr0) set at engage
+            self.last_gripper = 5.0 * GRIPPER_SCALE      # what the idle VR stream commands: open
 
             self.pub = self.create_publisher(RobotStatus, args.out_topic, 10) if args.execute else None
             self.create_subscription(RobotStatus, args.feedback_topic, self.on_feedback, 10)
             self.create_subscription(PosCmd, args.in_topic, self.on_pose, 10)
             self.create_service(Trigger, '~/engage', self.srv_engage)
             self.create_service(Trigger, '~/disengage', self.srv_disengage)
+            self.create_service(Trigger, '~/home', self.srv_home)
+            # Homing runs on its own clock: it must not depend on VR messages,
+            # which may be exactly what has gone away.
+            self.create_timer(args.dt, self.homing_tick)
             self.create_timer(args.report_period, self.report)
             mode = ('auto-engage on the absolute VR pose within '
                     f'{args.engage_distance * 1000:.0f} mm / {args.engage_angle:.0f} deg'
@@ -132,7 +142,8 @@ def build_node(args):
             self.vr_recent.append((now, self.vr_p))
             while self.vr_recent and now - self.vr_recent[0][0] > 1.0:
                 self.vr_recent.popleft()
-            if self.state == WAITING:
+            self.last_gripper = float(msg.gripper) * GRIPPER_SCALE
+            if self.state in (WAITING, HOMING):
                 return
 
             if self.state == ARMED:
@@ -180,12 +191,36 @@ def build_node(args):
                                f'{self.res_hist.maxlen} messages - target is out of reach')
                 return
 
-            if self.pub is not None:
-                out = RobotStatus()
-                out.header.stamp = self.get_clock().now().to_msg()
-                out.joint_pos[:6] = q.tolist()
-                out.joint_pos[6] = float(msg.gripper) * GRIPPER_SCALE
-                self.pub.publish(out)
+            self.publish(q)
+
+        # --- homing ------------------------------------------------------------------
+        def homing_tick(self):
+            if self.state != HOMING:
+                return
+            limit = args.max_velocity * args.dt
+            remaining = HOME_Q - self.last_q
+            if np.abs(remaining).max() <= HOME_TOLERANCE:
+                self.publish(HOME_Q)
+                self.seed(HOME_Q)
+                self.set_state(ARMED, 'at home')
+                return
+            self.last_q = self.last_q + np.clip(remaining, -limit, limit)
+            self.publish(self.last_q)
+
+        def srv_home(self, _req, resp):
+            if self.state == WAITING:
+                resp.success, resp.message = False, 'no arm feedback yet'
+            elif self.state == HOMING:
+                resp.success, resp.message = False, 'already homing'
+            else:
+                # Walk from where the arm actually is, not from the solver's last
+                # command: while holding, the two can differ.
+                self.origin = None
+                self.last_q = self.q_feedback.copy()
+                far = np.degrees(np.abs(self.q_feedback - HOME_Q).max())
+                self.set_state(HOMING, f'homing by request, {far:.1f} deg to go')
+                resp.success, resp.message = True, f'homing, {far:.1f} deg to go at {args.max_velocity:.2f} rad/s'
+            return resp
 
         # --- engage / disengage --------------------------------------------------
         def engage(self, why, now=None):
@@ -206,6 +241,8 @@ def build_node(args):
         def srv_engage(self, _req, resp):
             if self.state == WAITING:
                 resp.success, resp.message = False, 'no arm feedback yet'
+            elif self.state == HOMING:
+                resp.success, resp.message = False, 'homing; wait for it to finish or disengage to abort'
             elif self.state == TRACKING:
                 resp.success, resp.message = False, 'already tracking; disengage first to re-anchor'
             elif self.t_last_pose is None or time.monotonic() - self.t_last_pose > 0.5:
@@ -224,9 +261,22 @@ def build_node(args):
             if self.state == TRACKING:
                 self.disengage('disengaged by request')
                 resp.success, resp.message = True, 'holding'
+            elif self.state == HOMING:
+                self.seed(self.last_q)
+                self.set_state(ARMED, 'homing aborted by request; holding')
+                resp.success, resp.message = True, 'homing aborted; holding'
             else:
-                resp.success, resp.message = False, f'not tracking (state {self.state})'
+                resp.success, resp.message = False, f'nothing to disengage (state {self.state})'
             return resp
+
+        def publish(self, q):
+            if self.pub is None:
+                return
+            out = RobotStatus()
+            out.header.stamp = self.get_clock().now().to_msg()
+            out.joint_pos[:6] = np.asarray(q, dtype=float).tolist()
+            out.joint_pos[6] = self.last_gripper
+            self.pub.publish(out)
 
         # --- helpers -------------------------------------------------------------
         def set_state(self, state, why):
@@ -263,6 +313,8 @@ def build_node(args):
                     f'the headset awake, and the USB cable in?')
             elif self.state == WAITING:
                 self.get_logger().info('WAITING: no arm feedback yet')
+            elif self.state == HOMING:
+                self.get_logger().info(f'HOMING: {np.degrees(np.abs(HOME_Q - self.last_q).max()):.1f} deg to go')
             elif self.state == ARMED:
                 if self.t_last_pose is None:
                     self.get_logger().info('ARMED: no VR pose yet')

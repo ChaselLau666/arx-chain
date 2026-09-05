@@ -235,8 +235,9 @@ else
     for side in "${sides[@]}"; do
         echo "  ros2 service call /vr_ik_${side:0:1}/engage std_srvs/srv/Trigger"
     done
-    echo "Disengage (hold) with the matching /disengage service. The log says whether the"
-    echo "VR pose is actually moving - if it is not, the controller is not tracking."
+    echo "Disengage (hold) with the matching /disengage service, and /home walks the arm"
+    echo "back to zero like the app's reset. The log says whether the VR pose is actually"
+    echo "moving - if it is not, the controller is not tracking."
 fi
 echo "  tail -f ${LOG_DIR}/vr_ik_${sides[0]:0:1}.log"
 echo
