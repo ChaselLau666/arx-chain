@@ -34,6 +34,14 @@ SKIP_CAMERAS=${SKIP_CAMERAS:-0}
 # Starts nothing and reuses whatever is already running, for when the
 # collector alone needs restarting. Verified, not assumed; see below.
 COLLECTOR_ONLY=${COLLECTOR_ONLY:-0}
+# Where each arm parks. X5Controller hands this to the SDK at construction,
+# so the arm walks here as it comes up and every episode starts from the same
+# place, and publishing [0, 1] on /arx_joy sends it back - that subscription
+# is created outside the mode branches, so it works in vr_slave too.
+# Measured on this robot; the vendor's own v2_collect.yaml carries
+# [0, 0.948, 0.858, -0.573, 0, 0], which is the same pose within 0.2 deg.
+READY_POSE_L=${READY_POSE_L:-[-0.0002, 0.9447, 0.8597, -0.5755, 0.0006, -0.0013]}
+READY_POSE_R=${READY_POSE_R:-[-0.0002, 0.9466, 0.8604, -0.5724, -0.0002, -0.0006]}
 LOG_DIR=${LOG_DIR:-$HOME/collect_logs}
 ACT_PYTHON=${ACT_PYTHON:-/home/arx/miniconda3/envs/act/bin/python}
 LIFT_WS=/home/arx/LIFT/body/ROS2
@@ -219,7 +227,7 @@ if (( ! COLLECTOR_ONLY )); then
     echo "WARNING: the arms power up now and may home themselves. Stand clear."
 
     start_arm() {
-        local node=$1 can=$2 pub=$3 sub=$4
+        local node=$1 can=$2 pub=$3 sub=$4 home=$5
         start_component "$node" \
             ros2 run arx_x5_controller X5Controller --ros-args \
             -r __node:="$node" \
@@ -227,16 +235,17 @@ if (( ! COLLECTOR_ONLY )); then
             -p arm_control_type:=vr_slave \
             -p arm_end_type:=2 \
             -p arm_pub_topic_name:="$pub" \
-            -p arm_sub_topic_name:="$sub"
+            -p arm_sub_topic_name:="$sub" \
+            -p go_home_position:="$home"
     }
 
     if [[ "${SMOOTH_TAU}" == "0" || "${SMOOTH_TAU}" == "0.0" ]]; then
         echo "  SMOOTH_TAU=0: arms take the raw VR stream, matching 01_collect.sh"
-        start_arm vr_arm_l can1 arm_l_status /ARX_VR_L
-        start_arm vr_arm_r can3 arm_r_status /ARX_VR_R
+        start_arm vr_arm_l can1 arm_l_status /ARX_VR_L "${READY_POSE_L}"
+        start_arm vr_arm_r can3 arm_r_status /ARX_VR_R "${READY_POSE_R}"
     else
-        start_arm vr_arm_l can1 arm_l_status "${FILTERED_L}"
-        start_arm vr_arm_r can3 arm_r_status "${FILTERED_R}"
+        start_arm vr_arm_l can1 arm_l_status "${FILTERED_L}" "${READY_POSE_L}"
+        start_arm vr_arm_r can3 arm_r_status "${FILTERED_R}" "${READY_POSE_R}"
     fi
     wait_for_topic /arm_l_status_full 25
     wait_for_topic /arm_r_status_full 25
