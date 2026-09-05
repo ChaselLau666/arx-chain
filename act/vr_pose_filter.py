@@ -36,6 +36,7 @@ def build_node(args):
     from rclpy.node import Node
     from arm_control.msg import PosCmd
     from std_msgs.msg import Int32MultiArray
+    from arx5_arm_msg.msg import RobotStatus
     from scipy.spatial.transform import Rotation
 
     class VrPoseFilter(Node):
@@ -53,7 +54,18 @@ def build_node(args):
             # frame. The window is short and refreshed by every message, so a mute
             # lasts exactly as long as the sender keeps asking and no longer.
             self.mute_until = 0.0
+            self.muted = False
             self.create_subscription(Int32MultiArray, '/arx_joy', self.on_joy, 10)
+            # Where the arm actually is, which is the one thing the headset cannot
+            # know: the serial link carries nothing back to it. Reading it here is
+            # what lets the stream be re-aimed after something else moves the arm.
+            self.arm_pos = None
+            self.arm_rot = None
+            self.offset_pos = np.zeros(3)
+            self.offset_rot = Rotation.identity()
+            if args.rebase:
+                self.create_subscription(RobotStatus, args.arm_status_topic,
+                                         self.on_arm_status, 10)
             self.create_timer(args.report_period, self.report)
             self.get_logger().info(
                 f'{args.in_topic} -> {args.out_topic}  tau={args.tau:.3f}s '
@@ -64,6 +76,35 @@ def build_node(args):
                 if time.monotonic() >= self.mute_until:
                     self.get_logger().info('/arx_joy GO_HOME: standing aside')
                 self.mute_until = time.monotonic() + args.home_mute
+
+        def on_arm_status(self, msg):
+            self.arm_pos = np.array(msg.end_pos[:3], dtype=float)
+            self.arm_rot = Rotation.from_euler('xyz', list(msg.end_pos[3:6]))
+
+        def rebase(self):
+            """Re-aim the stream at wherever the arm has just been left.
+
+            The headset is never told that something else moved the arm, so it
+            goes on sending the pose it last commanded and would pull the arm
+            straight back out of the ready pose. Measuring the gap once, here,
+            and carrying it on everything that follows makes a frozen stream hold
+            the arm where it is and a moving one carry on from there.
+
+            The rotation offset is applied on the right so that a rotation of the
+            hand becomes the same rotation of the tool: with f(X) = X * P^-1 * R,
+            f(P) is R and f(D * X) is D * f(X). Composing on the left would
+            satisfy the first and not the second.
+            """
+            if self.arm_pos is None or self.pos_prev is None:
+                self.get_logger().warn(
+                    f'nothing to re-aim against ({args.arm_status_topic} silent), '
+                    f'keeping the offset as it is')
+                return
+            self.offset_pos = self.arm_pos - self.pos_prev
+            self.offset_rot = self.rot_prev.inv() * self.arm_rot
+            self.get_logger().info(
+                f're-aimed onto the arm: {np.round(self.offset_pos * 1000, 1)} mm, '
+                f'{np.degrees(self.offset_rot.magnitude()):.1f} deg')
 
         def on_pose(self, msg):
             pos = np.array([msg.x, msg.y, msg.z], dtype=float)
@@ -87,12 +128,20 @@ def build_node(args):
                     setattr(out, field, getattr(msg, field))
             if hasattr(msg, 'temp_float_data'):
                 out.temp_float_data = msg.temp_float_data
-            out.x, out.y, out.z = (float(v) for v in self.pos_prev)
-            out.roll, out.pitch, out.yaw = (float(v) for v in self.rot_prev.as_euler('xyz'))
             # Filter state above is kept current even while muted, so publishing
             # resumes from where the hand is now rather than from a stale pose.
-            if time.monotonic() < self.mute_until:
+            # The mute ending is what says the arm has been left somewhere new,
+            # so that is where the stream is re-aimed.
+            muted = time.monotonic() < self.mute_until
+            if self.muted and not muted and args.rebase:
+                self.rebase()
+            self.muted = muted
+            if muted:
                 return
+
+            out.x, out.y, out.z = (float(v) for v in self.pos_prev + self.offset_pos)
+            out.roll, out.pitch, out.yaw = (
+                float(v) for v in (self.rot_prev * self.offset_rot).as_euler('xyz'))
             self.pub.publish(out)
             self.passed += 1
 
@@ -127,6 +176,13 @@ def parse_args():
                         help='seconds to stop publishing after each /arx_joy GO_HOME message. '
                              'Every message refreshes it, so whoever is driving the arms home '
                              'sets the duration by how long it keeps asking')
+    parser.add_argument('--arm-status-topic', default='/arm_l_status_full',
+                        help='where the arm on this side reports its end-effector pose, read '
+                             'to re-aim the stream after the arm is parked')
+    parser.add_argument('--no-rebase', dest='rebase', action='store_false',
+                        help='forward poses as they come, without re-aiming them onto the '
+                             'arm when a mute ends. The arm is then pulled back to wherever '
+                             'the headset last commanded it')
     parser.add_argument('--report-period', type=float, default=2.0)
 
     return parser.parse_known_args()[0]

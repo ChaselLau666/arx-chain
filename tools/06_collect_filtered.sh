@@ -296,10 +296,12 @@ if (( ! COLLECTOR_ONLY )); then
     if [[ "${SMOOTH_TAU}" != "0" && "${SMOOTH_TAU}" != "0.0" ]]; then
         start_component vr_filter_l "$ACT_PYTHON" "${repo_root}/act/vr_pose_filter.py" \
             --in-topic /ARX_VR_L --out-topic "${FILTERED_L}" \
-            --tau "${SMOOTH_TAU}" --node-name vr_pose_filter_l
+            --tau "${SMOOTH_TAU}" --node-name vr_pose_filter_l \
+            --arm-status-topic /arm_l_status_full
         start_component vr_filter_r "$ACT_PYTHON" "${repo_root}/act/vr_pose_filter.py" \
             --in-topic /ARX_VR_R --out-topic "${FILTERED_R}" \
-            --tau "${SMOOTH_TAU}" --node-name vr_pose_filter_r
+            --tau "${SMOOTH_TAU}" --node-name vr_pose_filter_r \
+            --arm-status-topic /arm_r_status_full
         wait_for_topic "${FILTERED_L}" 20
         wait_for_topic "${FILTERED_R}" 20
         echo "  VR poses are low-passed at tau=${SMOOTH_TAU}s before reaching the arms"
