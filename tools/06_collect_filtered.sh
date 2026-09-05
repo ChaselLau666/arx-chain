@@ -53,6 +53,15 @@ REALSENSE_WS=${REALSENSE_WS:-/home/arx/ROS2_LIFT_Play/realsense}
 CAMERA_PROFILE=${CAMERA_PROFILE:-640x480x90}
 FILTERED_L=/ARX_VR_L_filtered
 FILTERED_R=/ARX_VR_R_filtered
+# Which topic each arm ends up subscribed to. collect.py commands the ready pose
+# on these, and reaching an arm means publishing where that arm is listening.
+if [[ "${SMOOTH_TAU:-}" == "0" || "${SMOOTH_TAU:-}" == "0.0" ]]; then
+    ARM_POSE_L=/ARX_VR_L
+    ARM_POSE_R=/ARX_VR_R
+else
+    ARM_POSE_L=${FILTERED_L}
+    ARM_POSE_R=${FILTERED_R}
+fi
 
 mkdir -p "$LOG_DIR"
 pids=()
@@ -239,14 +248,11 @@ if (( ! COLLECTOR_ONLY )); then
             -p go_home_position:="$home"
     }
 
-    if [[ "${SMOOTH_TAU}" == "0" || "${SMOOTH_TAU}" == "0.0" ]]; then
+    if [[ "${ARM_POSE_L}" == "/ARX_VR_L" ]]; then
         echo "  SMOOTH_TAU=0: arms take the raw VR stream, matching 01_collect.sh"
-        start_arm vr_arm_l can1 arm_l_status /ARX_VR_L "${READY_POSE_L}"
-        start_arm vr_arm_r can3 arm_r_status /ARX_VR_R "${READY_POSE_R}"
-    else
-        start_arm vr_arm_l can1 arm_l_status "${FILTERED_L}" "${READY_POSE_L}"
-        start_arm vr_arm_r can3 arm_r_status "${FILTERED_R}" "${READY_POSE_R}"
     fi
+    start_arm vr_arm_l can1 arm_l_status "${ARM_POSE_L}" "${READY_POSE_L}"
+    start_arm vr_arm_r can3 arm_r_status "${ARM_POSE_R}" "${READY_POSE_R}"
     wait_for_topic /arm_l_status_full 25
     wait_for_topic /arm_r_status_full 25
 
@@ -312,7 +318,8 @@ set +u
 source /home/arx/miniconda3/etc/profile.d/conda.sh
 conda activate act
 set -u
-collect_args=(--episode_idx -1 --height "${LIFT_HEIGHT}" --task "${TASK_NAME}")
+collect_args=(--episode_idx -1 --height "${LIFT_HEIGHT}" --task "${TASK_NAME}"
+              --ready_pose_topics "${ARM_POSE_L}" "${ARM_POSE_R}")
 if (( SKIP_CAMERAS )); then
     # --camera_names with no values leaves the list empty, which switches off
     # the per-camera checks in get_observation. Written outside datasets/ so an

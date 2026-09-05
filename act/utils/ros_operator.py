@@ -185,6 +185,16 @@ class RosOperator(Node):
         # joint modes. Nothing else on the robot publishes here.
         self.arx_joy_publisher = self.create_publisher(Int32MultiArray, '/arx_joy', 10)
 
+        # An X5Controller in vr_slave mode reads poses from one topic and nothing
+        # else, so publishing there is the only way to command a pose without the
+        # headset. Which topic that is depends on whether the pose filters were
+        # started, so 06_collect_filtered.sh passes the pair it actually wired.
+        topics = getattr(self.args, 'ready_pose_topics',
+                         ['/ARX_VR_L_filtered', '/ARX_VR_R_filtered'])
+        self.ready_pose_publishers = [
+            self.create_publisher(self.pos_cmd, topic, 10) for topic in topics
+        ]
+
         # 推理模式相关发布
         if not self.in_collect and getattr(self.args, 'execute', True):
             self.follow_arm_left_publisher = self.create_publisher(
@@ -217,6 +227,24 @@ class RosOperator(Node):
         message = Int32MultiArray()
         message.data = [0, 1]
         self.arx_joy_publisher.publish(message)
+
+    def publish_ready_pose(self, poses):
+        """Command an end-effector pose to each arm, down the path teleop uses.
+
+        VrCmdCallback sets END_CONTROL on every message, so this both moves the
+        arm and leaves it in the state a VR frame would - unlike GO_HOME, which
+        the next VR frame cancels. Callers repeat it for as long as they want the
+        pose held.
+
+        poses is one (xyzrpy, gripper) pair per arm, left first. The gripper is in
+        VR units: the controller multiplies it by -3.4/5 before use.
+        """
+        for publisher, (pose, gripper) in zip(self.ready_pose_publishers, poses):
+            message = self.pos_cmd()
+            (message.x, message.y, message.z,
+             message.roll, message.pitch, message.yaw) = [float(v) for v in pose]
+            message.gripper = float(gripper)
+            publisher.publish(message)
 
     # 推理
     def follow_arm_publish(self, left, right):

@@ -244,6 +244,45 @@ def read_ready_pose(node, arm_nodes=('/vr_arm_l', '/vr_arm_r'), timeout=4.0):
     return np.concatenate(poses)
 
 
+# The ready pose's gripper, in the arms' own units. go_home_position covers six
+# joints and not the seventh, so this is the one part of the pose that has to be
+# named here rather than read back from the arms.
+READY_GRIPPER = (-2.9717, -2.9675)
+# X5Controller multiplies a VR gripper by this before use, so command the inverse.
+VR_GRIPPER_SCALE = -3.4 / 5
+
+
+def hold_ready_pose(ros_operator, seconds=0.4, period=0.02):
+    """Hold the pose the arms just reached, commanded the way teleop commands it.
+
+    GO_HOME gets them there but leaves them in a state the next VR frame
+    cancels. Re-sending the pose they are already at, as an end-effector
+    command, leaves them in END_CONTROL holding it, so an episode starts in the
+    state teleop runs in rather than in a fight between the two.
+
+    The pose is read back from the arms rather than written down here, so it
+    follows go_home_position without a second copy to keep in step.
+
+    Runs inside the /arx_joy mute the caller has been holding, so nothing else
+    is publishing to the arms while it does.
+    """
+    poses = []
+    for arm, gripper in zip((ros_operator.follow_left_arm_deque,
+                             ros_operator.follow_right_arm_deque), READY_GRIPPER):
+        if not arm:
+            print('WARNING: no arm state to read the ready pose back from; not holding it.')
+            return False
+        poses.append((np.array(arm[-1].end_pos, dtype=float), gripper / VR_GRIPPER_SCALE))
+
+    end = time.time() + seconds
+    while time.time() < end:
+        ros_operator.publish_ready_pose(poses)
+        time.sleep(period)
+    print(f'  held as an end-effector command: '
+          f'left {np.round(poses[0][0][:3], 4)} right {np.round(poses[1][0][:3], 4)}')
+    return True
+
+
 def return_to_ready(ros_operator, timeout=12.0, min_wait=1.0, settle_window=0.4,
                     tolerance=0.004, arrival_tolerance=0.05):
     """Walk both arms to the go_home_position their controllers were launched with.
@@ -301,6 +340,7 @@ def return_to_ready(ros_operator, timeout=12.0, min_wait=1.0, settle_window=0.4,
         left, right = np.degrees(current[:6]), np.degrees(current[6:])
         print(f'  arms parked after {now - start:.1f}s: '
               f'left {np.round(left, 1)} right {np.round(right, 1)}')
+        hold_ready_pose(ros_operator)
         return True
 
     current = joints()
@@ -503,6 +543,11 @@ def parse_arguments(known=False):
                         help='fixed lift command in [0, 20]; omitted means follow VR height')
 
     parser.add_argument('--task', type=str, default='', help='task name')
+    parser.add_argument('--ready_pose_topics', nargs=2,
+                        default=['/ARX_VR_L_filtered', '/ARX_VR_R_filtered'],
+                        metavar=('LEFT', 'RIGHT'),
+                        help='the pose topics the arms subscribe to, left then right; '
+                             'these are the raw VR topics when the filters are off')
 
     return parser.parse_known_args()[0] if known else parser.parse_args()
 
