@@ -27,19 +27,26 @@ service rather than a controller button:
     ros2 service call /vr_ik_r/disengage std_srvs/srv/Trigger
     ros2 service call /vr_ik_r/home std_srvs/srv/Trigger
 
---auto-engage restores the earlier behaviour for a stream the app has
-already zeroed: the absolute VR pose is followed, once it comes within
---engage-distance / --engage-angle of where the arm actually is.
+--auto-engage is the vendor workflow, with the controller's own buttons: the
+headset app handles trigger, release and reset itself by changing the pose
+it sends - zeroed onto the arm, frozen, or walking home - so following the
+absolute pose reproduces all three. The pose is followed once it comes
+within --engage-distance / --engage-angle of where the arm actually is, or
+of the home pose (which is what the app's reset sends); a parked
+controller's pose is near neither and is ignored.
 
   WAITING   no arm feedback yet; nothing published
   ARMED     feedback present; holding, waiting for engage (or, with
             --auto-engage, for the target to come within reach)
   TRACKING  solving and publishing. Each joint moves at most --max-velocity,
             using the measured message interval, so a far target is walked
-            toward rather than lunged at. A residual above --max-residual
-            that stops improving over --stall-window messages means the
-            target left the workspace; publishing stops and the node
-            returns to ARMED holding the last command.
+            toward rather than lunged at. Two things end it: a target that
+            moves more than --max-jump in a single message (a hand cannot;
+            tracking was lost or the parking pose snapped in) holds at once,
+            and a residual that stays above --max-residual for a whole
+            --stall-window without shrinking means the target is out of
+            reach. Either way publishing stops and the node returns to
+            ARMED holding the last command.
   HOMING    the vendor app's "reset": walking every joint to zero at
             --max-velocity on a timer, ignoring the VR pose, then ARMED.
             /disengage aborts it and holds where it is.
@@ -94,6 +101,7 @@ def build_node(args):
             self.solver.dt = args.dt
             # FK of the feedback for gating and engaging, without touching the solver.
             self.fk_robot = placo.RobotWrapper(str(urdf), placo.Flags.ignore_collisions)
+            self.T_home = self.fk_of(HOME_Q)
 
             self.state = WAITING
             self.q_feedback = None
@@ -107,6 +115,7 @@ def build_node(args):
             self.vr_p = self.vr_R = None                 # latest VR pose, base frame
             self.vr_recent = collections.deque()         # (t, p) over the last second
             self.origin = None                           # (p_arm0, R_arm0, p_vr0, R_vr0) set at engage
+            self.p_target_prev = None                    # last target position, for the jump guard
             self.last_gripper = 5.0 * GRIPPER_SCALE      # what the idle VR stream commands: open
 
             self.pub = self.create_publisher(RobotStatus, args.out_topic, 10) if args.execute else None
@@ -149,11 +158,20 @@ def build_node(args):
             if self.state == ARMED:
                 if not args.auto_engage:
                     return
+                # The app-zeroed stream is accepted when it is near where the arm
+                # is (the trigger was pressed with the arm at rest under the hand)
+                # or near the home pose (the app's reset sends the arm home from
+                # wherever it is). A parked controller's pose is near neither.
                 T_arm = self.fk_of(self.q_feedback)
-                self.gate = (float(np.linalg.norm(self.vr_p - T_arm[:3, 3])), rotation_angle_deg(self.vr_R, T_arm[:3, :3]))
-                if self.gate[0] > args.engage_distance or self.gate[1] > args.engage_angle:
+                near_arm = (float(np.linalg.norm(self.vr_p - T_arm[:3, 3])), rotation_angle_deg(self.vr_R, T_arm[:3, :3]))
+                near_home = (float(np.linalg.norm(self.vr_p - self.T_home[:3, 3])), rotation_angle_deg(self.vr_R, self.T_home[:3, :3]))
+                self.gate = min(near_arm, near_home)
+                ok = lambda g: g[0] <= args.engage_distance and g[1] <= args.engage_angle
+                if not (ok(near_arm) or ok(near_home)):
                     return
-                self.engage(f'target within {self.gate[0] * 1000:.0f} mm / {self.gate[1]:.0f} deg of the arm', now)
+                where = 'the arm' if ok(near_arm) else 'home'
+                g = near_arm if ok(near_arm) else near_home
+                self.engage(f'target within {g[0] * 1000:.0f} mm / {g[1]:.0f} deg of {where}', now)
 
             if self.origin is None:          # auto-engage: follow the absolute pose
                 T = T_vr
@@ -162,6 +180,17 @@ def build_node(args):
                 T = np.eye(4)
                 T[:3, 3] = p_arm0 + (self.vr_p - p_vr0)
                 T[:3, :3] = (self.vr_R @ R_vr0.T) @ R_arm0
+
+            # A hand cannot move --max-jump in one message; a target that does has
+            # lost tracking or snapped to the app's parking pose. Hold at once,
+            # before the velocity cap starts walking the arm after it.
+            if self.p_target_prev is not None:
+                jump = float(np.linalg.norm(T[:3, 3] - self.p_target_prev))
+                if jump > args.max_jump:
+                    self.p_target_prev = None
+                    self.disengage(f'target jumped {jump * 1000:.0f} mm in one message - tracking lost')
+                    return
+            self.p_target_prev = T[:3, 3].copy()
 
             dt = min(max(now - self.t_prev_msg, 1 / 500), 1 / 20)   # tolerate a stalled stream
             self.t_prev_msg = now
@@ -182,10 +211,13 @@ def build_node(args):
             self.residual.append(res)
             self.res_hist.append(res)
             self.solved += 1
-            # Out of reach means the solver has stalled, not that the target is
-            # currently far: right after engaging the residual can be the whole
-            # engage distance and shrinks as the velocity cap walks the arm in.
-            if (res > args.max_residual and len(self.res_hist) == self.res_hist.maxlen
+            # Out of reach means the solver has stalled: the residual has been
+            # above the threshold for the whole window and is not shrinking.
+            # Every sample in the window has to be above it - comparing only
+            # against the oldest sample fired on the first message after any
+            # target step, when the oldest sample was still near zero, before
+            # the velocity cap had a chance to walk the arm in.
+            if (len(self.res_hist) == self.res_hist.maxlen and min(self.res_hist) > args.max_residual
                     and res > 0.9 * self.res_hist[0]):
                 self.disengage(f'residual {res * 1000:.0f} mm and not improving over '
                                f'{self.res_hist.maxlen} messages - target is out of reach')
@@ -229,6 +261,7 @@ def build_node(args):
             self.seed(self.q_feedback)
             self.t_prev_msg = now
             self.res_hist.clear()
+            self.p_target_prev = None
             if not args.auto_engage:
                 T_arm = self.fk_of(self.q_feedback)
                 self.origin = (T_arm[:3, 3].copy(), T_arm[:3, :3].copy(), self.vr_p.copy(), self.vr_R.copy())
@@ -236,6 +269,7 @@ def build_node(args):
 
         def disengage(self, why):
             self.origin = None
+            self.p_target_prev = None
             self.set_state(ARMED, why + '; holding')
 
         def srv_engage(self, _req, resp):
@@ -323,8 +357,8 @@ def build_node(args):
                     vr = f'VR pose {"moving" if moving > 1 else "NOT moving"} ({moving:.0f} mm/s)'
                     if args.auto_engage and self.gate is not None:
                         self.get_logger().info(
-                            f'ARMED: {vr}; target is {self.gate[0] * 1000:.0f} mm / {self.gate[1]:.0f} deg from the arm, '
-                            f'need < {args.engage_distance * 1000:.0f} mm / {args.engage_angle:.0f} deg')
+                            f'ARMED: {vr}; target is {self.gate[0] * 1000:.0f} mm / {self.gate[1]:.0f} deg from the nearer of '
+                            f'the arm and home, need < {args.engage_distance * 1000:.0f} mm / {args.engage_angle:.0f} deg')
                     else:
                         self.get_logger().info(
                             f'ARMED: {vr}; holding. Engage with: '
@@ -363,6 +397,8 @@ def main():
                         help='m; a residual above this that stops improving means the target is out of reach')
     parser.add_argument('--stall-window', type=int, default=30,
                         help='messages over which the residual must improve, else the target is out of reach')
+    parser.add_argument('--max-jump', type=float, default=0.3,
+                        help='m; a target that moves more than this in one message has lost tracking, hold at once')
     parser.add_argument('--report-period', type=float, default=2.0)
     parser.add_argument('--execute', action='store_true',
                         help='publish joint targets; default solves and reports only')
