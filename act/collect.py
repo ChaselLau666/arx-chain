@@ -24,6 +24,7 @@ import pyttsx3
 
 import numpy as np
 
+from collections import deque
 from copy import deepcopy
 
 from utils.ros_operator import Rate, RosOperator
@@ -214,6 +215,106 @@ def create_and_write_hdf5(args, data_dict, dataset_path, data_size, padded_size,
 
 
 # 保存数据函数
+def read_ready_pose(node, arm_nodes=('/vr_arm_l', '/vr_arm_r'), timeout=4.0):
+    """Read the go_home_position each arm controller was launched with.
+
+    This is the single source of truth for where the arms park:
+    tools/06_collect_filtered.sh passes it, X5Controller hands it to the SDK,
+    and reading it back is what lets return_to_ready tell arriving from merely
+    stopping. Returns None if either arm cannot be asked, in which case the
+    caller falls back to checking that the arms came to rest.
+    """
+    from rclpy.parameter_client import AsyncParameterClient
+
+    poses = []
+    for name in arm_nodes:
+        client = AsyncParameterClient(node, name)
+        if not client.wait_for_services(timeout_sec=timeout):
+            return None
+        future = client.get_parameters(['go_home_position'])
+        deadline = time.monotonic() + timeout
+        while not future.done() and rclpy.ok() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        if not future.done() or future.result() is None:
+            return None
+        values = future.result().values
+        if not values or not values[0].double_array_value:
+            return None
+        poses.append(np.array(values[0].double_array_value, dtype=float))
+    return np.concatenate(poses)
+
+
+def return_to_ready(ros_operator, timeout=12.0, min_wait=1.0, settle_window=0.4,
+                    tolerance=0.004, arrival_tolerance=0.05):
+    """Walk both arms to the go_home_position their controllers were launched with.
+
+    Publishing /arx_joy repeatedly does two jobs at once: it holds the arms in
+    GO_HOME against the END_CONTROL that every VR frame would otherwise restore,
+    and it keeps vr_pose_filter muted so the VR stream cannot fight the move.
+    Stopping lets the filter resume, so the mute lasts exactly as long as this
+    takes. The target lives in each arm's go_home_position parameter, set by
+    tools/06_collect_filtered.sh, and is deliberately not repeated here.
+
+    Coming to rest is not the same as arriving. When the mute does not take -
+    no filter to mute under SMOOTH_TAU=0, or one left running from an older
+    build - GO_HOME and END_CONTROL fight to a standstill partway, and treating
+    that as success would put a wrong first frame in the episode without saying
+    so. The pose read back from the arms decides it whenever it is available.
+
+    Returns True once both arms are at the ready pose and still.
+    """
+    def joints():
+        both = []
+        for arm in (ros_operator.follow_left_arm_deque, ros_operator.follow_right_arm_deque):
+            if not arm:
+                return None
+            both.append(np.array(arm[-1].joint_pos[:6], dtype=float))
+        return np.concatenate(both)
+
+    target = read_ready_pose(ros_operator)
+    if target is None:
+        print('Could not read go_home_position from the arms; '
+              'will only check that they come to rest.')
+
+    print('Returning the arms to the ready pose; stand clear.')
+    start = time.time()
+    recent = deque()
+    while time.time() - start < timeout:
+        ros_operator.request_go_home()
+        time.sleep(0.05)
+        current = joints()
+        if current is None:
+            continue
+        now = time.time()
+        recent.append((now, current))
+        while recent and now - recent[0][0] > settle_window:
+            recent.popleft()
+        # min_wait covers the case where the arms have not started moving yet:
+        # without it the first samples are trivially identical and settled.
+        if now - start < min_wait or now - recent[0][0] < settle_window * 0.8:
+            continue
+        spread = np.ptp(np.array([q for _, q in recent]), axis=0).max()
+        if spread >= tolerance:
+            continue
+        if target is not None and np.abs(current - target).max() > arrival_tolerance:
+            continue          # stopped, but not where it was asked to go
+        left, right = np.degrees(current[:6]), np.degrees(current[6:])
+        print(f'  arms parked after {now - start:.1f}s: '
+              f'left {np.round(left, 1)} right {np.round(right, 1)}')
+        return True
+
+    current = joints()
+    where = np.round(np.degrees(current), 1) if current is not None else 'unknown'
+    if target is not None and current is not None:
+        print(f'WARNING: the arms are {np.degrees(np.abs(current - target).max()):.1f} deg from the '
+              f'ready pose after {timeout:.0f}s, at {where}. Recording anyway, so this episode does '
+              f'not start where the others do. Is a pose filter running to be muted by /arx_joy?')
+    else:
+        print(f'WARNING: the arms had not settled after {timeout:.0f}s, at {where}. Recording anyway. '
+              f'Is a pose filter running to be muted, or is something blocking the arms?')
+    return False
+
+
 def save_data(args, timesteps, actions, actions_eef, action_bases, action_velocities, ros_operator, dataset_path):
     data_size = len(actions)
 
@@ -329,6 +430,12 @@ def main(args):
             if start_decision == 'q':
                 print('Collection stopped while idle; no episode was recorded.')
                 break
+
+            # Here rather than after save or discard: the arms follow the VR pose
+            # again the moment the filter unmutes, so parking them only holds until
+            # the operator next moves a hand. Doing it as recording is about to
+            # start is what actually puts the same first frame in every episode.
+            return_to_ready(ros_operator)
 
             print(f"Start recording episode {current_episode}")
             timesteps, actions, actions_eef, action_bases, action_velocities = collect_information(

@@ -18,6 +18,7 @@ from cv_bridge import CvBridge
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Image, CompressedImage, Imu
+from std_msgs.msg import Int32MultiArray
 from tf2_msgs.msg import TFMessage
 from std_msgs.msg import Int32MultiArray
 
@@ -178,6 +179,12 @@ class RosOperator(Node):
                                      self.config['robot_base_config']['robot_base_topic'],
                                      self.height_feedback_callback,
                                      10)
+        # Every X5Controller subscribes to /arx_joy whatever its arm_control_type,
+        # the subscription being created outside the mode branches, so this reaches
+        # the arms during collection with them in vr_slave just as well as in the
+        # joint modes. Nothing else on the robot publishes here.
+        self.arx_joy_publisher = self.create_publisher(Int32MultiArray, '/arx_joy', 10)
+
         # 推理模式相关发布
         if not self.in_collect and getattr(self.args, 'execute', True):
             self.follow_arm_left_publisher = self.create_publisher(
@@ -196,6 +203,20 @@ class RosOperator(Node):
                     self.config['robot_base_config']['robot_base_cmd_topic'],
                     10
                 )
+
+    def request_go_home(self):
+        """Ask every arm to walk to the go_home_position it was launched with.
+
+        data[1] == 1 selects GO_HOME; data[0] is left at 0 because a 1 there
+        selects gravity compensation instead. arxJoyCB indexes both without
+        checking the length, so the array has to carry two elements.
+
+        One message is enough to enter the state but not to stay in it: any VR
+        frame restores END_CONTROL. Callers repeat this until the arms arrive.
+        """
+        message = Int32MultiArray()
+        message.data = [0, 1]
+        self.arx_joy_publisher.publish(message)
 
     # 推理
     def follow_arm_publish(self, left, right):

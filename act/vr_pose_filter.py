@@ -34,6 +34,7 @@ def build_node(args):
     import rclpy
     from rclpy.node import Node
     from arm_control.msg import PosCmd
+    from std_msgs.msg import Int32MultiArray
     from scipy.spatial.transform import Rotation
 
     class VrPoseFilter(Node):
@@ -45,10 +46,23 @@ def build_node(args):
             self.passed = 0
             self.pub = self.create_publisher(PosCmd, args.out_topic, 10)
             self.create_subscription(PosCmd, args.in_topic, self.on_pose, 10)
+            # Stand aside while something is driving the arms home. data[1] == 1
+            # puts X5Controller in GO_HOME, but VrCmdCallback restores END_CONTROL
+            # on the very next pose published here, which cancels the move within a
+            # frame. The window is short and refreshed by every message, so a mute
+            # lasts exactly as long as the sender keeps asking and no longer.
+            self.mute_until = 0.0
+            self.create_subscription(Int32MultiArray, '/arx_joy', self.on_joy, 10)
             self.create_timer(args.report_period, self.report)
             self.get_logger().info(
                 f'{args.in_topic} -> {args.out_topic}  tau={args.tau:.3f}s '
                 f'alpha={self.alpha:.4f} (cutoff {1 / (2 * np.pi * max(args.tau, 1e-9)):.2f} Hz)')
+
+        def on_joy(self, msg):
+            if len(msg.data) > 1 and msg.data[1] == 1:
+                if time.monotonic() >= self.mute_until:
+                    self.get_logger().info('/arx_joy GO_HOME: standing aside')
+                self.mute_until = time.monotonic() + args.home_mute
 
         def on_pose(self, msg):
             pos = np.array([msg.x, msg.y, msg.z], dtype=float)
@@ -74,6 +88,10 @@ def build_node(args):
                 out.temp_float_data = msg.temp_float_data
             out.x, out.y, out.z = (float(v) for v in self.pos_prev)
             out.roll, out.pitch, out.yaw = (float(v) for v in self.rot_prev.as_euler('xyz'))
+            # Filter state above is kept current even while muted, so publishing
+            # resumes from where the hand is now rather than from a stale pose.
+            if time.monotonic() < self.mute_until:
+                return
             self.pub.publish(out)
             self.passed += 1
 
