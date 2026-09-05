@@ -14,6 +14,7 @@ jump in the pose becomes a jump in the joint solution.
 
 import os
 import sys
+import time
 
 from pathlib import Path
 
@@ -122,6 +123,10 @@ def parse_args():
     parser.add_argument('--dt', type=float, default=1 / 60.0,
                         help='expected input period, used to derive alpha')
     parser.add_argument('--node-name', default='vr_pose_filter')
+    parser.add_argument('--home-mute', type=float, default=0.5,
+                        help='seconds to stop publishing after each /arx_joy GO_HOME message. '
+                             'Every message refreshes it, so whoever is driving the arms home '
+                             'sets the duration by how long it keeps asking')
     parser.add_argument('--report-period', type=float, default=2.0)
 
     return parser.parse_known_args()[0]
