@@ -1167,6 +1167,20 @@ def _run_ros_control(
                         shutdown_requested = True
                         core.request_fault("operator shutdown", timestamp_ns)
                     else:
+                        if key == "1":
+                            # Physical trigger: one button toggles between
+                            # policy and human control by borrowing the
+                            # existing Space/P paths. core.state is the
+                            # toggle memory. Only the two settled states
+                            # translate; a press during either handoff (or
+                            # any hold state) falls through unmapped, so a
+                            # double-press cannot cancel an in-flight
+                            # resume. Aborting a resume stays on the
+                            # keyboard Space, which keeps that meaning.
+                            if core.state is ControlState.POLICY:
+                                key = " "
+                            elif core.state is ControlState.HUMAN:
+                                key = "p"
                         if key in {" ", "space"} and core.state in (
                             ControlState.POLICY, ControlState.HANDOFF_TO_POLICY,
                         ):
@@ -1566,9 +1580,9 @@ def _state_hint(state: Any) -> str:
         "PRECHECK_HOLD": "waiting for health checks",
         "MANUAL_RESET": "use VR to reset; [r] start, [q] quit",
         "HANDOFF_TO_POLICY": "HOLD; resetting policy",
-        "POLICY": "[space] human takeover, [e] end",
+        "POLICY": "[space/trigger] human takeover, [e] end",
         "HANDOFF_TO_HUMAN": "HOLD; waiting for post-key VR and feedback",
-        "HUMAN": "human active; [p] resume policy, [e] end",
+        "HUMAN": "human active; [p/trigger] resume policy, [e] end",
         "REVIEW_HOLD": "episode ended",
         "FAULT_HOLD": "fault latched; run safe shutdown",
     }
@@ -1585,6 +1599,45 @@ def _print_status(message: Mapping[str, Any]) -> None:
         print(f"\n[Human DAgger] {message.get('message', message)}", flush=True)
     elif kind == "fatal":
         print(f"\n[Human DAgger ERROR] {message.get('error', message)}", file=sys.stderr, flush=True)
+
+
+def _trigger_reader_main(
+    device_path: str,
+    command_queue: Any,
+    stop_event: threading.Event,
+) -> None:
+    """Forward physical trigger presses (KEY_1) as operator key "1".
+
+    The device is grabbed exclusively so a press cannot also leak a literal
+    "1" character into the terminal, which would double every event.
+
+    KEY_1 matches what the trigger hardware is flashed to emit (a single
+    "1" key); reflash the trigger and this constant must follow. The thread
+    blocks in read() and exits with the process (daemon=True); stop_event
+    only covers the pre-read window.
+    """
+    import fcntl
+    import struct
+
+    event_format = "llHHi"
+    event_size = struct.calcsize(event_format)
+    EVIOCGRAB = 0x40044590
+    EV_KEY = 0x01
+    KEY_1 = 2
+    try:
+        with open(device_path, "rb") as stream:
+            fcntl.ioctl(stream, EVIOCGRAB, 1)
+            while not stop_event.is_set():
+                data = stream.read(event_size)
+                if len(data) < event_size:
+                    break
+                _, _, event_type, code, value = struct.unpack(event_format, data)
+                if event_type == EV_KEY and code == KEY_1 and value == 1:
+                    command_queue.put(
+                        {"kind": "key", "key": "1", "time_ns": monotonic_ns()}
+                    )
+    except OSError as exc:
+        print(f"trigger reader stopped: {exc}", flush=True)
 
 
 def run_supervisor(args: argparse.Namespace, runtime_config: dict[str, Any]) -> int:
@@ -1720,6 +1773,20 @@ def run_supervisor(args: argparse.Namespace, runtime_config: dict[str, Any]) -> 
     policy_fault_sent = False
     recorder_fault_sent = False
 
+    trigger_stop = threading.Event()
+    trigger_device = str(getattr(args, "trigger_device", "") or "")
+    if trigger_device:
+        if os.path.exists(trigger_device):
+            threading.Thread(
+                target=_trigger_reader_main,
+                args=(trigger_device, ui_command_queue, trigger_stop),
+                name="trigger-reader",
+                daemon=True,
+            ).start()
+            print(f"DAgger trigger active on {trigger_device} (press toggles policy/human)", flush=True)
+        else:
+            print(f"DAgger trigger device missing, keyboard only: {trigger_device}", flush=True)
+
     try:
         with TerminalKeyReader() as key_reader:
             print("Human DAgger UI active. Waiting for PRECHECK...", flush=True)
@@ -1761,6 +1828,7 @@ def run_supervisor(args: argparse.Namespace, runtime_config: dict[str, Any]) -> 
     except KeyboardInterrupt:
         ui_command_queue.put({"kind": "shutdown", "time_ns": monotonic_ns()})
     finally:
+        trigger_stop.set()
         ui_command_queue.put({"kind": "shutdown", "time_ns": monotonic_ns()})
         try:
             policy_control_queue.put_nowait({"kind": "stop"})
@@ -1812,6 +1880,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--gripper-high-value", type=float, default=0.0)
     parser.add_argument("--arm-ema-alpha", type=float, default=1.0)
     parser.add_argument("--gripper-ema-alpha", type=float, default=1.0)
+    parser.add_argument(
+        "--trigger-device",
+        default="",
+        help="evdev device whose KEY_1 press toggles policy/human control (empty disables)",
+    )
     parser.add_argument("--mock-policy", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--mock-policy-delay", type=float, default=0.0, help=argparse.SUPPRESS)
     parser.add_argument("--session-manifest", default="", help=argparse.SUPPRESS)

@@ -438,6 +438,7 @@ start_frontend() {
     --dagger-round "$DAGGER_ROUND" \
     --episode-idx -1 \
     --max-timesteps "$MAX_TIMESTEPS" \
+    --trigger-device "${TRIGGER_DEVICE:-/dev/input/dagger_trigger}" \
     --session-manifest "$manifest" </dev/tty &
   frontend_pid=$!
   sleep 0.3

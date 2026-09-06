@@ -928,5 +928,88 @@ class CommandSafetyAndFaultTests(CoreFixture):
         self.assertEqual(result.command.source, CommandSource.HOLD)
 
 
+class TriggerToggleTests(CoreFixture):
+    """The physical trigger key "1" toggles POLICY <-> HUMAN.
+
+    Mirrors the translation block in human_dagger.py's control process: only
+    the settled POLICY/HUMAN states translate to Space/P; every other state
+    leaves "1" unmapped so the core ignores it.
+    """
+
+    @staticmethod
+    def translate_trigger(state: ControlState) -> str:
+        key = "1"
+        if state is ControlState.POLICY:
+            key = " "
+        elif state is ControlState.HUMAN:
+            key = "p"
+        return key
+
+    def press_trigger(self) -> tuple[str, bool]:
+        key = self.translate_trigger(self.core.state)
+        return key, self.core.handle_key(key, self.clock.now_ns)
+
+    def complete_handoff_to_human(self) -> None:
+        held = self.core.tick()
+        self.assertEqual(held.snapshot.state, ControlState.HANDOFF_TO_HUMAN)
+        self.core.acknowledge_handoff_hold_published(
+            held.snapshot.control_epoch, self.clock.now_ns
+        )
+        self.clock.now_ns += MS
+        self.install_inputs()
+        self.assertEqual(self.core.tick().snapshot.state, ControlState.HUMAN)
+
+    def complete_handoff_to_policy(self) -> None:
+        result = self.core.tick(self.clock.now_ns)
+        self.assertEqual(result.snapshot.state, ControlState.HANDOFF_TO_POLICY)
+        epoch = result.snapshot.control_epoch
+        self.clock.now_ns += MS
+        self.install_inputs()
+        self.assertTrue(self.core.acknowledge_policy_reset(epoch, self.clock.now_ns))
+        target = policy_action()
+        for frame in range(120):
+            self.assertTrue(
+                self.core.submit_policy_action(
+                    PolicyActionPacket(epoch, frame, self.clock.now_ns, target),
+                    self.clock.now_ns,
+                )
+            )
+            if self.core.tick(self.clock.now_ns).snapshot.state is ControlState.POLICY:
+                return
+            self.clock.now_ns += 2 * SECOND // 120
+            self.install_inputs()
+        self.fail("policy handoff did not converge")
+
+    def test_trigger_key_toggles_between_policy_and_human(self):
+        self.enter_policy()
+
+        # POLICY: press takes over.
+        self.assertEqual(self.press_trigger(), (" ", True))
+        self.core.tick()
+        self.assertEqual(self.core.state, ControlState.HANDOFF_TO_HUMAN)
+        # Mid-handoff press stays unmapped and ignored.
+        self.assertEqual(self.press_trigger(), ("1", False))
+        self.complete_handoff_to_human()
+
+        # HUMAN: press resumes policy.
+        self.assertEqual(self.press_trigger(), ("p", True))
+        self.core.tick(self.clock.now_ns)
+        # Mid-resume press must not cancel the resume (double-press guard).
+        self.assertEqual(self.core.state, ControlState.HANDOFF_TO_POLICY)
+        self.assertEqual(self.press_trigger(), ("1", False))
+        self.complete_handoff_to_policy()
+
+        # POLICY again: the cycle closes.
+        self.assertEqual(self.press_trigger(), (" ", True))
+        self.complete_handoff_to_human()
+
+    def test_trigger_key_ignored_in_review_hold(self):
+        self.enter_policy()
+        self.core.handle_key("e", self.clock.now_ns)
+        self.core.tick()
+        self.assertEqual(self.core.state, ControlState.REVIEW_HOLD)
+        self.assertEqual(self.press_trigger(), ("1", False))
+
+
 if __name__ == "__main__":
     unittest.main()
