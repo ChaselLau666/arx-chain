@@ -429,12 +429,19 @@ start_frontend() {
       --gripper-ema-alpha "${GRIPPER_EMA_ALPHA:-0.6}"
     )
   fi
+  # A move that drives the arms by itself must be switchable from the console.
+  local -a ready_args=()
+  if [[ "${READY_POSE_MOVE:-1}" == 0 ]]; then
+    ready_args=(--no-ready-pose)
+    echo "READY_POSE_MOVE=0: the record key will NOT park the arms first."
+  fi
   "$ACT_PYTHON" "${repo_root}/act/human_dagger.py" \
     --config "$CONFIG_PATH" \
     --datasets "$DATASET_DIR" \
     --task "$TASK_NAME" \
     --height "$LIFT_HEIGHT_ROS" \
     "${backend_args[@]}" \
+    "${ready_args[@]}" \
     --dagger-round "$DAGGER_ROUND" \
     --episode-idx -1 \
     --max-timesteps "$MAX_TIMESTEPS" \
@@ -551,7 +558,7 @@ wait_for_topic /human_dagger/vr/right_raw 20
 
 echo
 echo "Preflight passed. Keep the physical emergency stop within reach."
-echo "Controls: R=start, Space=human, P=policy, E=end; review with S/D/Q."
+echo "Controls: R=park at ready pose then start, Space=human, P=policy, E=end; review with S/D/Q."
 echo "Support-process logs: ${log_dir}"
 echo
 

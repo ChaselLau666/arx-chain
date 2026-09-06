@@ -223,6 +223,7 @@ class StateMachineTests(CoreFixture):
                 "HUMAN",
                 "REVIEW_HOLD",
                 "FAULT_HOLD",
+                "READY_MOVE",
             },
         )
 
@@ -1013,3 +1014,301 @@ class TriggerToggleTests(CoreFixture):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+READY_LEFT = (0.05, 0.15, 0.25, 0.35, 0.45, 0.55)
+READY_RIGHT = (1.05, 1.15, 1.25, 1.35, 1.45, 1.55)
+READY_GRIPPERS = (-1.25, -2.25)
+
+
+class ReadyMoveFixture(CoreFixture):
+    """A core configured to park the arms at a ready pose before every episode."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.config = replace(
+            self.config,
+            ready_pose_left=READY_LEFT,
+            ready_pose_right=READY_RIGHT,
+            ready_gripper=READY_GRIPPERS,
+            ready_move_timeout_ns=SECOND,
+        )
+        self.core = HumanDaggerCore(self.config, clock_ns=self.clock)
+
+
+class ReadyMoveEntryTests(ReadyMoveFixture):
+    def test_record_key_enters_ready_move_instead_of_policy_handoff(self):
+        self.enter_manual_reset()
+        self.core.handle_key("r", self.clock.now_ns)
+        result = self.core.tick(self.clock.now_ns)
+        self.assertEqual(result.snapshot.state, ControlState.READY_MOVE)
+
+    def test_record_key_marks_the_episode_active_before_the_arms_move(self):
+        self.enter_manual_reset()
+        self.core.handle_key("r", self.clock.now_ns)
+        result = self.core.tick(self.clock.now_ns)
+        self.assertTrue(result.snapshot.episode_active)
+
+    def test_ready_move_does_not_request_a_policy_reset_yet(self):
+        # The policy handoff budget is two seconds; asking the policy to reset
+        # before the arms have parked would spend it on the parking move.
+        self.enter_manual_reset()
+        self.core.handle_key("r", self.clock.now_ns)
+        result = self.core.tick(self.clock.now_ns)
+        self.assertIsNone(result.snapshot.pending_policy_reset_epoch)
+
+
+class ReadyMoveDisabledTests(CoreFixture):
+    def test_record_key_goes_straight_to_policy_handoff_without_a_ready_pose(self):
+        # Regression guard: a core with no configured ready pose must behave
+        # exactly as it did before the ready move existed.
+        self.enter_manual_reset()
+        self.core.handle_key("r", self.clock.now_ns)
+        result = self.core.tick(self.clock.now_ns)
+        self.assertEqual(result.snapshot.state, ControlState.HANDOFF_TO_POLICY)
+        self.assertEqual(
+            result.snapshot.pending_policy_reset_epoch,
+            result.snapshot.control_epoch,
+        )
+
+
+class ReadyMoveCommandTests(ReadyMoveFixture):
+    def start_ready_move(self):
+        self.enter_manual_reset()
+        self.core.handle_key("r", self.clock.now_ns)
+        result = self.core.tick(self.clock.now_ns)
+        self.assertEqual(result.snapshot.state, ControlState.READY_MOVE)
+        return result
+
+    def feed_from_command(self, command) -> None:
+        """Feed back exactly what was commanded: a perfectly tracking arm."""
+        self.assertTrue(
+            self.core.update_feedback(
+                ArmFeedback(
+                    joint_pos=command.left.joint_pos,
+                    eef_pose=(0.4, -0.1, 0.3, 0.2, -0.3, 0.4),
+                    gripper=command.left.gripper,
+                    timestamp_ns=self.clock.now_ns,
+                ),
+                ArmFeedback(
+                    joint_pos=command.right.joint_pos,
+                    eef_pose=(-0.4, 0.1, 0.35, -0.2, 0.1, -0.4),
+                    gripper=command.right.gripper,
+                    timestamp_ns=self.clock.now_ns,
+                ),
+            )
+        )
+
+    @staticmethod
+    def emitted_action(command):
+        return (
+            *command.left.joint_pos,
+            command.left.gripper,
+            *command.right.joint_pos,
+            command.right.gripper,
+        )
+
+    def test_first_ready_move_command_holds_the_measured_position(self):
+        # MANUAL_RESET commands are END_CONTROL; one measured POSITION_CONTROL
+        # frame lets the mode change land before any joint is asked to move.
+        result = self.start_ready_move()
+        self.assertEqual(result.command.source, CommandSource.HOLD)
+        self.assertEqual(self.emitted_action(result.command), measured_action())
+
+    def test_ready_move_commands_are_position_control(self):
+        result = self.start_ready_move()
+        self.clock.now_ns += MS
+        self.feed_from_command(result.command)
+        result = self.core.tick(self.clock.now_ns)
+        self.assertEqual(result.command.source, CommandSource.READY_MOVE)
+        self.assertEqual(result.command.left.mode, int(CommandMode.POSITION_CONTROL))
+        self.assertEqual(result.command.right.mode, int(CommandMode.POSITION_CONTROL))
+
+    def test_ready_move_never_steps_further_than_the_configured_limit(self):
+        result = self.start_ready_move()
+        previous = measured_action()
+        for _ in range(60):
+            self.clock.now_ns += MS
+            self.feed_from_command(result.command)
+            result = self.core.tick(self.clock.now_ns)
+            if result.snapshot.state is not ControlState.READY_MOVE:
+                break
+            emitted = self.emitted_action(result.command)
+            for index, (old, new) in enumerate(zip(previous, emitted)):
+                self.assertLessEqual(
+                    abs(new - old),
+                    self.config.ready_move_step_per_arm[index % 7] + 1e-9,
+                    f"channel {index} stepped too far",
+                )
+            previous = emitted
+
+    def test_ready_move_walks_the_commands_onto_the_ready_pose(self):
+        result = self.start_ready_move()
+        for _ in range(60):
+            self.clock.now_ns += MS
+            self.feed_from_command(result.command)
+            result = self.core.tick(self.clock.now_ns)
+            if self.emitted_action(result.command) == self.config.ready_action():
+                return
+        self.fail("ready move never commanded the configured ready pose")
+
+
+class ReadyMoveArrivalTests(ReadyMoveCommandTests):
+    def feed_frozen(self) -> None:
+        """A blocked arm: feedback stays fresh but the joints never move."""
+        self.install_inputs()
+
+    def run_move(self, feeder, limit: int = 90):
+        result = self.start_ready_move()
+        for _ in range(limit):
+            self.clock.now_ns += MS
+            feeder(result.command)
+            result = self.core.tick(self.clock.now_ns)
+            if result.snapshot.state is not ControlState.READY_MOVE:
+                return result
+        return result
+
+    def test_ready_move_completes_into_the_policy_handoff(self):
+        result = self.run_move(lambda command: self.feed_from_command(command))
+        self.assertEqual(result.snapshot.state, ControlState.HANDOFF_TO_POLICY)
+        self.assertEqual(
+            result.snapshot.pending_policy_reset_epoch,
+            result.snapshot.control_epoch,
+        )
+
+    def test_blocked_arm_never_completes_the_ready_move(self):
+        # The commands walk all the way onto the target, but the arm does not
+        # follow.  Treating "the command arrived" as arrival would start the
+        # episode from the wrong pose and record it as if it were right.
+        result = self.run_move(lambda command: self.feed_frozen())
+        self.assertEqual(result.snapshot.state, ControlState.READY_MOVE)
+
+    def test_episode_start_request_lands_on_the_policy_handoff_tick(self):
+        # The recorder opens on the tick that enters HANDOFF_TO_POLICY and
+        # drops events emitted before that, so the request that opens the
+        # recorded handoff row has to arrive on this exact tick.
+        result = self.run_move(lambda command: self.feed_from_command(command))
+        self.assertEqual(result.snapshot.state, ControlState.HANDOFF_TO_POLICY)
+        names = {getattr(event.name, "value", str(event.name)) for event in result.events}
+        self.assertIn("EPISODE_START_REQUEST", names)
+
+    def test_arrival_tolerates_the_configured_tracking_error(self):
+        # Real arms settle near the target, not on it.  Anything inside the
+        # tolerance counts as arrived.
+        offset = self.config.ready_arrival_tolerance * 0.9
+
+        def near_miss(command):
+            self.assertTrue(
+                self.core.update_feedback(
+                    ArmFeedback(
+                        joint_pos=tuple(a + offset for a in command.left.joint_pos),
+                        eef_pose=(0.4, -0.1, 0.3, 0.2, -0.3, 0.4),
+                        gripper=command.left.gripper,
+                        timestamp_ns=self.clock.now_ns,
+                    ),
+                    ArmFeedback(
+                        joint_pos=tuple(a + offset for a in command.right.joint_pos),
+                        eef_pose=(-0.4, 0.1, 0.35, -0.2, 0.1, -0.4),
+                        gripper=command.right.gripper,
+                        timestamp_ns=self.clock.now_ns,
+                    ),
+                )
+            )
+
+        result = self.run_move(near_miss)
+        self.assertEqual(result.snapshot.state, ControlState.HANDOFF_TO_POLICY)
+
+
+class ReadyMoveFailureTests(ReadyMoveCommandTests):
+    def test_ready_move_that_never_arrives_latches_a_fault(self):
+        result = self.start_ready_move()
+        deadline = self.clock.now_ns + self.config.ready_move_timeout_ns + 10 * MS
+        while self.clock.now_ns < deadline:
+            self.clock.now_ns += 10 * MS
+            # A blocked arm: feedback stays fresh, the joints never move.
+            self.install_inputs()
+            result = self.core.tick(self.clock.now_ns)
+            if result.snapshot.state is ControlState.FAULT_HOLD:
+                self.assertEqual(result.command.source, CommandSource.HOLD)
+                return
+        self.fail("a ready move that never arrives must latch a fault")
+
+    def test_ready_move_faults_when_arm_feedback_goes_stale(self):
+        self.start_ready_move()
+        self.clock.now_ns += self.config.feedback_timeout_ns + MS
+        result = self.core.tick(self.clock.now_ns)
+        self.assertEqual(result.snapshot.state, ControlState.FAULT_HOLD)
+
+    def test_ready_move_does_not_need_fresh_vr(self):
+        # Nothing in the move reads the VR trackers, so a headset that drops
+        # out while the arms park must not abort the episode.
+        result = self.start_ready_move()
+        for _ in range(30):
+            self.clock.now_ns += self.config.vr_timeout_ns // 4
+            self.feed_from_command(result.command)
+            result = self.core.tick(self.clock.now_ns)
+            self.assertNotEqual(result.snapshot.state, ControlState.FAULT_HOLD)
+            if result.snapshot.state is ControlState.HANDOFF_TO_POLICY:
+                return
+        self.fail("ready move did not finish without VR")
+
+    def test_end_key_aborts_the_ready_move_back_to_manual_reset(self):
+        self.start_ready_move()
+        self.clock.now_ns += MS
+        self.install_inputs()
+        self.core.handle_key("e", self.clock.now_ns)
+        result = self.core.tick(self.clock.now_ns)
+        self.assertEqual(result.snapshot.state, ControlState.MANUAL_RESET)
+        self.assertFalse(result.snapshot.episode_active)
+
+    def test_aborting_the_ready_move_re_anchors_the_vr_teleop(self):
+        # The arms have moved since MANUAL_RESET was last entered.  Reusing the
+        # old anchor would make the first VR frame jump them back.
+        result = self.start_ready_move()
+        for _ in range(3):
+            self.clock.now_ns += MS
+            self.feed_from_command(result.command)
+            self.core.update_vr(
+                vr_pose(self.clock.now_ns, gripper=2.0),
+                vr_pose(
+                    self.clock.now_ns,
+                    eef_pose=(-1.0, -2.0, 2.5, 0.1, -0.15, -0.2),
+                    gripper=3.0,
+                ),
+            )
+            result = self.core.tick(self.clock.now_ns)
+        self.core.handle_key("e", self.clock.now_ns)
+        result = self.core.tick(self.clock.now_ns)
+        self.assertEqual(result.snapshot.state, ControlState.MANUAL_RESET)
+        # Anchored on the pose the arms are actually in: the VR pose has not
+        # changed since the anchor, so the command repeats the measured EEF.
+        self.assertEqual(result.command.source, CommandSource.HUMAN)
+        self.assertEqual(result.command.left.mode, int(CommandMode.END_CONTROL))
+        self.assertEqual(result.command.left.end_pos, (0.4, -0.1, 0.3, 0.2, -0.3, 0.4))
+
+
+class ReadyMoveEveryEpisodeTests(ReadyMoveCommandTests):
+    def test_the_second_episode_parks_the_arms_again(self):
+        # The point of the ready move is that every recorded episode starts
+        # from the same pose, not just the first one after startup.
+        result = self.start_ready_move()
+        for _ in range(90):
+            self.clock.now_ns += MS
+            self.feed_from_command(result.command)
+            result = self.core.tick(self.clock.now_ns)
+            if result.snapshot.state is ControlState.HANDOFF_TO_POLICY:
+                break
+        self.assertEqual(result.snapshot.state, ControlState.HANDOFF_TO_POLICY)
+
+        self.clock.now_ns += MS
+        self.install_inputs()
+        self.core.handle_key("e", self.clock.now_ns)
+        result = self.core.tick(self.clock.now_ns)
+        self.assertEqual(result.snapshot.state, ControlState.REVIEW_HOLD)
+
+        self.clock.now_ns += MS
+        self.install_inputs()
+        self.assertTrue(self.core.reset_after_review(self.clock.now_ns))
+        self.core.handle_key("r", self.clock.now_ns)
+        result = self.core.tick(self.clock.now_ns)
+        self.assertEqual(result.snapshot.state, ControlState.READY_MOVE)
