@@ -845,7 +845,9 @@ def _run_ros_control(
     frame_period = 1.0 / float(args.frame_rate)
     start_ns = monotonic_ns()
     # Latency diagnostics: report tick health and per-stream gaps every 5 s.
-    diag_interval_ns = 5_000_000_000
+    # DIAG_INTERVAL_S changes that cadence; 0 (or negative) silences the line
+    # without losing the instrumentation behind it.
+    diag_interval_ns = int(float(os.environ.get("DIAG_INTERVAL_S", "5")) * 1e9)
     last_diag_report_ns = start_ns
     tick_count = 0
     tick_overruns = 0
@@ -1489,7 +1491,7 @@ def _run_ros_control(
             previous_state = result.snapshot.state
 
             tick_count += 1
-            if now_ns - last_diag_report_ns >= diag_interval_ns:
+            if diag_interval_ns > 0 and now_ns - last_diag_report_ns >= diag_interval_ns:
                 elapsed_s = (now_ns - last_diag_report_ns) / 1e9
                 diag = node.drain_diagnostics()
                 if result.snapshot.state is not ControlState.PRECHECK_HOLD:
