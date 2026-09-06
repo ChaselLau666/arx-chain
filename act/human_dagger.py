@@ -815,6 +815,10 @@ def _run_ros_control(
             human_filter_min_cutoff_hz=human_filter_min_cutoff_hz,
             human_filter_beta=human_filter_beta,
             human_filter_d_cutoff_hz=human_filter_d_cutoff_hz,
+            **_ready_pose_settings(
+                runtime_config,
+                enabled_override=False if getattr(args, "no_ready_pose", False) else None,
+            ),
         )
     )
     rclpy.init(args=[])
@@ -1524,8 +1528,13 @@ def _run_ros_control(
                     ControlState.FAULT_HOLD,
                 ):
                     break
-                if result.snapshot.state is ControlState.MANUAL_RESET:
-                    # MANUAL_RESET is EEF control; force an explicit position HOLD first.
+                if result.snapshot.state in (
+                    ControlState.MANUAL_RESET,
+                    ControlState.READY_MOVE,
+                ):
+                    # MANUAL_RESET is EEF control and READY_MOVE is walking the
+                    # arms; both must be forced to an explicit position HOLD
+                    # before the loop is allowed to end.
                     core.request_fault("operator shutdown", now_ns)
 
             next_tick += frame_period
@@ -1577,10 +1586,46 @@ class SimpleRuntimeArgs:
         self.__dict__.update(values)
 
 
+def _ready_pose_settings(
+    config: Mapping[str, Any],
+    enabled_override: bool | None = None,
+) -> dict[str, Any]:
+    """Turn the ``ready_pose`` config section into HumanDaggerConfig keywords.
+
+    An absent section, ``enabled: false``, or an operator override of ``False``
+    all return an empty mapping, which leaves the poses unset and the parking
+    move off.  The numbers were measured on this robot and are also carried by
+    tools/08_collect_ready_pose.sh; they are deliberately not passed to
+    X5Controller as ``go_home_position`` because act/shutdown_arm_home.py reads
+    that parameter to decide where the arms park before the lift comes down.
+    """
+
+    section = config.get("ready_pose") or {}
+    enabled = bool(section.get("enabled", False))
+    if enabled_override is not None:
+        enabled = enabled_override
+    if not enabled:
+        return {}
+    settings: dict[str, Any] = {
+        "ready_pose_left": tuple(float(angle) for angle in section["left"]),
+        "ready_pose_right": tuple(float(angle) for angle in section["right"]),
+        "ready_gripper": tuple(
+            float(value) for value in section.get("gripper", (0.0, 0.0))
+        ),
+        "ready_move_timeout_ns": int(float(section.get("timeout_s", 15.0)) * 1e9),
+        "ready_arrival_tolerance": float(section.get("arrival_tolerance", 0.05)),
+    }
+    steps = section.get("step_per_arm")
+    if steps is not None:
+        settings["ready_move_step_per_arm"] = tuple(float(step) for step in steps)
+    return settings
+
+
 def _state_hint(state: Any) -> str:
     hints = {
         "PRECHECK_HOLD": "waiting for health checks",
-        "MANUAL_RESET": "use VR to reset; [r] start, [q] quit",
+        "MANUAL_RESET": "use VR to reset; [r] go to ready pose and start, [q] quit",
+        "READY_MOVE": "arms moving to the ready pose - stand clear; [e] abort",
         "HANDOFF_TO_POLICY": "HOLD; resetting policy",
         "POLICY": "[space/trigger] human takeover, [e] end",
         "HANDOFF_TO_HUMAN": "HOLD; waiting for post-key VR and feedback",
@@ -1886,6 +1931,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--trigger-device",
         default="",
         help="evdev device whose KEY_1 press toggles policy/human control (empty disables)",
+    )
+    parser.add_argument(
+        "--no-ready-pose",
+        action="store_true",
+        help="do not park the arms at the configured ready pose when recording starts",
     )
     parser.add_argument("--mock-policy", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--mock-policy-delay", type=float, default=0.0, help=argparse.SUPPRESS)

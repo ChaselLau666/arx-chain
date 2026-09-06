@@ -48,6 +48,7 @@ Vector14 = Tuple[
 class ControlState(str, Enum):
     PRECHECK_HOLD = "PRECHECK_HOLD"
     MANUAL_RESET = "MANUAL_RESET"
+    READY_MOVE = "READY_MOVE"
     HANDOFF_TO_POLICY = "HANDOFF_TO_POLICY"
     POLICY = "POLICY"
     HANDOFF_TO_HUMAN = "HANDOFF_TO_HUMAN"
@@ -68,6 +69,7 @@ class CommandSource(str, Enum):
     POLICY = "POLICY"
     HUMAN = "HUMAN"
     POLICY_SLEW = "POLICY_SLEW"
+    READY_MOVE = "READY_MOVE"
 
 
 class ControlEvent(str, Enum):
@@ -89,6 +91,8 @@ class EventPriority(IntEnum):
 class TimelineEventName(str, Enum):
     PRECHECK_COMPLETE = "PRECHECK_COMPLETE"
     EPISODE_START_REQUEST = "EPISODE_START_REQUEST"
+    READY_MOVE_STARTED = "READY_MOVE_STARTED"
+    READY_MOVE_DONE = "READY_MOVE_DONE"
     TAKEOVER_REQUEST = "TAKEOVER_REQUEST"
     POLICY_RESUME_REQUEST = "POLICY_RESUME_REQUEST"
     EPISODE_END_REQUEST = "EPISODE_END_REQUEST"
@@ -124,6 +128,16 @@ def _validate_vector(values: Sequence[float], size: int, name: str) -> Optional[
     if not all(math.isfinite(float(value)) for value in values):
         return f"{name} contains a non-finite value"
     return None
+
+
+def _vectors_match(
+    left: Sequence[float],
+    right: Sequence[float],
+    tolerance: float,
+) -> bool:
+    """Whether every paired element is within ``tolerance`` of the other."""
+
+    return all(abs(a - b) <= tolerance for a, b in zip(left, right))
 
 
 def _validate_timestamp(timestamp_ns: int, name: str) -> Optional[str]:
@@ -350,6 +364,28 @@ class HumanDaggerConfig:
     gripper_trigger_close_above: float = 3.0
     gripper_open_value: float = 0.0
     gripper_closed_value: float = -3.384
+    # Where both arms park before an episode starts, and how they get there.
+    # Disabled unless a pose is configured, so a core without one behaves
+    # exactly as it did before the ready move existed; the Human DAgger app
+    # opts in via human_dagger.yaml.  ``ready_move_step_per_arm`` is the
+    # per-tick joint/gripper limit, deliberately gentler than the policy
+    # handoff slew because this move can cross a much larger distance.
+    ready_pose_left: Optional[Vector6] = None
+    ready_pose_right: Optional[Vector6] = None
+    ready_gripper: Tuple[float, float] = (0.0, 0.0)
+    ready_move_step_per_arm: Tuple[float, ...] = (
+        0.025,
+        0.025,
+        0.015,
+        0.025,
+        0.025,
+        0.025,
+        0.1,
+    )
+    ready_move_timeout_ns: int = 15_000_000_000
+    # Measured-arrival band, in radians, matching act/ready_pose.py and
+    # act/shutdown_arm_home.py so one number describes "the arms got there".
+    ready_arrival_tolerance: float = 0.05
     # One Euro smoothing of the HUMAN rebased target; min_cutoff <= 0 disables.
     # Disabled by default: the exact SE(3) rebase output is a tested contract.
     # The Human DAgger app opts in via human_dagger.yaml.
@@ -408,6 +444,56 @@ class HumanDaggerConfig:
             raise ValueError(
                 "human_filter_beta must be >= 0 and human_filter_d_cutoff_hz > 0"
             )
+        object.__setattr__(
+            self,
+            "ready_move_step_per_arm",
+            _float_tuple(self.ready_move_step_per_arm),
+        )
+        if (self.ready_pose_left is None) != (self.ready_pose_right is None):
+            raise ValueError("ready_pose_left and ready_pose_right must be set together")
+        if self.ready_pose_left is not None:
+            for field_name in ("ready_pose_left", "ready_pose_right"):
+                pose = _float_tuple(getattr(self, field_name))
+                if len(pose) != 6 or not all(math.isfinite(angle) for angle in pose):
+                    raise ValueError(f"{field_name} must be 6 finite joint angles")
+                object.__setattr__(self, field_name, pose)
+            gripper = _float_tuple(self.ready_gripper)
+            if len(gripper) != 2 or not all(math.isfinite(value) for value in gripper):
+                raise ValueError("ready_gripper must be two finite values")
+            object.__setattr__(self, "ready_gripper", gripper)
+            if len(self.ready_move_step_per_arm) != 7:
+                raise ValueError("ready_move_step_per_arm must have 7 elements")
+            if not all(
+                math.isfinite(step) and step > 0
+                for step in self.ready_move_step_per_arm
+            ):
+                raise ValueError(
+                    "ready_move_step_per_arm values must be finite and positive"
+                )
+            if int(self.ready_move_timeout_ns) <= 0:
+                raise ValueError("ready_move_timeout_ns must be positive")
+            if not math.isfinite(self.ready_arrival_tolerance) or (
+                self.ready_arrival_tolerance <= 0
+            ):
+                raise ValueError("ready_arrival_tolerance must be finite and positive")
+
+    @property
+    def ready_move_enabled(self) -> bool:
+        """Whether an episode parks the arms before handing over to the policy."""
+
+        return self.ready_pose_left is not None and self.ready_pose_right is not None
+
+    def ready_action(self) -> Vector14:
+        """The ready pose as one 14-D ``left(j0..j5, gripper), right(...)`` target."""
+
+        assert self.ready_pose_left is not None
+        assert self.ready_pose_right is not None
+        return (
+            *self.ready_pose_left,
+            self.ready_gripper[0],
+            *self.ready_pose_right,
+            self.ready_gripper[1],
+        )
 
 
 @dataclass(frozen=True)
@@ -465,6 +551,8 @@ class HumanDaggerCore:
         self._policy_reset_acknowledged = False
         self._policy_reset_ack_ns: Optional[int] = None
         self._slew_start_ns: Optional[int] = None
+        self._ready_started_ns: Optional[int] = None
+        self._ready_slew_action: Optional[Vector14] = None
         self._slew_start_action: Optional[Vector14] = None
         self._last_slew_action: Optional[Vector14] = None
 
@@ -798,6 +886,25 @@ class HumanDaggerCore:
             return
 
         if event is ControlEvent.END_EPISODE:
+            if self._state is ControlState.READY_MOVE:
+                # No EPISODE_END_REQUEST: the matching START_REQUEST is
+                # withheld until the policy handoff, so this episode never
+                # opened.  The state transition carries the reason instead.
+                self._invalidate_control_locked()
+                self._episode_active = False
+                # The arms have moved since MANUAL_RESET was last entered, so
+                # the teleop anchor has to be retaken here; reusing the stale
+                # one would jump them back on the first VR frame.  When the
+                # inputs are not fresh the anchor stays cleared and
+                # MANUAL_RESET holds, which the staleness checks then fault.
+                if self._feedback_fresh_locked(now) and self._vr_fresh_locked(now):
+                    self._capture_human_anchor_locked()
+                self._transition_locked(
+                    ControlState.MANUAL_RESET,
+                    now,
+                    "ready move abandoned",
+                )
+                return
             if self._state in (
                 ControlState.HANDOFF_TO_POLICY,
                 ControlState.POLICY,
@@ -827,13 +934,20 @@ class HumanDaggerCore:
 
         if event is ControlEvent.START_POLICY:
             if self._state is ControlState.MANUAL_RESET:
-                self._append_timeline_locked(
-                    TimelineEventName.EPISODE_START_REQUEST,
-                    queued.timestamp_ns,
-                )
                 self._episode_active = True
                 self._intervention_occurred = False
-                self._begin_policy_handoff_locked(now, "episode start")
+                if self.config.ready_move_enabled:
+                    # EPISODE_START_REQUEST is deliberately withheld until the
+                    # policy handoff actually begins: the recorder only opens
+                    # then, and an event emitted here would be dropped, leaving
+                    # the recorded handoff row without its opening request.
+                    self._begin_ready_move_locked(now, "episode start")
+                else:
+                    self._append_timeline_locked(
+                        TimelineEventName.EPISODE_START_REQUEST,
+                        queued.timestamp_ns,
+                    )
+                    self._begin_policy_handoff_locked(now, "episode start")
             return
 
         if event is ControlEvent.TAKEOVER:
@@ -862,6 +976,41 @@ class HumanDaggerCore:
                 )
                 self._begin_policy_handoff_locked(now, "operator resume")
 
+    def _ready_move_arrived_locked(self) -> bool:
+        """Whether the arms are commanded to, and measured at, the ready pose."""
+
+        if self._ready_slew_action is None:
+            # The measured POSITION_CONTROL frame has not been emitted yet.
+            return False
+        target = self.config.ready_action()
+        # Requiring the last emitted command to *be* the ready pose, rather than
+        # to be within one step of it, is what stops the move a full step short
+        # of where the episode is supposed to start.
+        if not _vectors_match(self._ready_slew_action, target, 1e-9):
+            return False
+        assert self._left_feedback is not None
+        assert self._right_feedback is not None
+        # Only the six joints are compared.  The gripper is a bounded actuator
+        # that cannot reach its command while it holds something, so gating
+        # arrival on it would hang the move.  A commanded-but-not-measured pose
+        # means something is holding the arms: starting the episode there would
+        # record a first frame that silently differs from every other episode.
+        tolerance = self.config.ready_arrival_tolerance
+        return _vectors_match(
+            self._left_feedback.joint_pos, target[:6], tolerance
+        ) and _vectors_match(
+            self._right_feedback.joint_pos, target[7:13], tolerance
+        )
+
+    def _begin_ready_move_locked(self, now: int, reason: str) -> None:
+        """Park both arms at the configured ready pose before the episode runs."""
+
+        self._invalidate_control_locked()
+        self._ready_started_ns = now
+        self._ready_slew_action = None
+        self._append_timeline_locked(TimelineEventName.READY_MOVE_STARTED, now, reason)
+        self._transition_locked(ControlState.READY_MOVE, now, reason)
+
     def _begin_policy_handoff_locked(self, now: int, reason: str) -> None:
         self._invalidate_control_locked()
         self._handoff_started_ns = now
@@ -885,6 +1034,8 @@ class HumanDaggerCore:
         self._slew_start_ns = None
         self._slew_start_action = None
         self._last_slew_action = None
+        self._ready_started_ns = None
+        self._ready_slew_action = None
         self._human_anchor = None
         self._latest_rebased_expert = None
         self._handoff_hold_published_ns = None
@@ -895,6 +1046,7 @@ class HumanDaggerCore:
 
         if self._state in (
             ControlState.MANUAL_RESET,
+            ControlState.READY_MOVE,
             ControlState.HANDOFF_TO_POLICY,
             ControlState.POLICY,
             ControlState.HANDOFF_TO_HUMAN,
@@ -906,6 +1058,23 @@ class HumanDaggerCore:
         if self._state in (ControlState.MANUAL_RESET, ControlState.HUMAN):
             if not self._vr_fresh_locked(now):
                 self._enter_fault_locked("VR timeout", now)
+            return
+
+        if self._state is ControlState.READY_MOVE:
+            assert self._ready_started_ns is not None
+            if self._ready_move_arrived_locked():
+                self._append_timeline_locked(TimelineEventName.READY_MOVE_DONE, now)
+                # EPISODE_START_REQUEST opens the recorded handoff row and the
+                # recorder starts on this same tick, so it has to be appended
+                # before the handoff events that follow it.
+                self._append_timeline_locked(TimelineEventName.EPISODE_START_REQUEST, now)
+                self._begin_policy_handoff_locked(now, "ready pose reached")
+            elif now - self._ready_started_ns > self.config.ready_move_timeout_ns:
+                seconds = self.config.ready_move_timeout_ns / 1_000_000_000
+                self._enter_fault_locked(
+                    f"arms did not reach the ready pose within {seconds:g}s",
+                    now,
+                )
             return
 
         if self._state is ControlState.HANDOFF_TO_HUMAN:
@@ -1064,14 +1233,33 @@ class HumanDaggerCore:
                 now,
             )
 
+        if self._state is ControlState.READY_MOVE:
+            if self._ready_slew_action is None:
+                # The first frame of the move publishes the measured position
+                # in POSITION_CONTROL.  MANUAL_RESET commands are END_CONTROL,
+                # so this lets the mode change land before any joint is asked
+                # to move.
+                self._ready_slew_action = self._feedback_as_action_locked()
+                return self._hold_command_locked(now)
+            slewed = self._slew_one_tick_locked(
+                self._ready_slew_action,
+                self.config.ready_action(),
+                self.config.ready_move_step_per_arm,
+            )
+            self._ready_slew_action = slewed
+            return self._policy_command_locked(slewed, CommandSource.READY_MOVE, now)
+
         return self._hold_command_locked(now)
 
     def _slew_one_tick_locked(
         self,
         previous: Sequence[float],
         target: Sequence[float],
+        step_per_arm: Optional[Sequence[float]] = None,
     ) -> Vector14:
-        steps = self.config.policy_slew_step_per_arm * 2
+        if step_per_arm is None:
+            step_per_arm = self.config.policy_slew_step_per_arm
+        steps = tuple(step_per_arm) * 2
         values = []
         for old, wanted, step in zip(previous, target, steps):
             delta = wanted - old

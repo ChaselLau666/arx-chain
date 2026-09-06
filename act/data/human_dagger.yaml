@@ -61,6 +61,34 @@ control:
   human_filter_beta: 0.15
   human_filter_d_cutoff_hz: 1.0
 
+# Where both arms park before every recorded episode. Pressing the record key
+# walks them here first, and the episode only starts once the arms are measured
+# to have arrived, so every dataset begins from the same pose.
+#
+# The joint angles were measured on this robot; tools/08_collect_ready_pose.sh
+# carries the same numbers for the ACT collection path. They are deliberately
+# NOT passed to X5Controller as go_home_position: act/shutdown_arm_home.py
+# reads that parameter to decide where the arms park before the lift comes
+# down, and that pose should stay the compact all-zeros one.
+#
+# The gripper values come from READY_GRIPPER in act/ready_pose.py.
+#
+# step_per_arm is the per-60Hz-tick joint/gripper limit. It is half the policy
+# handoff slew because this move can cross a much larger distance: 0.025 rad
+# per tick is 1.5 rad/s.
+#
+# Set enabled: false (or run with READY_POSE_MOVE=0) to switch the move off
+# without editing anything else; the record key then hands straight over to
+# the policy, exactly as it did before.
+ready_pose:
+  enabled: true
+  left:  [-0.0002, 0.9447, 0.8597, -0.5755,  0.0006, -0.0013]
+  right: [-0.0002, 0.9466, 0.8604, -0.5724, -0.0002, -0.0006]
+  gripper: [-2.9717, -2.9675]
+  step_per_arm: [0.025, 0.025, 0.015, 0.025, 0.025, 0.025, 0.1]
+  timeout_s: 15.0
+  arrival_tolerance: 0.05
+
 episode:
   max_timesteps: 800
   auto_save_without_intervention: true
