@@ -40,7 +40,7 @@ control:
   # are parsed inside a closed-source library, and mode1 is also consumed
   # by the body controller as a chassis command. Only TAKEOVER is
   # automated; returning to the policy stays on the P key.
-  vr_engage_enabled: true
+  vr_engage_enabled: false
   vr_engage_field: mode1
   vr_engage_side: left
   vr_engage_active_value: 1

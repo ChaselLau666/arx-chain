@@ -231,7 +231,7 @@ class HumanDaggerScriptTests(unittest.TestCase):
             'vr_timeout_ms: 100',
             'policy_timeout_ms: 250',
             'handoff_timeout_s: 2.0',
-            'vr_engage_enabled: true',
+            'vr_engage_enabled: false',
             'vr_engage_field: mode1',
             'gripper_trigger_open_below: 2.0',
             'gripper_trigger_close_above: 3.0',
