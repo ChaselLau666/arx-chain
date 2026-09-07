@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 import sys
 import tempfile
 import unittest
@@ -25,7 +26,7 @@ from tau0vla_protocol import (  # noqa: E402
     Tau0VLAHttpClient,
     recommended_replan_steps,
 )
-from tau0vla_trace import TraceWriter, analyze_trace  # noqa: E402
+from tau0vla_trace import TraceWriter, analyze_trace, plot_trace, write_trace_summary  # noqa: E402
 
 
 def _chunk(round_trip_ms: float, base: float = 0.0) -> ActionChunk:
@@ -200,6 +201,33 @@ class ChunkSchedulerTest(unittest.TestCase):
             summary = analyze_trace(path)
         self.assertEqual(summary["ticks"], 3)
         self.assertAlmostEqual(summary["tracking_error_max"], 0.1, places=5)
+
+    def test_trace_summary_and_optional_plots_are_saved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trace.jsonl"
+            writer = TraceWriter(path)
+            scheduler = ChunkScheduler(replan_steps=4, blend_steps=0)
+            chunk = _chunk(0.0)
+            writer.metadata(execute=True, model_id="model")
+            writer.adoption(chunk.request_id, scheduler.adopt(chunk, initial=True))
+            for control_step in range(3):
+                scheduled = scheduler.next_action()
+                writer.tick(
+                    monotonic_ns=1_000_000_000 + control_step * 33_333_333,
+                    control_step=control_step,
+                    scheduled=scheduled,
+                    command=scheduled.action,
+                    feedback=scheduled.action + .1,
+                    execute=True,
+                )
+            writer.close()
+            summary = analyze_trace(path)
+            summary_path = write_trace_summary(path, summary)
+            self.assertEqual(summary_path.name, "trace_summary.json")
+            if importlib.util.find_spec("matplotlib"):
+                outputs = plot_trace(path)
+                self.assertEqual(len(outputs), 2)
+                self.assertTrue(all(output.stat().st_size > 0 for output in outputs))
 
 
 class HttpClientTest(unittest.TestCase):

@@ -28,7 +28,7 @@ from tau0vla_protocol import (
     Tau0VLAHttpClient,
     resolve_replan_steps as _resolve_replan_steps,
 )
-from tau0vla_trace import TraceWriter, analyze_trace
+from tau0vla_trace import TraceWriter, analyze_trace, plot_trace, write_trace_summary
 from utils.setup_loader import setup_loader
 
 
@@ -285,7 +285,11 @@ def run(args) -> None:
             session_id=session["session_id"],
             server_url=args.server_url,
             task_instruction=args.task_instruction,
+            model_id=health.get("model_id"),
+            route=health.get("route"),
+            checkpoint_sha256=health.get("checkpoint_sha256"),
             execute=args.execute,
+            replan_steps=args.replan_steps,
             blend_steps=args.chunk_blend_steps,
             gripper_blend_steps=args.gripper_blend_steps,
             arm_ema_alpha=args.arm_ema_alpha,
@@ -429,9 +433,13 @@ def run(args) -> None:
         if args.trace_path is not None and args.trace_path.exists():
             try:
                 print(f"Trace: {args.trace_path}")
-                print(f"Trace summary: {json.dumps(analyze_trace(args.trace_path), sort_keys=True)}")
+                summary = analyze_trace(args.trace_path)
+                print(f"Trace summary: {json.dumps(summary, sort_keys=True)}")
+                print(f"Trace summary file: {write_trace_summary(args.trace_path, summary)}")
+                plots = plot_trace(args.trace_path)
+                print("Trace plots: " + ", ".join(str(path) for path in plots))
             except Exception as error:  # trace analysis must never block ROS cleanup
-                print(f"Trace analysis failed: {error}")
+                print(f"Trace report generation failed: {error}")
 
 
 def parse_args():

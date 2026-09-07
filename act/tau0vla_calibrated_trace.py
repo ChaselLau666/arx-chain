@@ -1,25 +1,13 @@
-"""Low-overhead JSONL tracing and smoothness metrics for Tau0VLA rollout."""
-
+"""JSONL trace and plots for calibrated-v3 rollout."""
 from __future__ import annotations
 
-import argparse
 import json
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
-from tau0vla_protocol import AdoptionInfo, ScheduledAction
-
-
-ARM_INDICES = np.asarray([0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12])
-GRIPPER_INDICES = np.asarray([6, 13])
-JOINT_NAMES = tuple(
-    [f"left_j{i}" for i in range(6)]
-    + ["left_gripper"]
-    + [f"right_j{i}" for i in range(6)]
-    + ["right_gripper"]
-)
+from tau0vla_calibrated_protocol import ARM_INDICES, GRIPPER_INDICES, JOINT_NAMES
 
 
 class TraceWriter:
@@ -43,55 +31,51 @@ class TraceWriter:
     def metadata(self, **values: Any) -> None:
         self._write({"event": "metadata", **values})
 
-    def adoption(self, request_id: int, info: AdoptionInfo) -> None:
-        self._write(
-            {
-                "event": "adoption",
-                "request_id": int(request_id),
-                "skipped": info.skipped,
-                "blended_steps": info.blended_steps,
-                "gripper_blended_steps": info.gripper_blended_steps,
-                "age_ms": info.age_ms,
-                "raw_boundary_jump_max": info.raw_boundary_jump_max,
-                "blended_boundary_jump_max": info.blended_boundary_jump_max,
-            }
-        )
+    def adoption(self, request_id: int, info) -> None:
+        self._write({
+            "event": "adoption",
+            "request_id": int(request_id),
+            "arm_skipped": info.arm_skipped,
+            "gripper_skipped": info.gripper_skipped,
+            "blended_steps": info.blended_steps,
+            "gripper_blended_steps": info.gripper_blended_steps,
+            "age_ms": info.age_ms,
+            "raw_boundary_jump_max": info.raw_boundary_jump_max,
+            "blended_boundary_jump_max": info.blended_boundary_jump_max,
+        })
 
     def tick(
         self,
         *,
         monotonic_ns: int,
         control_step: int,
-        scheduled: ScheduledAction,
+        scheduled,
         command: np.ndarray,
         feedback: np.ndarray,
         execute: bool,
-        gripper_stabilizer: dict[str, Any] | None = None,
     ) -> None:
-        payload = {
+        self._write({
             "event": "tick",
             "monotonic_ns": int(monotonic_ns),
             "control_step": int(control_step),
             "execute": bool(execute),
             "request_id": scheduled.request_id,
-            "source_index": scheduled.source_index,
-            "skipped": scheduled.skipped,
+            "arm_source_index": scheduled.arm_source_index,
+            "gripper_source_index": scheduled.gripper_source_index,
+            "arm_skipped": scheduled.arm_skipped,
+            "gripper_skipped": scheduled.gripper_skipped,
             "blend_alpha": scheduled.blend_alpha,
             "gripper_blend_alpha": scheduled.gripper_blend_alpha,
             "round_trip_ms": scheduled.round_trip_ms,
-            "raw_action": scheduled.raw_action.tolist(),
+            "model_calibrated_action": scheduled.calibrated_action.tolist(),
+            "mapped_raw_action": scheduled.raw_action.tolist(),
             "scheduled_action": scheduled.action.tolist(),
             "command": np.asarray(command, dtype=np.float32).tolist(),
             "feedback": np.asarray(feedback, dtype=np.float32).tolist(),
-        }
-        if gripper_stabilizer is not None:
-            payload["gripper_stabilizer"] = gripper_stabilizer
-        self._write(payload)
+        })
 
     def starvation(self, monotonic_ns: int, control_step: int) -> None:
-        self._write(
-            {"event": "starvation", "monotonic_ns": int(monotonic_ns), "control_step": int(control_step)}
-        )
+        self._write({"event": "starvation", "monotonic_ns": monotonic_ns, "control_step": control_step})
 
     def close(self) -> None:
         if self._stream is not None:
@@ -100,73 +84,52 @@ class TraceWriter:
             self._stream = None
 
 
-def _series_metrics(array: np.ndarray, indices: np.ndarray) -> dict[str, float]:
-    if len(array) < 2:
-        return {"step_p95": 0.0, "step_max": 0.0, "jerk_p95": 0.0, "jerk_max": 0.0}
-    step = np.max(np.abs(np.diff(array[:, indices], axis=0)), axis=1)
-    jerk = np.max(np.abs(np.diff(array[:, indices], n=2, axis=0)), axis=1) if len(array) >= 3 else np.zeros(1)
-    return {
-        "step_p95": float(np.percentile(step, 95)),
-        "step_max": float(np.max(step)),
-        "jerk_p95": float(np.percentile(jerk, 95)),
-        "jerk_max": float(np.max(jerk)),
-    }
-
-
-def _boundary_metrics(current: np.ndarray, previous: np.ndarray, indices: np.ndarray) -> dict[str, float]:
-    if len(current) == 0:
-        return {"p95": 0.0, "max": 0.0}
-    delta = np.max(np.abs(current[:, indices] - previous[:, indices]), axis=1)
-    return {"p95": float(np.percentile(delta, 95)), "max": float(np.max(delta))}
-
-
 def analyze_trace(path: str | Path) -> dict[str, Any]:
-    events = [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines() if line.strip()]
+    events = [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines() if line]
     ticks = [event for event in events if event.get("event") == "tick"]
     adoptions = [event for event in events if event.get("event") == "adoption"]
     starvation = sum(event.get("event") == "starvation" for event in events)
     if not ticks:
         return {"ticks": 0, "adoptions": len(adoptions), "starvation": starvation}
     command = np.asarray([row["command"] for row in ticks], dtype=np.float32)
-    scheduled = np.asarray([row["scheduled_action"] for row in ticks], dtype=np.float32)
-    raw = np.asarray([row["raw_action"] for row in ticks], dtype=np.float32)
     feedback = np.asarray([row["feedback"] for row in ticks], dtype=np.float32)
+    mapped = np.asarray([row["mapped_raw_action"] for row in ticks], dtype=np.float32)
     request_ids = np.asarray([row["request_id"] for row in ticks])
-    boundary = np.flatnonzero(request_ids[1:] != request_ids[:-1]) + 1
-    boundary_step = (
-        np.max(np.abs(command[boundary] - command[boundary - 1]), axis=1)
-        if len(boundary)
-        else np.zeros(1, dtype=np.float32)
-    )
-    raw_jumps = np.asarray([row["raw_boundary_jump_max"] for row in adoptions[1:]], dtype=np.float32)
-    blended_jumps = np.asarray([row["blended_boundary_jump_max"] for row in adoptions[1:]], dtype=np.float32)
+    boundaries = np.flatnonzero(request_ids[1:] != request_ids[:-1]) + 1
+
+    def metrics(values, indices):
+        step = np.max(np.abs(np.diff(values[:, indices], axis=0)), axis=1) if len(values) > 1 else np.zeros(1)
+        jerk = np.max(np.abs(np.diff(values[:, indices], n=2, axis=0)), axis=1) if len(values) > 2 else np.zeros(1)
+        return {
+            "step_p95": float(np.percentile(step, 95)),
+            "step_max": float(np.max(step)),
+            "jerk_p95": float(np.percentile(jerk, 95)),
+            "jerk_max": float(np.max(jerk)),
+        }
+
     tracking = np.max(np.abs(command - feedback), axis=1)
-    boundary_previous = command[boundary - 1] if len(boundary) else np.empty((0, command.shape[1]))
+    boundary_step = (
+        np.max(np.abs(command[boundaries] - command[boundaries - 1]), axis=1)
+        if len(boundaries)
+        else np.zeros(1)
+    )
     return {
         "ticks": len(ticks),
         "adoptions": len(adoptions),
         "starvation": starvation,
-        "boundary_count": int(len(boundary)),
+        "boundary_count": int(len(boundaries)),
         "boundary_step_p95": float(np.percentile(boundary_step, 95)),
         "boundary_step_max": float(np.max(boundary_step)),
-        "raw_boundary_jump_p95": float(np.percentile(raw_jumps, 95)) if len(raw_jumps) else 0.0,
-        "blended_boundary_jump_p95": float(np.percentile(blended_jumps, 95)) if len(blended_jumps) else 0.0,
-        "boundary": {
-            "raw_arm": _boundary_metrics(raw[boundary], boundary_previous, ARM_INDICES),
-            "scheduled_arm": _boundary_metrics(scheduled[boundary], boundary_previous, ARM_INDICES),
-            "command_arm": _boundary_metrics(command[boundary], boundary_previous, ARM_INDICES),
-            "raw_gripper": _boundary_metrics(raw[boundary], boundary_previous, GRIPPER_INDICES),
-            "scheduled_gripper": _boundary_metrics(scheduled[boundary], boundary_previous, GRIPPER_INDICES),
-            "command_gripper": _boundary_metrics(command[boundary], boundary_previous, GRIPPER_INDICES),
-        },
-        "arm": _series_metrics(command, ARM_INDICES),
-        "gripper": _series_metrics(command, GRIPPER_INDICES),
+        "arm": metrics(command, ARM_INDICES),
+        "gripper": metrics(command, GRIPPER_INDICES),
+        "mapped_gripper_min": np.min(mapped[:, GRIPPER_INDICES], axis=0).tolist(),
+        "mapped_gripper_max": np.max(mapped[:, GRIPPER_INDICES], axis=0).tolist(),
         "tracking_error_p95": float(np.percentile(tracking, 95)),
         "tracking_error_max": float(np.max(tracking)),
     }
 
 
-def write_trace_summary(path: str | Path, summary: dict[str, Any]) -> Path:
+def write_summary(path: str | Path, summary: dict[str, Any]) -> Path:
     source = Path(path)
     target = source.with_name(f"{source.stem}_summary.json")
     target.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -174,7 +137,6 @@ def write_trace_summary(path: str | Path, summary: dict[str, Any]) -> Path:
 
 
 def plot_trace(path: str | Path) -> list[Path]:
-    """Render state/action and runtime diagnostics without requiring a display."""
     import matplotlib
 
     matplotlib.use("Agg")
@@ -188,17 +150,18 @@ def plot_trace(path: str | Path) -> list[Path]:
     metadata = next((event for event in events if event.get("event") == "metadata"), {})
     ns = np.asarray([row["monotonic_ns"] for row in ticks], dtype=np.int64)
     seconds = (ns - ns[0]) / 1e9
-    raw = np.asarray([row["raw_action"] for row in ticks])
+    mapped = np.asarray([row["mapped_raw_action"] for row in ticks])
     scheduled = np.asarray([row["scheduled_action"] for row in ticks])
     command = np.asarray([row["command"] for row in ticks])
     feedback = np.asarray([row["feedback"] for row in ticks])
+    calibrated = np.asarray([row["model_calibrated_action"] for row in ticks])
 
     state_path = source.with_name(f"{source.stem}_state_action.png")
     figure, axes = plt.subplots(7, 2, figsize=(18, 22), sharex=True)
     for row in range(7):
         for column, index in enumerate((row, row + 7)):
             axis = axes[row, column]
-            axis.plot(seconds, raw[:, index], color="0.65", linewidth=.7, label="model raw")
+            axis.plot(seconds, mapped[:, index], color="0.6", linewidth=.7, label="mapped raw")
             axis.plot(seconds, scheduled[:, index], color="#ff7f0e", linewidth=.8, label="scheduled")
             axis.plot(seconds, command[:, index], color="#d62728", linewidth=1.0, label="command")
             axis.plot(seconds, feedback[:, index], color="#1f77b4", linewidth=1.0, label="feedback")
@@ -208,7 +171,10 @@ def plot_trace(path: str | Path) -> list[Path]:
     axes[-1, 1].set_xlabel("rollout time (s)")
     handles, labels = axes[0, 0].get_legend_handles_labels()
     figure.legend(handles, labels, loc="upper center", ncol=4)
-    figure.suptitle(f"Tau0VLA state/action\n{metadata.get('model_id', '')}", y=.995)
+    figure.suptitle(
+        f"Calibrated Tau0VLA state/action\n{metadata.get('model_id', '')} "
+        f"{metadata.get('experiment', '')}", y=.995
+    )
     figure.tight_layout(rect=(0, 0, 1, .97))
     figure.savefig(state_path, dpi=150)
     plt.close(figure)
@@ -221,6 +187,8 @@ def plot_trace(path: str | Path) -> list[Path]:
     axes[1].plot(seconds, grip_step, label="gripper command step")
     axes[2].plot(seconds, np.max(np.abs(command-feedback), axis=1), label="tracking error")
     axes[3].plot(seconds, [row["round_trip_ms"] for row in ticks], label="RTT ms")
+    for side, index in zip(("left", "right"), GRIPPER_INDICES, strict=True):
+        axes[1].plot(seconds, calibrated[:, index], alpha=.45, label=f"{side} calibrated output")
     for axis in axes:
         axis.grid(alpha=.25)
         axis.legend(loc="upper right")
@@ -231,18 +199,4 @@ def plot_trace(path: str | Path) -> list[Path]:
     return [state_path, diag_path]
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("trace", type=Path)
-    parser.add_argument("--plot", action="store_true")
-    args = parser.parse_args()
-    summary = analyze_trace(args.trace)
-    print(json.dumps(summary, indent=2, sort_keys=True))
-    if args.plot:
-        print(f"summary: {write_trace_summary(args.trace, summary)}")
-        for output in plot_trace(args.trace):
-            print(f"plot: {output}")
-
-
-if __name__ == "__main__":
-    main()
+__all__ = ["TraceWriter", "analyze_trace", "plot_trace", "write_summary"]

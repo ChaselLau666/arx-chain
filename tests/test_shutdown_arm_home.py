@@ -51,6 +51,9 @@ class HomeTests(unittest.TestCase):
         self.assertLess(home, lower)
         self.assertLess(script.index('echo "Human DAgger HOLD acknowledged."'), home)
         self.assertLess(script.index('stop_pattern "Tau0VLA inference"'), home)
+        self.assertLess(script.index('stop_pattern "Tau0VLA gripper calibration"'), home)
+        self.assertIn('tau0vla(_calibrated)?_client.py', script)
+        self.assertIn('tau0vla_calibrate_gripper.py', script)
         self.assertIn('set -euo pipefail', script)
         # Exercise the exact HOME block with stubbed process/ROS environment.
         block = script[script.index('# HOME must complete'):script.index("if ros2 node list")]
