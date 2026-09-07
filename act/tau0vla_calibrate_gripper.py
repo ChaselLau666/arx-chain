@@ -40,7 +40,9 @@ def create_node(config: dict):
             self._message_type = RobotStatus
             self._lock = threading.Lock()
             self._feedback = {"left": deque(maxlen=4000), "right": deque(maxlen=4000)}
-            self._publishers = {
+            # Do not shadow rclpy.Node._publishers; destroy_node() owns that
+            # internal list and expects integer indexing.
+            self._command_publishers = {
                 "left": self.create_publisher(
                     RobotStatus, config["arm_config"]["follow_arm_left_cmd_topic"], 10
                 ),
@@ -87,7 +89,7 @@ def create_node(config: dict):
             for side in ("left", "right"):
                 message = self._message_type()
                 message.joint_pos[:7] = [float(value) for value in targets[side]]
-                self._publishers[side].publish(message)
+                self._command_publishers[side].publish(message)
 
     return CalibrationNode()
 
@@ -116,6 +118,24 @@ def ramp(node, targets, side: str, target: float, *, step: float, rate_hz: float
         time.sleep(period)
 
 
+def hold(node, targets, seconds: float, *, rate_hz: float, stop) -> None:
+    """Keep publishing the reached target while hardware settles."""
+    deadline = time.monotonic() + seconds
+    period = 1.0 / rate_hz
+    while time.monotonic() < deadline:
+        if stop.is_set():
+            raise CalibrationError("calibration interrupted")
+        node.publish(targets)
+        time.sleep(period)
+
+
+def spin_node(node, stop) -> None:
+    import rclpy
+
+    while rclpy.ok() and not stop.is_set():
+        rclpy.spin_once(node, timeout_sec=.01)
+
+
 def run(args) -> Path:
     if not args.execute:
         print("DRY-RUN: no publisher is created; pass --execute for the guarded calibration.")
@@ -135,7 +155,7 @@ def run(args) -> Path:
     rclpy.init()
     node = create_node(config)
     stop = threading.Event()
-    spin = threading.Thread(target=rclpy.spin, args=(node,), daemon=True)
+    spin = threading.Thread(target=spin_node, args=(node, stop), daemon=True)
     spin.start()
     signal.signal(signal.SIGINT, lambda *_: stop.set())
     try:
@@ -150,6 +170,13 @@ def run(args) -> Path:
                     side,
                     float(command),
                     step=args.step,
+                    rate_hz=args.rate_hz,
+                    stop=stop,
+                )
+                hold(
+                    node,
+                    targets,
+                    args.pre_settle_s,
                     rate_hz=args.rate_hz,
                     stop=stop,
                 )
@@ -169,6 +196,13 @@ def run(args) -> Path:
                 rate_hz=args.rate_hz,
                 stop=stop,
             )
+        hold(
+            node,
+            targets,
+            args.pre_settle_s,
+            rate_hz=args.rate_hz,
+            stop=stop,
+        )
         final_open = node.sample_grippers(args.open_settle_s, args.rate_hz)
         left = fit_side(COMMAND_POINTS, feedback_windows["left"], final_open[:, 0])
         right = fit_side(COMMAND_POINTS, feedback_windows["right"], final_open[:, 1])
@@ -189,9 +223,10 @@ def run(args) -> Path:
         print(f"Calibration saved: {args.output}")
         return args.output
     finally:
+        stop.set()
+        spin.join(timeout=2.0)
         node.destroy_node()
         rclpy.shutdown()
-        spin.join(timeout=2.0)
 
 
 def parse_args():
@@ -201,6 +236,7 @@ def parse_args():
     parser.add_argument("--step", type=float, default=0.05)
     parser.add_argument("--rate-hz", type=float, default=60.0)
     parser.add_argument("--settle-s", type=float, default=1.5)
+    parser.add_argument("--pre-settle-s", type=float, default=.5)
     parser.add_argument("--open-settle-s", type=float, default=2.0)
     parser.add_argument("--config", type=Path, default=ROOT / "data/config.yaml")
     parser.add_argument(
@@ -215,6 +251,8 @@ def parse_args():
         parser.error("--rate-hz is fixed at 60 for reviewed calibration")
     if args.settle_s < 1.5 or args.open_settle_s < 2.0:
         parser.error("settle windows may not be shorter than the reviewed defaults")
+    if args.pre_settle_s < .5:
+        parser.error("--pre-settle-s may not be shorter than 0.5")
     return args
 
 

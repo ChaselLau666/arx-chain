@@ -247,3 +247,11 @@ def test_http_client_validates_contract_and_maps_grippers():
     result = client.infer(observation, 1)
     assert result.native_actions.shape == (30, 14)
     assert result.native_actions[0, 6] == pytest.approx(-3.39, abs=1e-5)
+
+
+def test_ros_calibration_does_not_shadow_node_publishers_and_pre_settles():
+    source = (ROOT / "act/tau0vla_calibrate_gripper.py").read_text(encoding="utf-8")
+    assert "self._publishers =" not in source
+    assert "self._command_publishers" in source
+    assert "args.pre_settle_s" in source
+    assert source.index("args.pre_settle_s") < source.index("node.sample_grippers(args.settle_s")
