@@ -30,13 +30,13 @@ for n in "${interfaces[@]}"; do
   # A dead slcand can leave a half-created interface behind; clear it first.
   if ip link show "$iface" >/dev/null 2>&1; then
     echo "${iface}: exists but not UP; recreating"
-    sudo ip link set "$iface" down 2>/dev/null || true
+    sudo -n ip link set "$iface" down 2>/dev/null || true
     pids=$(pgrep -f "slcand .*${dev} ${iface}" || true)
-    [[ -n "$pids" ]] && sudo kill $pids && sleep 0.5
+    [[ -n "$pids" ]] && sudo -n kill $pids && sleep 0.5
   fi
 
-  sudo slcand -o -f -s8 "$dev" "$iface"
-  sudo ip link set "$iface" up
+  sudo -n slcand -o -f -s8 "$dev" "$iface"
+  sudo -n ip link set "$iface" up
   echo "${iface}: created and UP"
 done
 

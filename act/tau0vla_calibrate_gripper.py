@@ -143,7 +143,9 @@ def run(args) -> Path:
         return args.output
     print("This moves one gripper at a time while holding all arm joints at current feedback.")
     print(f"Command points: {COMMAND_POINTS.tolist()}, then return to {COMMAND_POINTS[0]:.2f}.")
-    if input("Type CALIBRATE BOTH GRIPPERS to continue: ") != "CALIBRATE BOTH GRIPPERS":
+    if args.auto_confirm:
+        print("AUTO-CONFIRM: calibrating both grippers.")
+    elif input("Type CALIBRATE BOTH GRIPPERS to continue: ") != "CALIBRATE BOTH GRIPPERS":
         raise CalibrationError("calibration cancelled; no publisher was created")
 
     import rclpy
@@ -233,6 +235,7 @@ def parse_args():
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--execute", action="store_true")
+    parser.add_argument("--auto-confirm", action="store_true")
     parser.add_argument("--step", type=float, default=0.05)
     parser.add_argument("--rate-hz", type=float, default=60.0)
     parser.add_argument("--settle-s", type=float, default=1.5)

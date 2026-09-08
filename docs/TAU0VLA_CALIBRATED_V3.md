@@ -59,10 +59,12 @@ MODEL_SERVER_URL=http://192.168.50.2:8000 \
 
 During validation use candidate port `8001`. Profiles are `blue-feedback`, `t-feedback`, `blue-vr`, and `t-vr`. Before inference, `MOVE TO FIXED INITIAL POSE` is required and arrival is checked against `act/data/tau0vla_calibrated_ready.yaml`. Grippers remain at the full-open feedback measured by the current calibration, with their commands obtained through the fitted inverse rather than by treating feedback as command coordinates.
 
-The one-command rollout deliberately does not return from inside its `Ctrl-C` handler. Stop policy publication, wait for the shell prompt, clear the path, then run the independent command below. It locates the newest calibration from the current boot, rejects changed controller identities or an artifact older than 15 minutes, and does not require the rollout trace:
+The one-command execute path is non-interactive: it starts/reuses the hardware stack, performs the full two-gripper calibration, moves to the fixed training pose, starts policy publication, and returns to the fixed pose when either the operator presses `Ctrl-C` once or `MAX_STEPS` is reached. It prints `AUTO-CONFIRM` at each movement transition instead of reading confirmation text. The workspace must therefore be clear and the emergency stop reachable before the command is launched. A second `Ctrl-C` during return aborts movement.
+
+Protocol, calibration, sensor, mapping, response-age, and other unexpected errors remain fail-stop and never trigger automatic movement. After such an error, or if the policy process is externally killed, use the independent return command below. It locates the newest calibration from the current boot, rejects changed controller identities or an artifact older than 15 minutes, and does not require the rollout trace or model server:
 
 ```bash
 ./06_tau0vla_return_fixed.sh --execute
 ```
 
-Type `RETURN TO FIXED INITIAL POSE` to move. A protocol error or emergency stop never initiates return automatically. After a verified return, rerun the rollout command; it creates a fresh one-use calibration.
+The standalone command is also non-interactive and begins the fixed-pose move immediately after all identity and age checks pass. After a verified return, rerun the rollout command; it creates a fresh one-use calibration.

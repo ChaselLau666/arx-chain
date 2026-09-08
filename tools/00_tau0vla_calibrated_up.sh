@@ -1,7 +1,7 @@
 #!/bin/bash
 # One-command, idempotent ARX2 hardware bring-up for calibrated Tau0VLA.
-# It never starts policy or calibration publishers. Lift/arm movement remains
-# behind the exact START CALIBRATED STACK confirmation.
+# It never starts policy or calibration publishers. The calibrated rollout can
+# opt into the reviewed non-interactive sequence with --auto-confirm.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -55,9 +55,14 @@ report() {
   echo
 }
 
+auto_confirm=false
 if [[ "${1:-}" == --check ]]; then
   report
   exit 0
+fi
+if [[ "${1:-}" == --auto-confirm ]]; then
+  auto_confirm=true
+  shift
 fi
 if [[ $# -gt 0 ]]; then
   echo "Unknown argument: $1" >&2
@@ -66,14 +71,21 @@ fi
 
 echo "This starts CAN, raises the lift, powers both v2 arms, and starts three cameras."
 echo "It does not calibrate grippers or run a policy. Clear the full workspace first."
-read -r -p "Type START CALIBRATED STACK to continue: " confirmation
-if [[ "${confirmation}" != "START CALIBRATED STACK" ]]; then
-  echo "Cancelled; nothing was changed."
-  exit 1
+if [[ "${auto_confirm}" == true ]]; then
+  echo "AUTO-CONFIRM: starting the calibrated hardware stack."
+else
+  read -r -p "Type START CALIBRATED STACK to continue: " confirmation
+  if [[ "${confirmation}" != "START CALIBRATED STACK" ]]; then
+    echo "Cancelled; nothing was changed."
+    exit 1
+  fi
 fi
 
-sudo nmcli connection up "有线连接 1" >/dev/null
 route_info=$(ip route get 192.168.50.2 2>/dev/null || true)
+if [[ "${route_info}" != *"dev ${DIRECT_INTERFACE}"* || "${route_info}" != *"src ${DIRECT_CLIENT_IP}"* ]]; then
+  nmcli connection up "有线连接 1" >/dev/null
+  route_info=$(ip route get 192.168.50.2 2>/dev/null || true)
+fi
 if [[ "${route_info}" != *"dev ${DIRECT_INTERFACE}"* || "${route_info}" != *"src ${DIRECT_CLIENT_IP}"* ]]; then
   echo "Refused: direct route is not active: ${route_info:-unavailable}" >&2
   exit 1

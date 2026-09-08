@@ -156,7 +156,9 @@ def run(args):
         if args.trace is not None
         else "RETURN TO FIXED INITIAL POSE"
     )
-    if input(f"Type {confirmation_text} to move: ") != confirmation_text:
+    if args.auto_confirm:
+        print(f"AUTO-CONFIRM: {confirmation_text}")
+    elif input(f"Type {confirmation_text} to move: ") != confirmation_text:
         raise RuntimeError("return recovery cancelled")
 
     setup_loader(ROOT)
@@ -228,6 +230,7 @@ def parse_args():
     source.add_argument("--trace", type=Path)
     source.add_argument("--calibration-file", type=Path)
     parser.add_argument("--execute", action="store_true")
+    parser.add_argument("--auto-confirm", action="store_true")
     parser.add_argument("--max-trace-age-s", type=float, default=1800.0)
     parser.add_argument("--max-calibration-age-s", type=float, default=900.0)
     parser.add_argument("--config", type=Path, default=ROOT/"data/config.yaml")

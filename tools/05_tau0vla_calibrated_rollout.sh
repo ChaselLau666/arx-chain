@@ -59,7 +59,7 @@ case "${1:-}" in
 esac
 
 export MODEL_SERVER_URL
-"${script_dir}/00_tau0vla_calibrated_up.sh"
+"${script_dir}/00_tau0vla_calibrated_up.sh" --auto-confirm
 
 health=$(curl --fail --silent --show-error --noproxy '*' --max-time 5 \
   "${MODEL_SERVER_URL}/health")
@@ -85,7 +85,7 @@ set -u
 
 cd "${repo_root}/act"
 set -o pipefail
-python tau0vla_calibrate_gripper.py --execute --output "${calibration}" \
+python tau0vla_calibrate_gripper.py --execute --auto-confirm --output "${calibration}" \
   2>&1 | tee -a "${calibration_log}"
 test -f "${calibration}"
 
@@ -106,5 +106,5 @@ exec python tau0vla_calibrated_client.py \
   --trace-path "${trace}" \
   --log-path "${client_log}" \
   --max-steps "${max_steps}" \
-  --no-return-to-initial \
+  --auto-confirm \
   "${policy_mode[@]}"

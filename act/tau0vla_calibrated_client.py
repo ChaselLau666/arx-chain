@@ -422,7 +422,10 @@ def run(args) -> None:
             print("Second Ctrl-C: return motion aborted; no more commands will be published.")
         else:
             policy_stop.set()
-            print("Ctrl-C: policy publication stopping; return confirmation will follow.")
+            if args.auto_confirm:
+                print("Ctrl-C: policy publication stopping; automatic fixed-pose return will follow.")
+            else:
+                print("Ctrl-C: policy publication stopping; return confirmation will follow.")
 
     signal.signal(signal.SIGINT, handle_interrupt)
     executor = ThreadPoolExecutor(max_workers=1)
@@ -465,6 +468,7 @@ def run(args) -> None:
             calibration_id=calibration.calibration_id,
             calibration=calibration.to_dict(),
             execute=args.execute,
+            auto_confirm=args.auto_confirm,
             replan_steps=args.replan_steps,
             blend_steps=args.chunk_blend_steps,
             gripper_blend_steps=args.gripper_blend_steps,
@@ -475,12 +479,15 @@ def run(args) -> None:
         )
         if args.execute:
             print(f"Fixed initial feedback target: {np.array2string(ready_feedback, precision=4)}")
-            confirmation = input(
-                "Clear the full arm path and keep the emergency stop reachable. "
-                "Type MOVE TO FIXED INITIAL POSE to continue: "
-            )
-            if confirmation != "MOVE TO FIXED INITIAL POSE":
-                raise RuntimeError("fixed initial-pose move cancelled; policy was not started")
+            if args.auto_confirm:
+                print("AUTO-CONFIRM: moving to the fixed initial pose.")
+            else:
+                confirmation = input(
+                    "Clear the full arm path and keep the emergency stop reachable. "
+                    "Type MOVE TO FIXED INITIAL POSE to continue: "
+                )
+                if confirmation != "MOVE TO FIXED INITIAL POSE":
+                    raise RuntimeError("fixed initial-pose move cancelled; policy was not started")
             node.enable_publishers()
             motion_active.set()
             try:
@@ -522,12 +529,15 @@ def run(args) -> None:
         trace.adoption(first.request_id, adoption)
 
         if args.execute:
-            confirmation = input(
-                "Workspace clear, grippers calibrated, emergency stop reachable. "
-                "Type EXECUTE CALIBRATED TAU0VLA to publish: "
-            )
-            if confirmation != "EXECUTE CALIBRATED TAU0VLA":
-                raise RuntimeError("execution cancelled; no action publisher was created")
+            if args.auto_confirm:
+                print("AUTO-CONFIRM: starting calibrated Tau0VLA publication.")
+            else:
+                confirmation = input(
+                    "Workspace clear, grippers calibrated, emergency stop reachable. "
+                    "Type EXECUTE CALIBRATED TAU0VLA to publish: "
+                )
+                if confirmation != "EXECUTE CALIBRATED TAU0VLA":
+                    raise RuntimeError("execution cancelled; no action publisher was created")
             mark_consumed(args.calibration_file, session_id=session_id)
             node.enable_publishers()
             print("EXECUTE mode: calibration consumed; publishing mapped finite 14D commands.")
@@ -600,12 +610,15 @@ def run(args) -> None:
                 pending.cancel()
                 pending = None
             print(f"Policy stopped at step={step}; model publication is paused.")
-            confirmation = input(
-                "Clear the return path and keep the emergency stop reachable. "
-                "Type RETURN TO INITIAL POSE to move back: "
-            )
-            if confirmation != "RETURN TO INITIAL POSE":
-                raise RuntimeError("return-to-initial cancelled; robot remains at current pose")
+            if args.auto_confirm:
+                print("AUTO-CONFIRM: returning to the fixed initial pose.")
+            else:
+                confirmation = input(
+                    "Clear the return path and keep the emergency stop reachable. "
+                    "Type RETURN TO INITIAL POSE to move back: "
+                )
+                if confirmation != "RETURN TO INITIAL POSE":
+                    raise RuntimeError("return-to-initial cancelled; robot remains at current pose")
             motion_active.set()
             try:
                 detail = move_to_verified_pose(
@@ -683,6 +696,7 @@ def parse_args():
     parser.add_argument("--log-path", type=Path)
     parser.add_argument("--max-steps", type=int, default=10000)
     parser.add_argument("--execute", action="store_true")
+    parser.add_argument("--auto-confirm", action="store_true")
     parser.add_argument("--no-return-to-initial", action="store_true")
     parser.add_argument("--return-duration-s", type=float, default=5.0)
     parser.add_argument("--return-arm-step", type=float, default=.02)

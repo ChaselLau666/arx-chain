@@ -326,9 +326,13 @@ def test_one_command_rollout_orders_stack_calibration_policy_and_return():
     assert "RETURN TO INITIAL POSE" in client
     assert "fixed-pose verification failed" in client
     assert "fixed_initial_feedback" in client
-    assert "--no-return-to-initial" in rollout
+    assert "--auto-confirm" in rollout
+    assert "--no-return-to-initial" not in rollout
+    assert '00_tau0vla_calibrated_up.sh" --auto-confirm' in rollout
+    assert "tau0vla_calibrate_gripper.py --execute --auto-confirm" in rollout
     standalone = (ROOT / "tools/06_tau0vla_return_fixed.sh").read_text(encoding="utf-8")
     assert "--calibration-file" in standalone
+    assert "--auto-confirm" in standalone
     assert "trace_" not in standalone
     assert "[t]au0vla_.*client.py" in standalone
     assert "exec python tau0vla_calibrated_client.py" in rollout
@@ -343,6 +347,7 @@ def test_one_click_bringup_is_ark2_only_and_starts_cameras_in_order():
         "camera_l:260422273222"
     ) < source.index("camera_r:260422272473")
     assert "tau0vla_calibrate_gripper" not in source
+    assert "--auto-confirm" in source
 
 
 def test_height_waiter_checks_stability_not_command_feedback_equality():

@@ -33,4 +33,5 @@ set -u
 cd "${repo_root}/act"
 exec python tau0vla_return_from_trace.py \
   --calibration-file "${calibration}" \
+  --auto-confirm \
   "$@"
