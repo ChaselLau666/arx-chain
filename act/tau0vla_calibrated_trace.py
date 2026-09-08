@@ -93,13 +93,23 @@ class TraceWriter:
             "feedback": np.asarray(feedback, dtype=np.float32).tolist(),
         })
 
-    def return_result(self, *, status: str, target: np.ndarray, detail: dict[str, Any]) -> None:
-        self._write({
+    def return_result(
+        self,
+        *,
+        status: str,
+        target: np.ndarray,
+        detail: dict[str, Any],
+        command_target: np.ndarray | None = None,
+    ) -> None:
+        payload = {
             "event": "return_result",
             "status": status,
             "target": np.asarray(target, dtype=np.float32).tolist(),
             "detail": detail,
-        })
+        }
+        if command_target is not None:
+            payload["command_target"] = np.asarray(command_target, dtype=np.float32).tolist()
+        self._write(payload)
 
     def close(self) -> None:
         if self._stream is not None:

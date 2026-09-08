@@ -10,6 +10,7 @@ import time
 from typing import Any
 
 import numpy as np
+import yaml
 
 
 CALIBRATION_SCHEMA_VERSION = 1
@@ -173,6 +174,11 @@ def save_artifact(path: Path, artifact: CalibrationArtifact) -> None:
 
 def load_artifact(path: str | Path) -> CalibrationArtifact:
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    return artifact_from_dict(payload)
+
+
+def artifact_from_dict(payload: dict[str, Any]) -> CalibrationArtifact:
+    payload = dict(payload)
     try:
         left = SideCalibration(**payload.pop("left"))
         right = SideCalibration(**payload.pop("right"))
@@ -184,6 +190,57 @@ def load_artifact(path: str | Path) -> CalibrationArtifact:
     if artifact.calibration_version != CALIBRATION_VERSION:
         raise CalibrationError("calibration algorithm version mismatch")
     return artifact
+
+
+def load_training_ready_arms(path: str | Path) -> np.ndarray:
+    payload = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(payload, dict) or payload.get("format_version") != 1:
+        raise CalibrationError("training ready-pose config version mismatch")
+    try:
+        left = np.asarray(payload["left_arm"], dtype=np.float64)
+        right = np.asarray(payload["right_arm"], dtype=np.float64)
+    except (KeyError, TypeError, ValueError) as error:
+        raise CalibrationError(f"invalid training ready-pose config: {error}") from error
+    if left.shape != (6,) or right.shape != (6,) or not np.isfinite(left).all() or not np.isfinite(right).all():
+        raise CalibrationError("training ready pose requires two finite 6D arm targets")
+    return np.concatenate((left, right)).astype(np.float32)
+
+
+def feedback_pose_to_command(
+    artifact: CalibrationArtifact,
+    feedback: np.ndarray,
+) -> np.ndarray:
+    """Convert a measured 14D pose to the command coordinates used by X5."""
+    values = np.asarray(feedback, dtype=np.float64)
+    if values.shape != (14,) or not np.isfinite(values).all():
+        raise CalibrationError("feedback pose must be a finite 14-vector")
+    command = values.copy()
+    for side, index in zip(SIDES, GRIPPER_INDICES, strict=True):
+        fit: SideCalibration = getattr(artifact, side)
+        value = (values[index] - fit.intercept) / fit.slope
+        lower = min(fit.command_points) - COMMAND_MARGIN
+        upper = max(fit.command_points) + COMMAND_MARGIN
+        if not lower <= value <= upper:
+            raise CalibrationError(
+                f"{side} feedback maps outside calibrated command envelope [{lower}, {upper}]"
+            )
+        command[index] = value
+    return command.astype(np.float32)
+
+
+def training_ready_targets(
+    artifact: CalibrationArtifact,
+    ready_arms: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return command and expected-feedback targets for the fixed training pose."""
+    arms = np.asarray(ready_arms, dtype=np.float64)
+    if arms.shape != (12,) or not np.isfinite(arms).all():
+        raise CalibrationError("training ready arm target must be a finite 12-vector")
+    expected = np.empty(14, dtype=np.float64)
+    expected[np.asarray(ARM_INDICES)] = arms
+    expected[6] = artifact.left.final_open_feedback
+    expected[13] = artifact.right.final_open_feedback
+    return feedback_pose_to_command(artifact, expected), expected.astype(np.float32)
 
 
 def validate_artifact(
@@ -322,15 +379,19 @@ __all__ = [
     "CalibratedGripperMapper",
     "SideCalibration",
     "assert_current_open",
+    "artifact_from_dict",
     "current_boot_id",
     "current_controller_identity",
     "current_robot_identity",
     "consumed_path",
     "fit_side",
+    "feedback_pose_to_command",
     "load_artifact",
+    "load_training_ready_arms",
     "mark_consumed",
     "require_unconsumed",
     "return_trajectory",
     "save_artifact",
+    "training_ready_targets",
     "validate_artifact",
 ]

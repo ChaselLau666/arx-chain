@@ -20,8 +20,11 @@ from tau0vla_calibration import (  # noqa: E402
     CalibrationError,
     CalibratedGripperMapper,
     SideCalibration,
+    feedback_pose_to_command,
     fit_side,
+    load_training_ready_arms,
     return_trajectory,
+    training_ready_targets,
     validate_artifact,
 )
 from tau0vla_calibrated_protocol import (  # noqa: E402
@@ -278,6 +281,23 @@ def test_return_trajectory_is_smooth_bounded_and_reaches_initial_pose():
     assert np.all(np.diff(trajectory[:, 0]) >= 0)
 
 
+def test_fixed_training_ready_pose_separates_gripper_command_and_feedback(tmp_path):
+    config = tmp_path / "ready.yaml"
+    config.write_text(
+        "format_version: 1\n"
+        "left_arm: [0, 1, 2, 3, 4, 5]\n"
+        "right_arm: [6, 7, 8, 9, 10, 11]\n",
+        encoding="utf-8",
+    )
+    arms = load_training_ready_arms(config)
+    command, feedback = training_ready_targets(_artifact(), arms)
+    np.testing.assert_allclose(command[[0, 1, 2, 3, 4, 5]], np.arange(6))
+    np.testing.assert_allclose(command[[7, 8, 9, 10, 11, 12]], np.arange(6, 12))
+    assert command[6] == pytest.approx(-3.39)
+    assert feedback[6] == pytest.approx(-3.34)
+    np.testing.assert_allclose(feedback_pose_to_command(_artifact(), feedback), command)
+
+
 def test_one_command_rollout_orders_stack_calibration_policy_and_return():
     rollout = (ROOT / "tools/05_tau0vla_calibrated_rollout.sh").read_text(encoding="utf-8")
     client = (ROOT / "act/tau0vla_calibrated_client.py").read_text(encoding="utf-8")
@@ -286,8 +306,10 @@ def test_one_command_rollout_orders_stack_calibration_policy_and_return():
     ) < rollout.index("tau0vla_calibrated_client.py")
     assert "expected_route=arx-lift2s-0907-blue-joint-feedback-ft" in rollout
     assert "actual_route" in rollout
+    assert "MOVE TO FIXED INITIAL POSE" in client
     assert "RETURN TO INITIAL POSE" in client
-    assert "return-to-initial verification failed" in client
+    assert "fixed-pose verification failed" in client
+    assert "fixed_initial_feedback" in client
     assert "exec python tau0vla_calibrated_client.py" in rollout
     assert '2>&1 | tee -a "${client_log}"' not in rollout
 
@@ -308,17 +330,29 @@ def test_height_waiter_checks_stability_not_command_feedback_equality():
     assert "abs(float(values[-1]) - args.target)" not in source
 
 
-def test_return_recovery_prefers_explicit_initial_event_then_first_tick(tmp_path):
+def test_return_recovery_derives_fixed_pose_from_legacy_trace_metadata(tmp_path):
     from tau0vla_return_from_trace import load_target
 
     path = tmp_path / "trace.jsonl"
+    ready = tmp_path / "ready.yaml"
+    ready.write_text(
+        "format_version: 1\n"
+        "left_arm: [0, 1, 2, 3, 4, 5]\n"
+        "right_arm: [6, 7, 8, 9, 10, 11]\n",
+        encoding="utf-8",
+    )
     path.write_text(
         '\n'.join([
-            json.dumps({"event": "metadata", "calibration": {}}),
+            json.dumps({"event": "metadata", "calibration": _artifact().to_dict()}),
             json.dumps({"event": "tick", "feedback": [1.0]*14}),
             json.dumps({"event": "return_result", "status": "initial_pose", "target": [2.0]*14}),
         ]) + '\n',
         encoding="utf-8",
     )
-    target, _ = load_target(path)
-    np.testing.assert_array_equal(target, np.full(14, 2.0))
+    command, feedback, calibration, metadata = load_target(path, ready)
+    assert calibration.calibration_id == "calibration"
+    assert metadata["event"] == "metadata"
+    np.testing.assert_allclose(command[[0, 1, 2, 3, 4, 5]], np.arange(6))
+    np.testing.assert_allclose(command[[7, 8, 9, 10, 11, 12]], np.arange(6, 12))
+    assert command[6] == pytest.approx(-3.39)
+    assert feedback[6] == pytest.approx(-3.34)

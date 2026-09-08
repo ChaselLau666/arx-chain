@@ -30,10 +30,13 @@ from tau0vla_calibrated_trace import TraceWriter, analyze_trace, plot_trace, wri
 from tau0vla_calibration import (
     assert_current_open,
     current_robot_identity,
+    feedback_pose_to_command,
     load_artifact,
+    load_training_ready_arms,
     mark_consumed,
     require_unconsumed,
     return_trajectory,
+    training_ready_targets,
     validate_artifact,
 )
 from utils.setup_loader import setup_loader
@@ -238,11 +241,21 @@ def create_observation_node(config: dict, *, max_observation_age_ms: float, max_
     return ObservationNode()
 
 
-def return_to_initial_pose(node, target, trace, abort: threading.Event, args) -> dict[str, float]:
-    start = node.current_qpos()
+def move_to_verified_pose(
+    node,
+    command_target,
+    feedback_target,
+    calibration,
+    trace,
+    abort: threading.Event,
+    args,
+    *,
+    result_status: str,
+) -> dict[str, float]:
+    start = feedback_pose_to_command(calibration, node.current_qpos())
     trajectory = return_trajectory(
         start,
-        target,
+        command_target,
         rate_hz=FPS,
         minimum_duration_s=args.return_duration_s,
         max_arm_step=args.return_arm_step,
@@ -267,7 +280,7 @@ def return_to_initial_pose(node, target, trace, abort: threading.Event, args) ->
     while time.monotonic() < hold_deadline:
         if abort.is_set():
             raise RuntimeError("return interrupted while holding target")
-        node.publish(target)
+        node.publish(command_target)
         time.sleep(period)
     samples = []
     verify_deadline = time.monotonic() + 2.0
@@ -275,8 +288,8 @@ def return_to_initial_pose(node, target, trace, abort: threading.Event, args) ->
         samples.append(node.current_qpos())
         time.sleep(period)
     values = np.asarray(samples, dtype=np.float32)
-    arm_error = float(np.max(np.abs(values[-1, ARM_INDICES] - target[ARM_INDICES])))
-    gripper_error = float(np.max(np.abs(values[-1, GRIPPER_INDICES] - target[GRIPPER_INDICES])))
+    arm_error = float(np.max(np.abs(values[-1, ARM_INDICES] - feedback_target[ARM_INDICES])))
+    gripper_error = float(np.max(np.abs(values[-1, GRIPPER_INDICES] - feedback_target[GRIPPER_INDICES])))
     spread = float(np.max(np.ptp(values, axis=0)))
     detail = {
         "arm_error_max": arm_error,
@@ -285,9 +298,19 @@ def return_to_initial_pose(node, target, trace, abort: threading.Event, args) ->
         "trajectory_steps": int(len(trajectory)),
     }
     if arm_error > .05 or gripper_error > .1 or spread > .01:
-        trace.return_result(status="failed", target=target, detail=detail)
-        raise RuntimeError(f"return-to-initial verification failed: {detail}")
-    trace.return_result(status="complete", target=target, detail=detail)
+        trace.return_result(
+            status=f"{result_status}_failed",
+            target=feedback_target,
+            command_target=command_target,
+            detail=detail,
+        )
+        raise RuntimeError(f"fixed-pose verification failed: {detail}")
+    trace.return_result(
+        status=result_status,
+        target=feedback_target,
+        command_target=command_target,
+        detail=detail,
+    )
     return detail
 
 
@@ -353,6 +376,8 @@ def run(args) -> None:
     import rclpy
 
     calibration = load_artifact(args.calibration_file)
+    ready_arms = load_training_ready_arms(args.ready_pose_config)
+    ready_command, ready_feedback = training_ready_targets(calibration, ready_arms)
     hostname, domain, boot_id, controllers = current_robot_identity()
     validate_artifact(
         calibration,
@@ -377,11 +402,15 @@ def run(args) -> None:
     policy_stop = threading.Event()
     spin_stop = threading.Event()
     return_abort = threading.Event()
+    motion_active = threading.Event()
     spin = threading.Thread(target=spin_node, args=(node, spin_stop), daemon=True)
     spin.start()
 
     def handle_interrupt(*_):
-        if policy_stop.is_set():
+        if motion_active.is_set():
+            return_abort.set()
+            print("Ctrl-C: fixed-pose motion aborted; no more commands will be published.")
+        elif policy_stop.is_set():
             return_abort.set()
             print("Second Ctrl-C: return motion aborted; no more commands will be published.")
         else:
@@ -434,7 +463,34 @@ def run(args) -> None:
             gripper_blend_steps=args.gripper_blend_steps,
             arm_ema_alpha=args.arm_ema_alpha,
             gripper_ema_alpha=args.gripper_ema_alpha,
+            fixed_initial_command=ready_command.tolist(),
+            fixed_initial_feedback=ready_feedback.tolist(),
         )
+        if args.execute:
+            print(f"Fixed initial feedback target: {np.array2string(ready_feedback, precision=4)}")
+            confirmation = input(
+                "Clear the full arm path and keep the emergency stop reachable. "
+                "Type MOVE TO FIXED INITIAL POSE to continue: "
+            )
+            if confirmation != "MOVE TO FIXED INITIAL POSE":
+                raise RuntimeError("fixed initial-pose move cancelled; policy was not started")
+            node.enable_publishers()
+            motion_active.set()
+            try:
+                detail = move_to_verified_pose(
+                    node,
+                    ready_command,
+                    ready_feedback,
+                    calibration,
+                    trace,
+                    return_abort,
+                    args,
+                    result_status="fixed_initial_before_policy",
+                )
+            finally:
+                motion_active.clear()
+            print(f"FIXED INITIAL POSE READY: {json.dumps(detail, sort_keys=True)}")
+            assert_current_open(calibration, node.open_samples(2.0))
 
         request_id, latencies = benchmark(
             client, node, 0, args.benchmark_warmup, args.benchmark_requests
@@ -445,6 +501,8 @@ def run(args) -> None:
         print(f"Selected replan_steps={replan_steps}; measured p99 RTT={p99:.1f} ms")
         request_id += 1
         first = client.infer(wait_observation(node, 5.0), request_id)
+        if policy_stop.is_set():
+            raise RuntimeError("interrupted before policy execution; robot remains at fixed initial pose")
         scheduler = CalibratedChunkScheduler(
             replan_steps,
             blend_steps=args.chunk_blend_steps,
@@ -452,7 +510,6 @@ def run(args) -> None:
         )
         ema = ActionEMA(args.arm_ema_alpha, args.gripper_ema_alpha)
         initial = node.snapshot().qpos
-        trace.return_result(status="initial_pose", target=initial, detail={})
         ema.reset(initial)
         adoption = scheduler.adopt(first, initial=True, arrival_monotonic_ns=time.monotonic_ns())
         trace.adoption(first.request_id, adoption)
@@ -540,8 +597,21 @@ def run(args) -> None:
             )
             if confirmation != "RETURN TO INITIAL POSE":
                 raise RuntimeError("return-to-initial cancelled; robot remains at current pose")
-            detail = return_to_initial_pose(node, initial, trace, return_abort, args)
-            print(f"RETURN TO INITIAL COMPLETE: {json.dumps(detail, sort_keys=True)}")
+            motion_active.set()
+            try:
+                detail = move_to_verified_pose(
+                    node,
+                    ready_command,
+                    ready_feedback,
+                    calibration,
+                    trace,
+                    return_abort,
+                    args,
+                    result_status="fixed_initial_after_policy",
+                )
+            finally:
+                motion_active.clear()
+            print(f"RETURN TO FIXED INITIAL COMPLETE: {json.dumps(detail, sort_keys=True)}")
         print("CALIBRATED_ROLLOUT_COMPLETE")
     finally:
         if pending is not None:
@@ -572,6 +642,11 @@ def parse_args():
     parser.add_argument("--task-instruction", required=True)
     parser.add_argument("--calibration-file", type=Path, required=True)
     parser.add_argument("--config", type=Path, default=ROOT / "data/config.yaml")
+    parser.add_argument(
+        "--ready-pose-config",
+        type=Path,
+        default=ROOT / "data/tau0vla_calibrated_ready.yaml",
+    )
     parser.add_argument("--expected-height", type=float, default=15.5)
     parser.add_argument("--height-stability-tolerance", type=float, default=.05)
     parser.add_argument("--height-stability-window", type=float, default=2.0)

@@ -1,0 +1,9 @@
+format_version: 1
+
+# Fixed arm pose used at the beginning of the 0907 Blue/T demonstrations.
+# The T raw-data first-frame medians on the deployment server are within
+# 0.0081 rad of these controller targets. Grippers are intentionally omitted:
+# every rollout derives its full-open command and expected feedback from that
+# rollout's calibration artifact.
+left_arm:  [-0.0002, 0.9447, 0.8597, -0.5755,  0.0006, -0.0013]
+right_arm: [-0.0002, 0.9466, 0.8604, -0.5724, -0.0002, -0.0006]

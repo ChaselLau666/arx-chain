@@ -1,5 +1,5 @@
 #!/bin/bash
-# Recover the initial pose from the newest calibrated rollout trace.
+# Recover the fixed training initial pose using the newest rollout calibration.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

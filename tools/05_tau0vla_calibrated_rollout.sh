@@ -1,6 +1,6 @@
 #!/bin/bash
 # One command per calibrated rollout: idempotent stack bring-up, mandatory full
-# gripper calibration, policy run, and guarded return to the captured start pose.
+# gripper calibration, fixed training-pose setup, policy run, and guarded return.
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

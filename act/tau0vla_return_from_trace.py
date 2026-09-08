@@ -1,4 +1,4 @@
-"""Guarded recovery to the initial pose recorded in a calibrated rollout trace."""
+"""Guarded recovery to the fixed training initial pose for a calibrated trace."""
 from __future__ import annotations
 
 import argparse
@@ -13,7 +13,14 @@ import rclpy
 from rclpy.node import Node
 import yaml
 
-from tau0vla_calibration import current_robot_identity, return_trajectory
+from tau0vla_calibration import (
+    artifact_from_dict,
+    current_robot_identity,
+    feedback_pose_to_command,
+    load_training_ready_arms,
+    return_trajectory,
+    training_ready_targets,
+)
 from utils.setup_loader import setup_loader
 
 
@@ -22,23 +29,29 @@ ARM = np.asarray([0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12])
 GRIPPER = np.asarray([6, 13])
 
 
-def load_target(path: Path):
+def load_target(path: Path, ready_pose_config: Path):
     metadata = None
-    initial = None
-    first_tick = None
     for line in path.read_text(encoding="utf-8").splitlines():
         event = json.loads(line)
         if event.get("event") == "metadata" and metadata is None:
             metadata = event
-        if event.get("event") == "return_result" and event.get("status") == "initial_pose":
-            initial = event.get("target")
-        if event.get("event") == "tick" and first_tick is None:
-            first_tick = event.get("feedback")
-    target = initial if initial is not None else first_tick
-    values = np.asarray(target, dtype=np.float32)
-    if metadata is None or values.shape != (14,) or not np.isfinite(values).all():
-        raise RuntimeError("trace has no valid metadata and initial 14D feedback")
-    return values, metadata
+    if metadata is None or not isinstance(metadata.get("calibration"), dict):
+        raise RuntimeError("trace has no calibrated-v3 metadata")
+    calibration = artifact_from_dict(metadata["calibration"])
+    if "fixed_initial_command" in metadata and "fixed_initial_feedback" in metadata:
+        command = np.asarray(metadata["fixed_initial_command"], dtype=np.float32)
+        feedback = np.asarray(metadata["fixed_initial_feedback"], dtype=np.float32)
+    else:
+        ready_arms = load_training_ready_arms(ready_pose_config)
+        command, feedback = training_ready_targets(calibration, ready_arms)
+    if (
+        command.shape != (14,)
+        or feedback.shape != (14,)
+        or not np.isfinite(command).all()
+        or not np.isfinite(feedback).all()
+    ):
+        raise RuntimeError("trace has no valid fixed 14D ready pose")
+    return command, feedback, calibration, metadata
 
 
 class ReturnNode(Node):
@@ -90,7 +103,9 @@ class ReturnNode(Node):
 
 
 def run(args):
-    target, metadata = load_target(args.trace)
+    command_target, feedback_target, calibration, metadata = load_target(
+        args.trace, args.ready_pose_config
+    )
     hostname, domain, boot_id, controllers = current_robot_identity()
     saved = metadata.get("calibration") or {}
     if (
@@ -104,11 +119,11 @@ def run(args):
     if not 0 <= age <= args.max_trace_age_s:
         raise RuntimeError(f"trace age {age:.1f}s exceeds recovery limit")
     print(f"Recovery trace: {args.trace}")
-    print(f"Initial target: {np.array2string(target, precision=4)}")
+    print(f"Fixed initial feedback target: {np.array2string(feedback_target, precision=4)}")
     if not args.execute:
         print("DRY-RUN: no publisher was created.")
         return
-    if input("Type RETURN LAST TRACE TO INITIAL POSE to move: ") != "RETURN LAST TRACE TO INITIAL POSE":
+    if input("Type RETURN LAST TRACE TO FIXED INITIAL POSE to move: ") != "RETURN LAST TRACE TO FIXED INITIAL POSE":
         raise RuntimeError("return recovery cancelled")
 
     setup_loader(ROOT)
@@ -135,7 +150,8 @@ def run(args):
                 time.sleep(.05)
         else:
             raise RuntimeError("arm feedback unavailable")
-        trajectory = return_trajectory(current, target)
+        current_command = feedback_pose_to_command(calibration, current)
+        trajectory = return_trajectory(current_command, command_target)
         period = 1 / 30
         next_tick = time.monotonic()
         for command in trajectory:
@@ -146,7 +162,7 @@ def run(args):
             time.sleep(max(0.0, next_tick-time.monotonic()))
         hold_until = time.monotonic() + 1.0
         while time.monotonic() < hold_until:
-            node.publish(target)
+            node.publish(command_target)
             time.sleep(period)
         samples = []
         verify_until = time.monotonic() + 2.0
@@ -155,8 +171,8 @@ def run(args):
             time.sleep(period)
         values = np.asarray(samples)
         result = {
-            "arm_error_max": float(np.max(np.abs(values[-1, ARM]-target[ARM]))),
-            "gripper_error_max": float(np.max(np.abs(values[-1, GRIPPER]-target[GRIPPER]))),
+            "arm_error_max": float(np.max(np.abs(values[-1, ARM]-feedback_target[ARM]))),
+            "gripper_error_max": float(np.max(np.abs(values[-1, GRIPPER]-feedback_target[GRIPPER]))),
             "feedback_spread_max": float(np.max(np.ptp(values, axis=0))),
             "trajectory_steps": len(trajectory),
         }
@@ -164,7 +180,7 @@ def run(args):
             raise RuntimeError(f"return recovery verification failed: {result}")
         args.report.parent.mkdir(parents=True, exist_ok=True)
         args.report.write_text(json.dumps(result, indent=2, sort_keys=True)+"\n", encoding="utf-8")
-        print(f"RETURN TO INITIAL COMPLETE: {json.dumps(result, sort_keys=True)}")
+        print(f"RETURN TO FIXED INITIAL COMPLETE: {json.dumps(result, sort_keys=True)}")
         print(f"Recovery report: {args.report}")
     finally:
         spin_stop.set()
@@ -179,6 +195,11 @@ def parse_args():
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--max-trace-age-s", type=float, default=1800.0)
     parser.add_argument("--config", type=Path, default=ROOT/"data/config.yaml")
+    parser.add_argument(
+        "--ready-pose-config",
+        type=Path,
+        default=ROOT/"data/tau0vla_calibrated_ready.yaml",
+    )
     parser.add_argument(
         "--report",
         type=Path,

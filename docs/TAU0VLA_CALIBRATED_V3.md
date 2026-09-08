@@ -45,7 +45,7 @@ Logs, immutable calibration artifacts, JSONL traces, summaries and plots are wri
 
 ## One-command workflow
 
-After deployment, the same command is used for every rollout. It idempotently starts or reuses the direct network, CAN, lift, v2 arms and sequential cameras; performs a new full calibration; runs the selected policy; and offers a guarded return to the 14D pose captured before policy execution:
+After deployment, the same command is used for every rollout. It idempotently starts or reuses the direct network, CAN, lift, v2 arms and sequential cameras; performs a new full calibration; moves both arms to the fixed pose used at the beginning of the 0907 training demonstrations; runs the selected policy; and offers a guarded return to that same fixed pose:
 
 ```bash
 export ROS_DOMAIN_ID=63
@@ -55,4 +55,4 @@ MODEL_SERVER_URL=http://192.168.50.2:8000 \
 ./05_tau0vla_calibrated_rollout.sh --execute
 ```
 
-During validation use candidate port `8001`. Profiles are `blue-feedback`, `t-feedback`, `blue-vr`, and `t-vr`. A normal completion or first `Ctrl-C` pauses policy publication and asks for `RETURN TO INITIAL POSE`; a second `Ctrl-C`, protocol error, invalid model output, or emergency stop never initiates return motion. After a successful return, rerun the same command for the next test; it creates a fresh one-use calibration.
+During validation use candidate port `8001`. Profiles are `blue-feedback`, `t-feedback`, `blue-vr`, and `t-vr`. Before inference, `MOVE TO FIXED INITIAL POSE` is required and arrival is checked against `act/data/tau0vla_calibrated_ready.yaml`. Grippers remain at the full-open feedback measured by the current calibration, with their commands obtained through the fitted inverse rather than by treating feedback as command coordinates. A normal completion or first `Ctrl-C` pauses policy publication and asks for `RETURN TO INITIAL POSE`; this now means the same fixed training pose, not whatever pose happened to exist when the client started. A second `Ctrl-C`, protocol error, invalid model output, or emergency stop never initiates return motion. After a successful return, rerun the same command for the next test; it creates a fresh one-use calibration.
