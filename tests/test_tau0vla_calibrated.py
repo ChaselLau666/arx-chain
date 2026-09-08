@@ -284,6 +284,8 @@ def test_one_command_rollout_orders_stack_calibration_policy_and_return():
     assert rollout.index("00_tau0vla_calibrated_up.sh") < rollout.index(
         "tau0vla_calibrate_gripper.py"
     ) < rollout.index("tau0vla_calibrated_client.py")
+    assert "expected_route=arx-lift2s-0907-blue-joint-feedback-ft" in rollout
+    assert "actual_route" in rollout
     assert "RETURN TO INITIAL POSE" in client
     assert "return-to-initial verification failed" in client
 

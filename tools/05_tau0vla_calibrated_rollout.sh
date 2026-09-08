@@ -19,18 +19,22 @@ repo_root="$(cd "${script_dir}/.." && pwd)"
 case "${MODEL_PROFILE}" in
   blue-feedback)
     experiment=joint-feedback
+    expected_route=arx-lift2s-0907-blue-joint-feedback-ft
     task='Pick up the blue box and place it in its designated position on the board.'
     ;;
   t-feedback)
     experiment=joint-feedback
+    expected_route=arx-lift2s-0907-t-joint-feedback-ft
     task='Pick up the T-shaped part and place it in its designated position on the board.'
     ;;
   blue-vr)
     experiment=joint-vr
+    expected_route=arx-lift2s-0907-blue-joint-vr-ft
     task='Pick up the blue box and place it in its designated position on the board.'
     ;;
   t-vr)
     experiment=joint-vr
+    expected_route=arx-lift2s-0907-t-joint-vr-ft
     task='Pick up the T-shaped part and place it in its designated position on the board.'
     ;;
   *)
@@ -56,6 +60,16 @@ esac
 
 export MODEL_SERVER_URL
 "${script_dir}/00_tau0vla_calibrated_up.sh"
+
+health=$(curl --fail --silent --show-error --noproxy '*' --max-time 5 \
+  "${MODEL_SERVER_URL}/health")
+actual_route=$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("route", ""))' <<<"${health}")
+actual_experiment=$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("experiment", ""))' <<<"${health}")
+if [[ "${actual_route}" != "${expected_route}" || "${actual_experiment}" != "${experiment}" ]]; then
+  echo "Refused: MODEL_PROFILE=${MODEL_PROFILE} expects ${expected_route}/${experiment}," >&2
+  echo "but ${MODEL_SERVER_URL} serves ${actual_route}/${actual_experiment}." >&2
+  exit 1
+fi
 
 mkdir -p "${LOG_DIR}"
 stamp=$(date +%Y%m%d_%H%M%S)
