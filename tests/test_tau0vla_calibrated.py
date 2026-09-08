@@ -130,7 +130,12 @@ def test_joint_feedback_small_endpoint_error_saturates_but_large_error_rejects()
     assert mapper.last_saturation["count"] == 60
     assert mapper.last_saturation["max_command_excess"] == pytest.approx(0.06, abs=1e-5)
 
-    values[0, 6] = -0.08
+    # Covers the observed T-feedback worst case (0.07739 beyond the closed
+    # endpoint) while retaining a hard rejection outside the reviewed 0.10.
+    values[0, 13] = 3.46739
+    mapped = mapper.map_chunk(values)
+    assert mapped[0, 13] == pytest.approx(0.0)
+    values[0, 6] = -0.11
     with pytest.raises(CalibrationError, match="soft tolerance"):
         mapper.map_chunk(values)
 

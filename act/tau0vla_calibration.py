@@ -21,7 +21,7 @@ COMMAND_MARGIN = 0.05
 # Accept only a small semantic error, then saturate to the calibrated endpoint;
 # never publish the extrapolated value. The hard limit remains close enough to
 # the measured range to catch a wrong route, baseline, or mapping immediately.
-COMMAND_SOFT_TOLERANCE = 0.075
+COMMAND_SOFT_TOLERANCE = 0.10
 GRIPPER_INDICES = (6, 13)
 ARM_INDICES = (0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12)
 SIDES = ("left", "right")
