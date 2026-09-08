@@ -1,0 +1,149 @@
+#!/bin/bash
+# One-command, idempotent ARX2 hardware bring-up for calibrated Tau0VLA.
+# It never starts policy or calibration publishers. Lift/arm movement remains
+# behind the exact START CALIBRATED STACK confirmation.
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+: "${ROS_DOMAIN_ID:?Set ROS_DOMAIN_ID=63 for ark-2}"
+: "${MODEL_SERVER_URL:=http://192.168.50.2:8001}"
+: "${DIRECT_INTERFACE:=enp130s0}"
+: "${DIRECT_CLIENT_IP:=192.168.50.1}"
+: "${LIFT_HEIGHT:=15.5}"
+
+if [[ "$(hostname)" != ark-2 || "${ROS_DOMAIN_ID}" != 63 ]]; then
+  echo "Refused: calibrated one-click bring-up requires ark-2 and ROS_DOMAIN_ID=63." >&2
+  exit 1
+fi
+
+set +u
+source /opt/ros/jazzy/setup.bash
+source /home/arx/LIFT/body/ROS2/install/setup.bash
+set -u
+
+publisher_count() {
+  ros2 topic info "$1" 2>/dev/null | awk '/^Publisher count:/{print $3; found=1} END{if (!found) print 0}'
+}
+
+wait_node() {
+  local name=$1
+  for _ in $(seq 1 60); do
+    ros2 node list 2>/dev/null | grep -qx "${name}" && return 0
+    sleep 1
+  done
+  echo "Refused: ${name} did not start within 60s." >&2
+  return 1
+}
+
+wait_topic() {
+  local topic=$1
+  for _ in $(seq 1 60); do
+    [[ $(publisher_count "${topic}") -ge 1 ]] && return 0
+    sleep 1
+  done
+  echo "Refused: no publisher for ${topic} after 60s." >&2
+  return 1
+}
+
+report() {
+  echo "Network: $(ip -br addr show "${DIRECT_INTERFACE}" 2>/dev/null || true)"
+  for interface in can1 can3 can5; do ip -br link show "${interface}" 2>/dev/null || true; done
+  echo "Nodes:"
+  ros2 node list 2>/dev/null | grep -E '^/(lift|arm_slave_l|arm_slave_r|camera/camera_[hlr])$' || true
+  echo "Candidate:"
+  curl --noproxy '*' --max-time 5 "${MODEL_SERVER_URL}/health" 2>/dev/null || true
+  echo
+}
+
+if [[ "${1:-}" == --check ]]; then
+  report
+  exit 0
+fi
+if [[ $# -gt 0 ]]; then
+  echo "Unknown argument: $1" >&2
+  exit 1
+fi
+
+echo "This starts CAN, raises the lift, powers both v2 arms, and starts three cameras."
+echo "It does not calibrate grippers or run a policy. Clear the full workspace first."
+read -r -p "Type START CALIBRATED STACK to continue: " confirmation
+if [[ "${confirmation}" != "START CALIBRATED STACK" ]]; then
+  echo "Cancelled; nothing was changed."
+  exit 1
+fi
+
+sudo nmcli connection up "有线连接 1" >/dev/null
+route_info=$(ip route get 192.168.50.2 2>/dev/null || true)
+if [[ "${route_info}" != *"dev ${DIRECT_INTERFACE}"* || "${route_info}" != *"src ${DIRECT_CLIENT_IP}"* ]]; then
+  echo "Refused: direct route is not active: ${route_info:-unavailable}" >&2
+  exit 1
+fi
+curl --fail --silent --show-error --noproxy '*' --max-time 5 "${MODEL_SERVER_URL}/health" >/dev/null
+
+"${repo_root}/tools/00_can_up.sh"
+
+if ! ros2 node list 2>/dev/null | grep -qx /lift; then
+  gnome-terminal --title="tau0vla-body" -- bash -ic \
+    "cd /home/arx/LIFT/body/ROS2; source install/setup.bash; ros2 launch arx_lift_controller lift.launch.py; exec bash"
+  wait_node /lift
+fi
+height_set=false
+for _ in $(seq 1 20); do
+  if ros2 param set /lift fixed_height "${LIFT_HEIGHT}"; then
+    height_set=true
+    break
+  fi
+  sleep .5
+done
+if [[ "${height_set}" != true ]]; then
+  echo "Refused: could not set /lift fixed_height; use safe shutdown." >&2
+  exit 1
+fi
+/home/arx/miniconda3/envs/act/bin/python "${repo_root}/act/tau0vla_wait_height.py" \
+  --target "${LIFT_HEIGHT}"
+
+arm_count=$(pgrep -fc '/arx_x5_controller/[X]5Controller' || true)
+v2_count=$(pgrep -fc '/arx_x5_controller/[X]5Controller.*v2_joint_control.yaml' || true)
+if [[ ${arm_count} -eq 0 ]]; then
+  gnome-terminal --title="tau0vla-v2-arms" -- bash -ic \
+    "cd /home/arx/LIFT/ARX_X5/ROS2/X5_ws; source install/setup.bash; \
+     ros2 launch arx_x5_controller v2_joint_control.launch.py; exec bash"
+  wait_node /arm_slave_l
+  wait_node /arm_slave_r
+elif [[ ${arm_count} -ne 2 || ${v2_count} -ne 2 ]]; then
+  echo "Refused: found ${arm_count} X5 controllers (${v2_count} v2); stop the conflicting stack." >&2
+  exit 1
+fi
+wait_topic /arm_slave_l_status
+wait_topic /arm_slave_r_status
+
+camera_count=$(pgrep -fc '/realsense2_camera/[r]ealsense2_camera_node' || true)
+if [[ ${camera_count} -eq 0 ]]; then
+  cameras=(
+    "camera_h:260522275257:/camera/camera_h/color/image_rect_raw/compressed"
+    "camera_l:260422273222:/camera/camera_l/color/image_rect_raw/compressed"
+    "camera_r:260422272473:/camera/camera_r/color/image_rect_raw/compressed"
+  )
+  for entry in "${cameras[@]}"; do
+    IFS=: read -r name serial topic <<<"${entry}"
+    gnome-terminal --title="${name}" -- bash -ic \
+      "cd /home/arx/ROS2_LIFT_Play/realsense; source install/setup.bash; \
+       ros2 launch realsense2_camera rs_launch.py camera_name:=${name} \
+       depth_module.color_profile:=640x480x90 depth_module.depth_profile:=640x480x90 \
+       serial_no:=_${serial}; exec bash"
+    wait_topic "${topic}"
+  done
+elif [[ ${camera_count} -ne 3 ]]; then
+  echo "Refused: expected zero or three RealSense processes, found ${camera_count}." >&2
+  exit 1
+fi
+for topic in \
+  /camera/camera_h/color/image_rect_raw/compressed \
+  /camera/camera_l/color/image_rect_raw/compressed \
+  /camera/camera_r/color/image_rect_raw/compressed
+do
+  wait_topic "${topic}"
+done
+
+echo "CALIBRATED_STACK_READY"
+report

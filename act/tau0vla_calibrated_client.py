@@ -32,12 +32,15 @@ from tau0vla_calibration import (
     load_artifact,
     mark_consumed,
     require_unconsumed,
+    return_trajectory,
     validate_artifact,
 )
 from utils.setup_loader import setup_loader
 
 
 ROOT = Path(__file__).resolve().parent
+ARM_INDICES = np.asarray([0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12])
+GRIPPER_INDICES = np.asarray([6, 13])
 
 
 def create_observation_node(config: dict, *, max_observation_age_ms: float, max_camera_skew_ms: float):
@@ -171,6 +174,20 @@ def create_observation_node(config: dict, *, max_observation_age_ms: float, max_
                 rows = [row[1:] for row in self._gripper_samples if row[0] >= start]
             return np.asarray(rows, dtype=np.float64)
 
+        def current_qpos(self) -> np.ndarray:
+            with self._lock:
+                left = self._latest.get("arm:left")
+                right = self._latest.get("arm:right")
+                if left is None or right is None:
+                    raise ProtocolError("joint feedback is unavailable")
+                values = np.concatenate((
+                    np.asarray(left[0].joint_pos, dtype=np.float32)[:7],
+                    np.asarray(right[0].joint_pos, dtype=np.float32)[:7],
+                ))
+            if values.shape != (ACTION_DIM,) or not np.isfinite(values).all():
+                raise ProtocolError("joint feedback is not a finite 14-vector")
+            return values
+
         def enable_publishers(self) -> None:
             if self._left_publisher is None:
                 self._left_publisher = self.create_publisher(
@@ -194,6 +211,59 @@ def create_observation_node(config: dict, *, max_observation_age_ms: float, max_
             self._right_publisher.publish(right)
 
     return ObservationNode()
+
+
+def return_to_initial_pose(node, target, trace, abort: threading.Event, args) -> dict[str, float]:
+    start = node.current_qpos()
+    trajectory = return_trajectory(
+        start,
+        target,
+        rate_hz=FPS,
+        minimum_duration_s=args.return_duration_s,
+        max_arm_step=args.return_arm_step,
+        max_gripper_step=args.return_gripper_step,
+    )
+    period = 1.0 / FPS
+    deadline = time.monotonic()
+    for index, command in enumerate(trajectory):
+        if abort.is_set():
+            raise RuntimeError("return interrupted; publication stopped")
+        node.publish(command)
+        feedback = node.current_qpos()
+        trace.return_tick(
+            monotonic_ns=time.monotonic_ns(),
+            return_step=index,
+            command=command,
+            feedback=feedback,
+        )
+        deadline += period
+        time.sleep(max(0.0, deadline - time.monotonic()))
+    hold_deadline = time.monotonic() + 1.0
+    while time.monotonic() < hold_deadline:
+        if abort.is_set():
+            raise RuntimeError("return interrupted while holding target")
+        node.publish(target)
+        time.sleep(period)
+    samples = []
+    verify_deadline = time.monotonic() + 2.0
+    while time.monotonic() < verify_deadline:
+        samples.append(node.current_qpos())
+        time.sleep(period)
+    values = np.asarray(samples, dtype=np.float32)
+    arm_error = float(np.max(np.abs(values[-1, ARM_INDICES] - target[ARM_INDICES])))
+    gripper_error = float(np.max(np.abs(values[-1, GRIPPER_INDICES] - target[GRIPPER_INDICES])))
+    spread = float(np.max(np.ptp(values, axis=0)))
+    detail = {
+        "arm_error_max": arm_error,
+        "gripper_error_max": gripper_error,
+        "feedback_spread_max": spread,
+        "trajectory_steps": int(len(trajectory)),
+    }
+    if arm_error > .05 or gripper_error > .1 or spread > .01:
+        trace.return_result(status="failed", target=target, detail=detail)
+        raise RuntimeError(f"return-to-initial verification failed: {detail}")
+    trace.return_result(status="complete", target=target, detail=detail)
+    return detail
 
 
 def spin_node(node, stop: threading.Event) -> None:
@@ -279,10 +349,21 @@ def run(args) -> None:
         max_observation_age_ms=args.max_observation_age_ms,
         max_camera_skew_ms=args.max_camera_skew_ms,
     )
-    stop = threading.Event()
-    spin = threading.Thread(target=spin_node, args=(node, stop), daemon=True)
+    policy_stop = threading.Event()
+    spin_stop = threading.Event()
+    return_abort = threading.Event()
+    spin = threading.Thread(target=spin_node, args=(node, spin_stop), daemon=True)
     spin.start()
-    signal.signal(signal.SIGINT, lambda *_: stop.set())
+
+    def handle_interrupt(*_):
+        if policy_stop.is_set():
+            return_abort.set()
+            print("Second Ctrl-C: return motion aborted; no more commands will be published.")
+        else:
+            policy_stop.set()
+            print("Ctrl-C: policy publication stopping; return confirmation will follow.")
+
+    signal.signal(signal.SIGINT, handle_interrupt)
     executor = ThreadPoolExecutor(max_workers=1)
     pending: Future[CalibratedActionChunk] | None = None
     trace = TraceWriter(args.trace_path)
@@ -369,7 +450,7 @@ def run(args) -> None:
         starved = False
         published = 0
         publish_started = time.monotonic()
-        while rclpy.ok() and not stop.is_set() and step < args.max_steps:
+        while rclpy.ok() and not policy_stop.is_set() and step < args.max_steps:
             now = time.monotonic()
             if now < deadline:
                 time.sleep(min(deadline-now, .005))
@@ -421,12 +502,26 @@ def run(args) -> None:
             elif step % FPS == 0:
                 print(f"DRY-RUN step={step}, command={np.array2string(command, precision=4)}")
             step += 1
+        if args.execute and not args.no_return_to_initial:
+            policy_stop.set()
+            if pending is not None:
+                pending.cancel()
+                pending = None
+            print(f"Policy stopped at step={step}; model publication is paused.")
+            confirmation = input(
+                "Clear the return path and keep the emergency stop reachable. "
+                "Type RETURN TO INITIAL POSE to move back: "
+            )
+            if confirmation != "RETURN TO INITIAL POSE":
+                raise RuntimeError("return-to-initial cancelled; robot remains at current pose")
+            detail = return_to_initial_pose(node, initial, trace, return_abort, args)
+            print(f"RETURN TO INITIAL COMPLETE: {json.dumps(detail, sort_keys=True)}")
     finally:
         if pending is not None:
             pending.cancel()
         executor.shutdown(wait=False, cancel_futures=True)
         trace.close()
-        stop.set()
+        spin_stop.set()
         node.destroy_node()
         rclpy.shutdown()
         spin.join(timeout=2.0)
@@ -471,6 +566,10 @@ def parse_args():
     parser.add_argument("--trace-path", type=Path, required=True)
     parser.add_argument("--max-steps", type=int, default=10000)
     parser.add_argument("--execute", action="store_true")
+    parser.add_argument("--no-return-to-initial", action="store_true")
+    parser.add_argument("--return-duration-s", type=float, default=5.0)
+    parser.add_argument("--return-arm-step", type=float, default=.02)
+    parser.add_argument("--return-gripper-step", type=float, default=.05)
     args = parser.parse_args()
     if args.benchmark_warmup < 0 or args.benchmark_requests < 1:
         parser.error("benchmark counts must be non-negative with at least one request")
@@ -478,6 +577,10 @@ def parse_args():
         parser.error("blend steps must be in [0,29]")
     if not 0 < args.arm_ema_alpha <= 1 or not 0 < args.gripper_ema_alpha <= 1:
         parser.error("EMA alpha must be in (0,1]")
+    if args.return_duration_s < 5.0:
+        parser.error("--return-duration-s may not be shorter than 5.0")
+    if not 0 < args.return_arm_step <= .02 or not 0 < args.return_gripper_step <= .05:
+        parser.error("return step limits exceed the reviewed envelope")
     return args
 
 

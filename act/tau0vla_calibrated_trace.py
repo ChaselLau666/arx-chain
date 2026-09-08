@@ -77,6 +77,30 @@ class TraceWriter:
     def starvation(self, monotonic_ns: int, control_step: int) -> None:
         self._write({"event": "starvation", "monotonic_ns": monotonic_ns, "control_step": control_step})
 
+    def return_tick(
+        self,
+        *,
+        monotonic_ns: int,
+        return_step: int,
+        command: np.ndarray,
+        feedback: np.ndarray,
+    ) -> None:
+        self._write({
+            "event": "return_tick",
+            "monotonic_ns": int(monotonic_ns),
+            "return_step": int(return_step),
+            "command": np.asarray(command, dtype=np.float32).tolist(),
+            "feedback": np.asarray(feedback, dtype=np.float32).tolist(),
+        })
+
+    def return_result(self, *, status: str, target: np.ndarray, detail: dict[str, Any]) -> None:
+        self._write({
+            "event": "return_result",
+            "status": status,
+            "target": np.asarray(target, dtype=np.float32).tolist(),
+            "detail": detail,
+        })
+
     def close(self) -> None:
         if self._stream is not None:
             self._stream.flush()

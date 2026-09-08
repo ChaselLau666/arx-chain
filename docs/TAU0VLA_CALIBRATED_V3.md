@@ -42,3 +42,17 @@ For T use `Pick up the T-shaped part and place it in its designated position on 
 Type `EXECUTE CALIBRATED TAU0VLA` only after confirming the model ID, calibration ID, clear workspace, and reachable emergency stop. No arm or gripper clipping is applied; invalid intent, calibration, mapping, response age, session ordering, or finite-value checks stop publication.
 
 Logs, immutable calibration artifacts, JSONL traces, summaries and plots are written under `/home/arx/logs/tau0vla-calibrated/`.
+
+## One-command workflow
+
+After deployment, the same command is used for every rollout. It idempotently starts or reuses the direct network, CAN, lift, v2 arms and sequential cameras; performs a new full calibration; runs the selected policy; and offers a guarded return to the 14D pose captured before policy execution:
+
+```bash
+export ROS_DOMAIN_ID=63
+cd /home/arx/ROS2_LIFT_Play/tools
+MODEL_PROFILE=blue-feedback \
+MODEL_SERVER_URL=http://192.168.50.2:8000 \
+./05_tau0vla_calibrated_rollout.sh --execute
+```
+
+During validation use candidate port `8001`. Profiles are `blue-feedback`, `t-feedback`, `blue-vr`, and `t-vr`. A normal completion or first `Ctrl-C` pauses policy publication and asks for `RETURN TO INITIAL POSE`; a second `Ctrl-C`, protocol error, invalid model output, or emergency stop never initiates return motion. After a successful return, rerun the same command for the next test; it creates a fresh one-use calibration.

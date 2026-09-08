@@ -21,6 +21,7 @@ from tau0vla_calibration import (  # noqa: E402
     CalibratedGripperMapper,
     SideCalibration,
     fit_side,
+    return_trajectory,
     validate_artifact,
 )
 from tau0vla_calibrated_protocol import (  # noqa: E402
@@ -255,3 +256,43 @@ def test_ros_calibration_does_not_shadow_node_publishers_and_pre_settles():
     assert "self._command_publishers" in source
     assert "args.pre_settle_s" in source
     assert source.index("args.pre_settle_s") < source.index("node.sample_grippers(args.settle_s")
+
+
+def test_return_trajectory_is_smooth_bounded_and_reaches_initial_pose():
+    current = np.zeros(14, dtype=np.float32)
+    target = np.ones(14, dtype=np.float32)
+    trajectory = return_trajectory(
+        current,
+        target,
+        rate_hz=30,
+        minimum_duration_s=5.0,
+        max_arm_step=.02,
+        max_gripper_step=.05,
+    )
+    assert len(trajectory) >= 150
+    np.testing.assert_allclose(trajectory[-1], target)
+    arm_step = np.max(np.abs(np.diff(trajectory[:, [0, 1, 7, 8]], axis=0)))
+    gripper_step = np.max(np.abs(np.diff(trajectory[:, [6, 13]], axis=0)))
+    assert arm_step <= .02
+    assert gripper_step <= .05
+    assert np.all(np.diff(trajectory[:, 0]) >= 0)
+
+
+def test_one_command_rollout_orders_stack_calibration_policy_and_return():
+    rollout = (ROOT / "tools/05_tau0vla_calibrated_rollout.sh").read_text(encoding="utf-8")
+    client = (ROOT / "act/tau0vla_calibrated_client.py").read_text(encoding="utf-8")
+    assert rollout.index("00_tau0vla_calibrated_up.sh") < rollout.index(
+        "tau0vla_calibrate_gripper.py"
+    ) < rollout.index("tau0vla_calibrated_client.py")
+    assert "RETURN TO INITIAL POSE" in client
+    assert "return-to-initial verification failed" in client
+
+
+def test_one_click_bringup_is_ark2_only_and_starts_cameras_in_order():
+    source = (ROOT / "tools/00_tau0vla_calibrated_up.sh").read_text(encoding="utf-8")
+    assert '"$(hostname)" != ark-2' in source
+    assert '"${ROS_DOMAIN_ID}" != 63' in source
+    assert source.index("camera_h:260522275257") < source.index(
+        "camera_l:260422273222"
+    ) < source.index("camera_r:260422272473")
+    assert "tau0vla_calibrate_gripper" not in source

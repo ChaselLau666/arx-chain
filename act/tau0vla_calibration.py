@@ -17,6 +17,7 @@ CALIBRATION_VERSION = "arx-open-baseline-v1"
 COMMAND_POINTS = np.asarray([-3.39, -2.55, -1.70, -0.85, 0.0], dtype=np.float64)
 COMMAND_MARGIN = 0.05
 GRIPPER_INDICES = (6, 13)
+ARM_INDICES = (0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12)
 SIDES = ("left", "right")
 
 
@@ -246,6 +247,36 @@ class CalibratedGripperMapper:
         return mapped
 
 
+def return_trajectory(
+    current: np.ndarray,
+    target: np.ndarray,
+    *,
+    rate_hz: float = 30.0,
+    minimum_duration_s: float = 5.0,
+    max_arm_step: float = .02,
+    max_gripper_step: float = .05,
+) -> np.ndarray:
+    """Generate a bounded smoothstep path back to a captured 14D pose."""
+    start = np.asarray(current, dtype=np.float32)
+    goal = np.asarray(target, dtype=np.float32)
+    if start.shape != (14,) or goal.shape != (14,):
+        raise CalibrationError("return poses must be 14-vectors")
+    if not np.isfinite(start).all() or not np.isfinite(goal).all():
+        raise CalibrationError("return poses must be finite")
+    arm = np.asarray(ARM_INDICES)
+    gripper = np.asarray(GRIPPER_INDICES)
+    arm_steps = int(
+        np.ceil(1.5 * np.max(np.abs(goal[arm] - start[arm])) / max_arm_step)
+    )
+    gripper_steps = int(
+        np.ceil(1.5 * np.max(np.abs(goal[gripper] - start[gripper])) / max_gripper_step)
+    )
+    steps = max(int(np.ceil(minimum_duration_s * rate_hz)), arm_steps, gripper_steps, 1)
+    progress = np.linspace(1.0 / steps, 1.0, steps, dtype=np.float32)
+    alpha = progress * progress * (3.0 - 2.0 * progress)
+    return start[None, :] + alpha[:, None] * (goal - start)[None, :]
+
+
 def consumed_path(path: str | Path) -> Path:
     source = Path(path)
     return source.with_suffix(source.suffix + ".consumed")
@@ -299,6 +330,7 @@ __all__ = [
     "load_artifact",
     "mark_consumed",
     "require_unconsumed",
+    "return_trajectory",
     "save_artifact",
     "validate_artifact",
 ]
