@@ -44,6 +44,8 @@ class TraceWriter:
             "blended_boundary_jump_max": info.blended_boundary_jump_max,
             "gripper_saturation_count": info.gripper_saturation_count,
             "gripper_saturation_max": info.gripper_saturation_max,
+            "gripper_intent_saturation_count": info.gripper_intent_saturation_count,
+            "gripper_intent_saturation_max": info.gripper_intent_saturation_max,
         })
 
     def tick(
@@ -130,6 +132,13 @@ def analyze_trace(path: str | Path) -> dict[str, Any]:
         (float(event.get("gripper_saturation_max", 0.0)) for event in adoptions),
         default=0.0,
     )
+    intent_saturation_count = sum(
+        int(event.get("gripper_intent_saturation_count", 0)) for event in adoptions
+    )
+    intent_saturation_max = max(
+        (float(event.get("gripper_intent_saturation_max", 0.0)) for event in adoptions),
+        default=0.0,
+    )
     if not ticks:
         return {
             "ticks": 0,
@@ -137,6 +146,8 @@ def analyze_trace(path: str | Path) -> dict[str, Any]:
             "starvation": starvation,
             "gripper_saturation_count": saturation_count,
             "gripper_saturation_max": saturation_max,
+            "gripper_intent_saturation_count": intent_saturation_count,
+            "gripper_intent_saturation_max": intent_saturation_max,
         }
     command = np.asarray([row["command"] for row in ticks], dtype=np.float32)
     feedback = np.asarray([row["feedback"] for row in ticks], dtype=np.float32)
@@ -166,6 +177,8 @@ def analyze_trace(path: str | Path) -> dict[str, Any]:
         "starvation": starvation,
         "gripper_saturation_count": saturation_count,
         "gripper_saturation_max": saturation_max,
+        "gripper_intent_saturation_count": intent_saturation_count,
+        "gripper_intent_saturation_max": intent_saturation_max,
         "boundary_count": int(len(boundaries)),
         "boundary_step_p95": float(np.percentile(boundary_step, 95)),
         "boundary_step_max": float(np.max(boundary_step)),

@@ -147,7 +147,15 @@ def test_joint_vr_gripper_mapping_and_range_rejection():
     assert mapped[0, 6] == pytest.approx(-3.39, abs=1e-5)
     assert mapped[-1, 6] == pytest.approx(0.0, abs=1e-5)
     values[5, 6] = 1.01
-    with pytest.raises(CalibrationError, match="outside"):
+    values[6, 13] = -0.02
+    mapped = CalibratedGripperMapper(_artifact(), "joint-vr")
+    result = mapped.map_chunk(values)
+    assert result[5, 6] == pytest.approx(0.0, abs=1e-5)
+    assert result[6, 13] == pytest.approx(-3.39, abs=1e-5)
+    assert mapped.last_saturation["intent_count"] == 2
+    assert mapped.last_saturation["max_intent_excess"] == pytest.approx(0.02)
+    values[5, 6] = 1.051
+    with pytest.raises(CalibrationError, match="soft tolerance"):
         CalibratedGripperMapper(_artifact(), "joint-vr").map_chunk(values)
 
 

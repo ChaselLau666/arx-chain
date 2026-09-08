@@ -22,6 +22,7 @@ COMMAND_MARGIN = 0.05
 # never publish the extrapolated value. The hard limit remains close enough to
 # the measured range to catch a wrong route, baseline, or mapping immediately.
 COMMAND_SOFT_TOLERANCE = 0.10
+VR_INTENT_SOFT_TOLERANCE = 0.05
 GRIPPER_INDICES = (6, 13)
 ARM_INDICES = (0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12)
 SIDES = ("left", "right")
@@ -277,6 +278,8 @@ class CalibratedGripperMapper:
         self.last_saturation = {
             "count": 0,
             "max_command_excess": 0.0,
+            "intent_count": 0,
+            "max_intent_excess": 0.0,
             "by_side": {},
         }
 
@@ -294,6 +297,8 @@ class CalibratedGripperMapper:
         mapped = action.copy()
         saturation_count = 0
         saturation_max = 0.0
+        intent_saturation_count = 0
+        intent_saturation_max = 0.0
         saturation_by_side: dict[str, dict[str, float | int]] = {}
         for side, index in zip(SIDES, GRIPPER_INDICES, strict=True):
             fit: SideCalibration = getattr(self.artifact, side)
@@ -301,8 +306,27 @@ class CalibratedGripperMapper:
             if self.experiment == "joint-feedback":
                 desired_feedback = fit.final_open_feedback + values
             else:
-                if np.any(values < 0.0) or np.any(values > 1.0):
-                    raise CalibrationError(f"{side} VR gripper intent is outside [0,1]")
+                intent_excess = np.maximum.reduce(
+                    (-values, values - 1.0, np.zeros_like(values))
+                )
+                maximum_intent_excess = float(np.max(intent_excess))
+                if maximum_intent_excess > VR_INTENT_SOFT_TOLERANCE:
+                    raise CalibrationError(
+                        f"{side} VR gripper intent range "
+                        f"[{float(np.min(values)):.6f}, {float(np.max(values)):.6f}] "
+                        f"exceeds [0,1] plus soft tolerance {VR_INTENT_SOFT_TOLERANCE:.3f}"
+                    )
+                intent_count = int(np.count_nonzero(intent_excess > 0.0))
+                if intent_count:
+                    intent_saturation_count += intent_count
+                    intent_saturation_max = max(
+                        intent_saturation_max, maximum_intent_excess
+                    )
+                    saturation_by_side[side] = {
+                        "intent_count": intent_count,
+                        "max_intent_excess": maximum_intent_excess,
+                    }
+                values = np.clip(values, 0.0, 1.0)
                 desired_feedback = fit.final_open_feedback + values * (
                     fit.closed_feedback - fit.final_open_feedback
                 )
@@ -325,14 +349,18 @@ class CalibratedGripperMapper:
             if count:
                 saturation_count += count
                 saturation_max = max(saturation_max, maximum)
-                saturation_by_side[side] = {
-                    "count": count,
-                    "max_command_excess": maximum,
-                }
+                saturation_by_side.setdefault(side, {}).update(
+                    {
+                        "command_count": count,
+                        "max_command_excess": maximum,
+                    }
+                )
             mapped[:, index] = command.astype(np.float32)
         self.last_saturation = {
-            "count": saturation_count,
+            "count": saturation_count + intent_saturation_count,
             "max_command_excess": saturation_max,
+            "intent_count": intent_saturation_count,
+            "max_intent_excess": intent_saturation_max,
             "by_side": saturation_by_side,
         }
         return mapped
@@ -409,6 +437,7 @@ __all__ = [
     "COMMAND_MARGIN",
     "COMMAND_POINTS",
     "COMMAND_SOFT_TOLERANCE",
+    "VR_INTENT_SOFT_TOLERANCE",
     "CalibrationArtifact",
     "CalibrationError",
     "CalibratedGripperMapper",

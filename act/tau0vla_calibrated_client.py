@@ -367,7 +367,8 @@ def benchmark(client, node, request_id: int, warmup: int, samples: int):
             latencies.append(result.round_trip_ms)
         saturation = (
             f", gripper_saturated={result.gripper_saturation_count} "
-            f"(max excess={result.gripper_saturation_max:.4f})"
+            f"(command excess={result.gripper_saturation_max:.4f}, "
+            f"intent excess={result.gripper_intent_saturation_max:.4f})"
             if result.gripper_saturation_count
             else ""
         )
@@ -568,7 +569,8 @@ def run(args) -> None:
                     f"skip arm/gripper={adoption.arm_skipped}/{adoption.gripper_skipped}, "
                     f"buffer={scheduler.remaining}, "
                     f"gripper_saturated={adoption.gripper_saturation_count} "
-                    f"(max excess={adoption.gripper_saturation_max:.4f})"
+                    f"(command excess={adoption.gripper_saturation_max:.4f}, "
+                    f"intent excess={adoption.gripper_intent_saturation_max:.4f})"
                 )
                 pending = None
                 starved = False
