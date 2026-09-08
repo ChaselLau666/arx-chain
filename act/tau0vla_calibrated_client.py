@@ -470,6 +470,7 @@ def run(args) -> None:
             calibration=calibration.to_dict(),
             execute=args.execute,
             auto_confirm=args.auto_confirm,
+            expected_height=args.expected_height,
             replan_steps=args.replan_steps,
             blend_steps=args.chunk_blend_steps,
             gripper_blend_steps=args.gripper_blend_steps,

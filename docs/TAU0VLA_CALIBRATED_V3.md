@@ -61,6 +61,8 @@ During validation use candidate port `8001`. Profiles are `blue-feedback`, `t-fe
 
 The one-command execute path is non-interactive: it starts/reuses the hardware stack, performs the full two-gripper calibration, moves to the fixed training pose, starts policy publication, and returns to the fixed pose when either the operator presses `Ctrl-C` once or `MAX_STEPS` is reached. It prints `AUTO-CONFIRM` at each movement transition instead of reading confirmation text. The workspace must therefore be clear and the emergency stop reachable before the command is launched. A second `Ctrl-C` during return aborts movement.
 
+The lift defaults to the training height `15.5`. Set `LIFT_HEIGHT` on the one-command launcher to change it; the same value is applied to `/lift fixed_height` and passed to the policy client's stability check. Small changes should be tested first because lift height changes camera and arm-to-table geometry, for example `LIFT_HEIGHT=15.0`.
+
 Protocol, calibration, sensor, mapping, response-age, and other unexpected errors remain fail-stop and never trigger automatic movement. After such an error, or if the policy process is externally killed, use the independent return command below. It locates the newest calibration from the current boot, rejects changed controller identities or an artifact older than 15 minutes, and does not require the rollout trace or model server:
 
 ```bash

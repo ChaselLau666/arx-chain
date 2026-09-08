@@ -343,6 +343,8 @@ def test_one_command_rollout_orders_stack_calibration_policy_and_return():
     assert "--no-return-to-initial" not in rollout
     assert '00_tau0vla_calibrated_up.sh" --auto-confirm' in rollout
     assert "tau0vla_calibrate_gripper.py --execute --auto-confirm" in rollout
+    assert ': "${LIFT_HEIGHT:=15.5}"' in rollout
+    assert '--expected-height "${LIFT_HEIGHT}"' in rollout
     standalone = (ROOT / "tools/06_tau0vla_return_fixed.sh").read_text(encoding="utf-8")
     assert "--calibration-file" in standalone
     assert "--auto-confirm" in standalone

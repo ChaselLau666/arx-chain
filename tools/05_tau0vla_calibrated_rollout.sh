@@ -15,6 +15,7 @@ repo_root="$(cd "${script_dir}/.." && pwd)"
 : "${ARM_EMA_ALPHA:=0.6}"
 : "${GRIPPER_EMA_ALPHA:=1.0}"
 : "${MAX_RESPONSE_AGE_MS:=500}"
+: "${LIFT_HEIGHT:=15.5}"
 
 case "${MODEL_PROFILE}" in
   blue-feedback)
@@ -97,6 +98,7 @@ exec python tau0vla_calibrated_client.py \
   --experiment "${experiment}" \
   --task-instruction "${task}" \
   --calibration-file "${calibration}" \
+  --expected-height "${LIFT_HEIGHT}" \
   --replan-steps "${REPLAN_STEPS}" \
   --chunk-blend-steps "${CHUNK_BLEND_STEPS}" \
   --gripper-blend-steps "${GRIPPER_BLEND_STEPS}" \
