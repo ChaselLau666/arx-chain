@@ -365,9 +365,16 @@ def benchmark(client, node, request_id: int, warmup: int, samples: int):
         result = client.infer(wait_observation(node, 5.0), request_id)
         if index >= warmup:
             latencies.append(result.round_trip_ms)
+        saturation = (
+            f", gripper_saturated={result.gripper_saturation_count} "
+            f"(max excess={result.gripper_saturation_max:.4f})"
+            if result.gripper_saturation_count
+            else ""
+        )
         print(
             f"Benchmark {index+1}/{warmup+samples}: request={request_id}, "
             f"RTT={result.round_trip_ms:.1f} ms, inference={result.inference_ms:.1f} ms"
+            f"{saturation}"
         )
     return request_id, latencies
 
@@ -549,7 +556,9 @@ def run(args) -> None:
                     f"Response request={result.request_id}, RTT={result.round_trip_ms:.1f} ms, "
                     f"inference={result.inference_ms:.1f} ms, "
                     f"skip arm/gripper={adoption.arm_skipped}/{adoption.gripper_skipped}, "
-                    f"buffer={scheduler.remaining}"
+                    f"buffer={scheduler.remaining}, "
+                    f"gripper_saturated={adoption.gripper_saturation_count} "
+                    f"(max excess={adoption.gripper_saturation_max:.4f})"
                 )
                 pending = None
                 starved = False

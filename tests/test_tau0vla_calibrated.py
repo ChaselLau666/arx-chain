@@ -119,6 +119,22 @@ def test_joint_feedback_gripper_mapping_uses_feedback_fit():
     assert mapped[-1, 6] == pytest.approx(-0.11, abs=1e-5)
 
 
+def test_joint_feedback_small_endpoint_error_saturates_but_large_error_rejects():
+    values = np.zeros((30, 14), dtype=np.float32)
+    values[:, 6] = -0.06
+    values[:, 13] = 3.45
+    mapper = CalibratedGripperMapper(_artifact(), "joint-feedback")
+    mapped = mapper.map_chunk(values)
+    np.testing.assert_allclose(mapped[:, 6], -3.39)
+    np.testing.assert_allclose(mapped[:, 13], 0.0)
+    assert mapper.last_saturation["count"] == 60
+    assert mapper.last_saturation["max_command_excess"] == pytest.approx(0.06, abs=1e-5)
+
+    values[0, 6] = -0.08
+    with pytest.raises(CalibrationError, match="soft tolerance"):
+        mapper.map_chunk(values)
+
+
 def test_joint_vr_gripper_mapping_and_range_rejection():
     values = np.zeros((30, 14), dtype=np.float32)
     values[:, [6, 13]] = np.linspace(0.0, 1.0, 30)[:, None]

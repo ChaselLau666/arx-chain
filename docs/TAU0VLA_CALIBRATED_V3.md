@@ -39,7 +39,9 @@ For T use `Pick up the T-shaped part and place it in its designated position on 
 ./03_tau0vla_calibrated_inference.sh --execute --max-steps 3600
 ```
 
-Type `EXECUTE CALIBRATED TAU0VLA` only after confirming the model ID, calibration ID, clear workspace, and reachable emergency stop. No arm or gripper clipping is applied; invalid intent, calibration, mapping, response age, session ordering, or finite-value checks stop publication.
+Type `EXECUTE CALIBRATED TAU0VLA` only after confirming the model ID, calibration ID, clear workspace, and reachable emergency stop. Arm actions are not clipped; invalid intent, calibration, mapping, response age, session ordering, or finite-value checks stop publication.
+
+For `joint-feedback`, a flow sample may fall slightly beyond a demonstrated gripper endpoint. The client accepts at most `0.075` command units of endpoint error and saturates it to the measured command endpoint; the extrapolated command is never published. Larger errors still terminate the session. Every saturation records its count and maximum excess in the response log and trace summary. Arm actions are never clipped. `joint-vr` intent remains strictly constrained to `[0,1]`.
 
 Logs, immutable calibration artifacts, JSONL traces, summaries and plots are written under `/home/arx/logs/tau0vla-calibrated/`.
 

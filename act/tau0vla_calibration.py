@@ -17,6 +17,11 @@ CALIBRATION_SCHEMA_VERSION = 1
 CALIBRATION_VERSION = "arx-open-baseline-v1"
 COMMAND_POINTS = np.asarray([-3.39, -2.55, -1.70, -0.85, 0.0], dtype=np.float64)
 COMMAND_MARGIN = 0.05
+# Flow-policy samples can land just beyond a demonstrated gripper endpoint.
+# Accept only a small semantic error, then saturate to the calibrated endpoint;
+# never publish the extrapolated value. The hard limit remains close enough to
+# the measured range to catch a wrong route, baseline, or mapping immediately.
+COMMAND_SOFT_TOLERANCE = 0.075
 GRIPPER_INDICES = (6, 13)
 ARM_INDICES = (0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12)
 SIDES = ("left", "right")
@@ -269,6 +274,11 @@ class CalibratedGripperMapper:
             raise CalibrationError(f"unsupported calibrated experiment: {experiment}")
         self.artifact = artifact
         self.experiment = experiment
+        self.last_saturation = {
+            "count": 0,
+            "max_command_excess": 0.0,
+            "by_side": {},
+        }
 
     @property
     def open_baselines(self) -> dict[str, float]:
@@ -282,6 +292,9 @@ class CalibratedGripperMapper:
         if action.shape != (30, 14) or not np.isfinite(action).all():
             raise CalibrationError("calibrated action chunk must be finite [30,14]")
         mapped = action.copy()
+        saturation_count = 0
+        saturation_max = 0.0
+        saturation_by_side: dict[str, dict[str, float | int]] = {}
         for side, index in zip(SIDES, GRIPPER_INDICES, strict=True):
             fit: SideCalibration = getattr(self.artifact, side)
             values = action[:, index].astype(np.float64)
@@ -293,14 +306,35 @@ class CalibratedGripperMapper:
                 desired_feedback = fit.final_open_feedback + values * (
                     fit.closed_feedback - fit.final_open_feedback
                 )
-            command = (desired_feedback - fit.intercept) / fit.slope
-            lower = min(fit.command_points) - COMMAND_MARGIN
-            upper = max(fit.command_points) + COMMAND_MARGIN
-            if np.any(command < lower) or np.any(command > upper):
+            raw_command = (desired_feedback - fit.intercept) / fit.slope
+            lower = min(fit.command_points)
+            upper = max(fit.command_points)
+            hard_lower = lower - COMMAND_SOFT_TOLERANCE
+            hard_upper = upper + COMMAND_SOFT_TOLERANCE
+            if np.any(raw_command < hard_lower) or np.any(raw_command > hard_upper):
                 raise CalibrationError(
-                    f"{side} mapped gripper command is outside calibrated envelope [{lower}, {upper}]"
+                    f"{side} mapped gripper command range "
+                    f"[{float(np.min(raw_command)):.6f}, {float(np.max(raw_command)):.6f}] "
+                    f"exceeds calibrated endpoints [{lower:.2f}, {upper:.2f}] plus "
+                    f"soft tolerance {COMMAND_SOFT_TOLERANCE:.3f}"
                 )
+            command = np.clip(raw_command, lower, upper)
+            excess = np.abs(raw_command - command)
+            count = int(np.count_nonzero(excess > 0.0))
+            maximum = float(np.max(excess))
+            if count:
+                saturation_count += count
+                saturation_max = max(saturation_max, maximum)
+                saturation_by_side[side] = {
+                    "count": count,
+                    "max_command_excess": maximum,
+                }
             mapped[:, index] = command.astype(np.float32)
+        self.last_saturation = {
+            "count": saturation_count,
+            "max_command_excess": saturation_max,
+            "by_side": saturation_by_side,
+        }
         return mapped
 
 
@@ -374,6 +408,7 @@ __all__ = [
     "CALIBRATION_VERSION",
     "COMMAND_MARGIN",
     "COMMAND_POINTS",
+    "COMMAND_SOFT_TOLERANCE",
     "CalibrationArtifact",
     "CalibrationError",
     "CalibratedGripperMapper",

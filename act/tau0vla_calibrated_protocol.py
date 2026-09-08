@@ -60,6 +60,8 @@ class CalibratedActionChunk:
     experiment: str
     arm_offset_steps: int
     gripper_offset_steps: int
+    gripper_saturation_count: int = 0
+    gripper_saturation_max: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -71,6 +73,8 @@ class AdoptionInfo:
     age_ms: float
     raw_boundary_jump_max: float
     blended_boundary_jump_max: float
+    gripper_saturation_count: int = 0
+    gripper_saturation_max: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -282,6 +286,8 @@ class CalibratedHttpClient:
             experiment=self.experiment,
             arm_offset_steps=int(self.arm_offset_steps),
             gripper_offset_steps=int(self.gripper_offset_steps),
+            gripper_saturation_count=int(self.mapper.last_saturation["count"]),
+            gripper_saturation_max=float(self.mapper.last_saturation["max_command_excess"]),
         )
 
 
@@ -396,6 +402,8 @@ class CalibratedChunkScheduler:
             age_ms=age_ms,
             raw_boundary_jump_max=raw_jump,
             blended_boundary_jump_max=blended_jump,
+            gripper_saturation_count=chunk.gripper_saturation_count,
+            gripper_saturation_max=chunk.gripper_saturation_max,
         )
 
     def next_action(self) -> ScheduledAction:
