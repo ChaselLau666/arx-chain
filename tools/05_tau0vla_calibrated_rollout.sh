@@ -89,7 +89,10 @@ python tau0vla_calibrate_gripper.py --execute --output "${calibration}" \
   2>&1 | tee -a "${calibration_log}"
 test -f "${calibration}"
 
-python tau0vla_calibrated_client.py \
+echo "Calibration: ${calibration}"
+echo "Client log: ${client_log}"
+echo "Trace: ${trace}"
+exec python tau0vla_calibrated_client.py \
   --server-url "${MODEL_SERVER_URL}" \
   --experiment "${experiment}" \
   --task-instruction "${task}" \
@@ -101,11 +104,6 @@ python tau0vla_calibrated_client.py \
   --gripper-ema-alpha "${GRIPPER_EMA_ALPHA}" \
   --max-response-age-ms "${MAX_RESPONSE_AGE_MS}" \
   --trace-path "${trace}" \
+  --log-path "${client_log}" \
   --max-steps "${max_steps}" \
-  "${policy_mode[@]}" \
-  2>&1 | tee -a "${client_log}"
-
-echo "CALIBRATED_ROLLOUT_COMPLETE"
-echo "Calibration: ${calibration}"
-echo "Client log: ${client_log}"
-echo "Trace: ${trace}"
+  "${policy_mode[@]}"

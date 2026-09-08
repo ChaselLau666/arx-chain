@@ -7,6 +7,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 import json
 from pathlib import Path
 import signal
+import sys
 import threading
 import time
 
@@ -41,6 +42,30 @@ from utils.setup_loader import setup_loader
 ROOT = Path(__file__).resolve().parent
 ARM_INDICES = np.asarray([0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12])
 GRIPPER_INDICES = np.asarray([6, 13])
+
+
+class TeeStream:
+    """Line-buffered stdout/stderr duplication without a shell pipeline."""
+    def __init__(self, terminal, log_stream, lock: threading.Lock):
+        self.terminal = terminal
+        self.log_stream = log_stream
+        self.lock = lock
+        self.encoding = getattr(terminal, "encoding", "utf-8")
+
+    def write(self, value):
+        with self.lock:
+            terminal_result = self.terminal.write(value)
+            self.log_stream.write(value)
+            self.log_stream.flush()
+        return terminal_result
+
+    def flush(self):
+        with self.lock:
+            self.terminal.flush()
+            self.log_stream.flush()
+
+    def isatty(self):
+        return self.terminal.isatty()
 
 
 def create_observation_node(config: dict, *, max_observation_age_ms: float, max_camera_skew_ms: float):
@@ -427,6 +452,7 @@ def run(args) -> None:
         )
         ema = ActionEMA(args.arm_ema_alpha, args.gripper_ema_alpha)
         initial = node.snapshot().qpos
+        trace.return_result(status="initial_pose", target=initial, detail={})
         ema.reset(initial)
         adoption = scheduler.adopt(first, initial=True, arrival_monotonic_ns=time.monotonic_ns())
         trace.adoption(first.request_id, adoption)
@@ -516,6 +542,7 @@ def run(args) -> None:
                 raise RuntimeError("return-to-initial cancelled; robot remains at current pose")
             detail = return_to_initial_pose(node, initial, trace, return_abort, args)
             print(f"RETURN TO INITIAL COMPLETE: {json.dumps(detail, sort_keys=True)}")
+        print("CALIBRATED_ROLLOUT_COMPLETE")
     finally:
         if pending is not None:
             pending.cancel()
@@ -564,6 +591,7 @@ def parse_args():
     parser.add_argument("--gripper-ema-alpha", type=float, default=1.0)
     parser.add_argument("--calibration-max-age-s", type=float, default=900.0)
     parser.add_argument("--trace-path", type=Path, required=True)
+    parser.add_argument("--log-path", type=Path)
     parser.add_argument("--max-steps", type=int, default=10000)
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--no-return-to-initial", action="store_true")
@@ -585,4 +613,18 @@ def parse_args():
 
 
 if __name__ == "__main__":
-    run(parse_args())
+    parsed = parse_args()
+    if parsed.log_path is None:
+        run(parsed)
+    else:
+        parsed.log_path.parent.mkdir(parents=True, exist_ok=True)
+        with parsed.log_path.open("a", encoding="utf-8", buffering=1) as log_stream:
+            lock = threading.Lock()
+            stdout, stderr = sys.stdout, sys.stderr
+            sys.stdout = TeeStream(stdout, log_stream, lock)
+            sys.stderr = TeeStream(stderr, log_stream, lock)
+            try:
+                run(parsed)
+            finally:
+                sys.stdout = stdout
+                sys.stderr = stderr

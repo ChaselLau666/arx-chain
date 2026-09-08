@@ -288,6 +288,8 @@ def test_one_command_rollout_orders_stack_calibration_policy_and_return():
     assert "actual_route" in rollout
     assert "RETURN TO INITIAL POSE" in client
     assert "return-to-initial verification failed" in client
+    assert "exec python tau0vla_calibrated_client.py" in rollout
+    assert '2>&1 | tee -a "${client_log}"' not in rollout
 
 
 def test_one_click_bringup_is_ark2_only_and_starts_cameras_in_order():

@@ -111,8 +111,8 @@ gnome-terminal --title="tau0vla-calibrated-inference" -- bash -ic \
      --arm-ema-alpha $(quote "${ARM_EMA_ALPHA}") \
      --gripper-ema-alpha $(quote "${GRIPPER_EMA_ALPHA}") \
      --max-response-age-ms $(quote "${MAX_RESPONSE_AGE_MS}") \
-     --trace-path $(quote "${trace_file}")${extra_q} \
-     2>&1 | tee -a $(quote "${log_file}"); exec bash"
+     --trace-path $(quote "${trace_file}") \
+     --log-path $(quote "${log_file}")${extra_q}; exec bash"
 
 echo "Calibrated client launched."
 echo "Calibration: ${CALIBRATION_FILE}"
