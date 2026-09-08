@@ -306,3 +306,19 @@ def test_height_waiter_checks_stability_not_command_feedback_equality():
     source = (ROOT / "act/tau0vla_wait_height.py").read_text(encoding="utf-8")
     assert "is_safe_and_stable" in source
     assert "abs(float(values[-1]) - args.target)" not in source
+
+
+def test_return_recovery_prefers_explicit_initial_event_then_first_tick(tmp_path):
+    from tau0vla_return_from_trace import load_target
+
+    path = tmp_path / "trace.jsonl"
+    path.write_text(
+        '\n'.join([
+            json.dumps({"event": "metadata", "calibration": {}}),
+            json.dumps({"event": "tick", "feedback": [1.0]*14}),
+            json.dumps({"event": "return_result", "status": "initial_pose", "target": [2.0]*14}),
+        ]) + '\n',
+        encoding="utf-8",
+    )
+    target, _ = load_target(path)
+    np.testing.assert_array_equal(target, np.full(14, 2.0))
