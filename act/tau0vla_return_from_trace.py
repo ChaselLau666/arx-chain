@@ -15,9 +15,11 @@ from tau0vla_calibration import (
     artifact_from_dict,
     current_robot_identity,
     feedback_pose_to_command,
+    load_artifact,
     load_training_ready_arms,
     return_trajectory,
     training_ready_targets,
+    validate_artifact,
 )
 from utils.setup_loader import setup_loader
 
@@ -50,6 +52,13 @@ def load_target(path: Path, ready_pose_config: Path):
     ):
         raise RuntimeError("trace has no valid fixed 14D ready pose")
     return command, feedback, calibration, metadata
+
+
+def load_calibrated_target(calibration_path: Path, ready_pose_config: Path):
+    calibration = load_artifact(calibration_path)
+    ready_arms = load_training_ready_arms(ready_pose_config)
+    command, feedback = training_ready_targets(calibration, ready_arms)
+    return command, feedback, calibration
 
 
 def create_return_node(config):
@@ -108,27 +117,46 @@ def create_return_node(config):
 def run(args):
     import rclpy
 
-    command_target, feedback_target, calibration, metadata = load_target(
-        args.trace, args.ready_pose_config
-    )
     hostname, domain, boot_id, controllers = current_robot_identity()
-    saved = metadata.get("calibration") or {}
-    if (
-        saved.get("hostname") != hostname
-        or saved.get("ros_domain_id") != domain
-        or saved.get("boot_id") != boot_id
-        or saved.get("controller_identity") != controllers
-    ):
-        raise RuntimeError("trace calibration identity does not match the live robot/controllers")
-    age = time.time() - args.trace.stat().st_mtime
-    if not 0 <= age <= args.max_trace_age_s:
-        raise RuntimeError(f"trace age {age:.1f}s exceeds recovery limit")
-    print(f"Recovery trace: {args.trace}")
+    if args.trace is not None:
+        command_target, feedback_target, calibration, metadata = load_target(
+            args.trace, args.ready_pose_config
+        )
+        saved = metadata.get("calibration") or {}
+        if (
+            saved.get("hostname") != hostname
+            or saved.get("ros_domain_id") != domain
+            or saved.get("boot_id") != boot_id
+            or saved.get("controller_identity") != controllers
+        ):
+            raise RuntimeError("trace calibration identity does not match the live robot/controllers")
+        age = time.time() - args.trace.stat().st_mtime
+        if not 0 <= age <= args.max_trace_age_s:
+            raise RuntimeError(f"trace age {age:.1f}s exceeds recovery limit")
+        print(f"Recovery trace: {args.trace}")
+    else:
+        command_target, feedback_target, calibration = load_calibrated_target(
+            args.calibration_file, args.ready_pose_config
+        )
+        validate_artifact(
+            calibration,
+            hostname=hostname,
+            ros_domain_id=domain,
+            boot_id=boot_id,
+            controller_identity=controllers,
+            max_age_s=args.max_calibration_age_s,
+        )
+        print(f"Calibration: {args.calibration_file}")
     print(f"Fixed initial feedback target: {np.array2string(feedback_target, precision=4)}")
     if not args.execute:
         print("DRY-RUN: no publisher was created.")
         return
-    if input("Type RETURN LAST TRACE TO FIXED INITIAL POSE to move: ") != "RETURN LAST TRACE TO FIXED INITIAL POSE":
+    confirmation_text = (
+        "RETURN LAST TRACE TO FIXED INITIAL POSE"
+        if args.trace is not None
+        else "RETURN TO FIXED INITIAL POSE"
+    )
+    if input(f"Type {confirmation_text} to move: ") != confirmation_text:
         raise RuntimeError("return recovery cancelled")
 
     setup_loader(ROOT)
@@ -196,9 +224,12 @@ def run(args):
 def parse_args():
     stamp = time.strftime("%Y%m%d_%H%M%S")
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--trace", type=Path, required=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--trace", type=Path)
+    source.add_argument("--calibration-file", type=Path)
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--max-trace-age-s", type=float, default=1800.0)
+    parser.add_argument("--max-calibration-age-s", type=float, default=900.0)
     parser.add_argument("--config", type=Path, default=ROOT/"data/config.yaml")
     parser.add_argument(
         "--ready-pose-config",

@@ -57,4 +57,12 @@ MODEL_SERVER_URL=http://192.168.50.2:8000 \
 ./05_tau0vla_calibrated_rollout.sh --execute
 ```
 
-During validation use candidate port `8001`. Profiles are `blue-feedback`, `t-feedback`, `blue-vr`, and `t-vr`. Before inference, `MOVE TO FIXED INITIAL POSE` is required and arrival is checked against `act/data/tau0vla_calibrated_ready.yaml`. Grippers remain at the full-open feedback measured by the current calibration, with their commands obtained through the fitted inverse rather than by treating feedback as command coordinates. A normal completion or first `Ctrl-C` pauses policy publication and asks for `RETURN TO INITIAL POSE`; this now means the same fixed training pose, not whatever pose happened to exist when the client started. A second `Ctrl-C`, protocol error, invalid model output, or emergency stop never initiates return motion. After a successful return, rerun the same command for the next test; it creates a fresh one-use calibration.
+During validation use candidate port `8001`. Profiles are `blue-feedback`, `t-feedback`, `blue-vr`, and `t-vr`. Before inference, `MOVE TO FIXED INITIAL POSE` is required and arrival is checked against `act/data/tau0vla_calibrated_ready.yaml`. Grippers remain at the full-open feedback measured by the current calibration, with their commands obtained through the fitted inverse rather than by treating feedback as command coordinates.
+
+The one-command rollout deliberately does not return from inside its `Ctrl-C` handler. Stop policy publication, wait for the shell prompt, clear the path, then run the independent command below. It locates the newest calibration from the current boot, rejects changed controller identities or an artifact older than 15 minutes, and does not require the rollout trace:
+
+```bash
+./06_tau0vla_return_fixed.sh --execute
+```
+
+Type `RETURN TO FIXED INITIAL POSE` to move. A protocol error or emergency stop never initiates return automatically. After a verified return, rerun the rollout command; it creates a fresh one-use calibration.

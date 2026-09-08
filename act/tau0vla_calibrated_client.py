@@ -621,6 +621,11 @@ def run(args) -> None:
             finally:
                 motion_active.clear()
             print(f"RETURN TO FIXED INITIAL COMPLETE: {json.dumps(detail, sort_keys=True)}")
+        elif args.execute:
+            print(
+                "Policy publication stopped. Return is intentionally separate; run "
+                "tools/06_tau0vla_return_fixed.sh --execute."
+            )
         print("CALIBRATED_ROLLOUT_COMPLETE")
     finally:
         if pending is not None:

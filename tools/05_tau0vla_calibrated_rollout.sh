@@ -106,4 +106,5 @@ exec python tau0vla_calibrated_client.py \
   --trace-path "${trace}" \
   --log-path "${client_log}" \
   --max-steps "${max_steps}" \
+  --no-return-to-initial \
   "${policy_mode[@]}"

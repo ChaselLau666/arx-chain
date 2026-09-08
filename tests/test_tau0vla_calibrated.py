@@ -326,6 +326,11 @@ def test_one_command_rollout_orders_stack_calibration_policy_and_return():
     assert "RETURN TO INITIAL POSE" in client
     assert "fixed-pose verification failed" in client
     assert "fixed_initial_feedback" in client
+    assert "--no-return-to-initial" in rollout
+    standalone = (ROOT / "tools/06_tau0vla_return_fixed.sh").read_text(encoding="utf-8")
+    assert "--calibration-file" in standalone
+    assert "trace_" not in standalone
+    assert "tau0vla_.*client.py" in standalone
     assert "exec python tau0vla_calibrated_client.py" in rollout
     assert '2>&1 | tee -a "${client_log}"' not in rollout
 
