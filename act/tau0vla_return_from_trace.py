@@ -9,8 +9,6 @@ import threading
 import time
 
 import numpy as np
-import rclpy
-from rclpy.node import Node
 import yaml
 
 from tau0vla_calibration import (
@@ -54,55 +52,62 @@ def load_target(path: Path, ready_pose_config: Path):
     return command, feedback, calibration, metadata
 
 
-class ReturnNode(Node):
-    def __init__(self, config):
-        super().__init__("tau0vla_return_from_trace")
-        from arx5_arm_msg.msg import RobotStatus
+def create_return_node(config):
+    from rclpy.node import Node
 
-        self._message_type = RobotStatus
-        self._lock = threading.Lock()
-        self._latest = {}
-        self._command_publishers = {
-            "left": self.create_publisher(
-                RobotStatus, config["arm_config"]["follow_arm_left_cmd_topic"], 10
-            ),
-            "right": self.create_publisher(
-                RobotStatus, config["arm_config"]["follow_arm_right_cmd_topic"], 10
-            ),
-        }
-        self.create_subscription(
-            RobotStatus,
-            config["arm_config"]["follow_arm_left_feedback_topic"],
-            lambda message: self._receive("left", message),
-            20,
-        )
-        self.create_subscription(
-            RobotStatus,
-            config["arm_config"]["follow_arm_right_feedback_topic"],
-            lambda message: self._receive("right", message),
-            20,
-        )
+    class ReturnNode(Node):
+        def __init__(self):
+            super().__init__("tau0vla_return_from_trace")
+            from arx5_arm_msg.msg import RobotStatus
 
-    def _receive(self, side, message):
-        values = np.asarray(message.joint_pos, dtype=np.float32)
-        if values.shape == (7,) and np.isfinite(values).all():
+            self._message_type = RobotStatus
+            self._lock = threading.Lock()
+            self._latest = {}
+            self._command_publishers = {
+                "left": self.create_publisher(
+                    RobotStatus, config["arm_config"]["follow_arm_left_cmd_topic"], 10
+                ),
+                "right": self.create_publisher(
+                    RobotStatus, config["arm_config"]["follow_arm_right_cmd_topic"], 10
+                ),
+            }
+            self.create_subscription(
+                RobotStatus,
+                config["arm_config"]["follow_arm_left_feedback_topic"],
+                lambda message: self._receive("left", message),
+                20,
+            )
+            self.create_subscription(
+                RobotStatus,
+                config["arm_config"]["follow_arm_right_feedback_topic"],
+                lambda message: self._receive("right", message),
+                20,
+            )
+
+        def _receive(self, side, message):
+            values = np.asarray(message.joint_pos, dtype=np.float32)
+            if values.shape == (7,) and np.isfinite(values).all():
+                with self._lock:
+                    self._latest[side] = values.copy()
+
+        def current(self):
             with self._lock:
-                self._latest[side] = values.copy()
+                if set(self._latest) != {"left", "right"}:
+                    raise RuntimeError("both arm feedback streams are required")
+                return np.concatenate((self._latest["left"], self._latest["right"]))
 
-    def current(self):
-        with self._lock:
-            if set(self._latest) != {"left", "right"}:
-                raise RuntimeError("both arm feedback streams are required")
-            return np.concatenate((self._latest["left"], self._latest["right"]))
+        def publish(self, values):
+            for side, part in (("left", values[:7]), ("right", values[7:])):
+                message = self._message_type()
+                message.joint_pos[:7] = np.asarray(part, dtype=float).tolist()
+                self._command_publishers[side].publish(message)
 
-    def publish(self, values):
-        for side, part in (("left", values[:7]), ("right", values[7:])):
-            message = self._message_type()
-            message.joint_pos[:7] = np.asarray(part, dtype=float).tolist()
-            self._command_publishers[side].publish(message)
+    return ReturnNode()
 
 
 def run(args):
+    import rclpy
+
     command_target, feedback_target, calibration, metadata = load_target(
         args.trace, args.ready_pose_config
     )
@@ -129,7 +134,7 @@ def run(args):
     setup_loader(ROOT)
     with args.config.open("r", encoding="utf-8") as stream:
         config = yaml.safe_load(stream)
-    node = ReturnNode(config)
+    node = create_return_node(config)
     abort = threading.Event()
     signal.signal(signal.SIGINT, lambda *_: abort.set())
     spin_stop = threading.Event()
@@ -209,6 +214,8 @@ def parse_args():
 
 
 if __name__ == "__main__":
+    import rclpy
+
     rclpy.init()
     try:
         run(parse_args())
