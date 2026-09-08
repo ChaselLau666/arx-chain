@@ -298,3 +298,9 @@ def test_one_click_bringup_is_ark2_only_and_starts_cameras_in_order():
         "camera_l:260422273222"
     ) < source.index("camera_r:260422272473")
     assert "tau0vla_calibrate_gripper" not in source
+
+
+def test_height_waiter_checks_stability_not_command_feedback_equality():
+    source = (ROOT / "act/tau0vla_wait_height.py").read_text(encoding="utf-8")
+    assert "is_safe_and_stable" in source
+    assert "abs(float(values[-1]) - args.target)" not in source

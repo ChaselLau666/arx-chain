@@ -5,10 +5,11 @@ import argparse
 import collections
 import time
 
-import numpy as np
 import rclpy
 from rclpy.node import Node
 from arm_control.msg import PosCmd
+
+from safe_height import is_safe_and_stable
 
 
 def main(args) -> int:
@@ -24,16 +25,13 @@ def main(args) -> int:
     try:
         while rclpy.ok() and time.monotonic() < deadline:
             rclpy.spin_once(node, timeout_sec=.1)
-            if len(samples) < 2 or samples[-1][0] - samples[0][0] < args.window:
-                continue
-            cutoff = samples[-1][0] - args.window
-            values = np.asarray([value for stamp, value in samples if stamp >= cutoff])
-            if (
-                len(values) >= 2
-                and abs(float(values[-1]) - args.target) <= args.tolerance
-                and float(np.ptp(values)) <= args.tolerance
-            ):
-                print(f"HEIGHT_STABLE target={args.target:.6f} feedback={values[-1]:.6f}")
+            # fixed_height is a command coordinate; /body_information.height
+            # has a calibrated offset (15.5 command is normally ~15.03
+            # feedback). Match the already-validated inference preflight:
+            # require the parameter separately, and gate only on fresh stable
+            # feedback here rather than equality between unlike coordinates.
+            if is_safe_and_stable(samples, float("inf"), args.tolerance, args.window):
+                print(f"HEIGHT_STABLE target={args.target:.6f} feedback={samples[-1][1]:.6f}")
                 return 0
         print("REFUSED: lift did not reach a stable target before timeout")
         return 1
