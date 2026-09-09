@@ -11,13 +11,14 @@ Filtering here rather than on the recorded joint angles is what teleop-app
 does, and for the same reason: the pose is what feeds inverse kinematics, and a
 jump in the pose becomes a jump in the joint solution.
 
-It also carries the offset that makes the stream relative. The headset sends an
-absolute pose and is never told that anything else moved the arm, so on the
-first frame after the arm is parked it would command the arm to wherever the
-hand happens to be. Anchoring on the arm once, when a /arx_joy mute ends, and
-carrying the difference on everything after is the same trick Human DAgger plays
-on every takeover (_rebase_one in human_dagger_core.py): a still hand holds the
-arm where it is, a moving one carries on from there.
+It also carries the offset that puts the headset's frame onto the arm's. The
+headset streams the controller's pose in a frame of its own, whose origin means
+"arm at its zero point" - that is where a long press of A or X drives the stream.
+The offset maps that origin onto the arm's pose at the moment of anchoring, so a
+stream at its origin commands the arm exactly there and everything else follows
+relative to it. Anchor while the arm sits at the ready pose and the headset's
+origin is the ready pose for the rest of the session, which is what makes A and X
+land where the operator expects.
 """
 
 import os
@@ -112,12 +113,19 @@ def build_node(args):
             self.arm_status_at = time.monotonic()
 
         def rebase(self, reason):
-            """Re-aim the stream at wherever the arm has just been left.
+            """Point the stream's origin at where the arm has just been left.
+
+            The headset sends the controller's pose in its own frame, and its
+            origin is what a long press of A or X drives the stream back to -
+            the vendor's "arm returns to zero". Mapping that origin onto the
+            arm's current pose is the whole offset, so a stream at its origin
+            commands the arm exactly here, and everything else follows relative
+            to that.
 
             The rotation offset is applied on the right so that a rotation of
-            the hand becomes the same rotation of the tool: with
-            f(X) = X * P^-1 * R, f(P) is R and f(D * X) is D * f(X). Composing
-            on the left would satisfy the first and not the second.
+            the hand becomes the same rotation of the tool: with f(X) = X * R,
+            f(identity) is R and f(D * X) is D * f(X). Composing on the left
+            would satisfy the first and not the second.
             """
             if self.pos_prev is None:
                 self.safety_warn('waiting for the first valid VR pose before publishing')
@@ -131,8 +139,14 @@ def build_node(args):
                 self.safety_warn(
                     f'holding VR output: {args.arm_status_topic} is stale ({age:.2f}s)')
                 return False
-            self.offset_pos = self.arm_pos - self.pos_prev
-            self.offset_rot = self.rot_prev.inv() * self.arm_rot
+            # The headset's origin already means "put the arm at its zero
+            # point", so the offset is the arm's own pose and nothing else. The
+            # VR pose at this instant is deliberately not subtracted: doing so
+            # would fold wherever the operator's hand happened to be into the
+            # mapping, and the headset's origin would then land somewhere other
+            # than the ready pose for the rest of the session.
+            self.offset_pos = self.arm_pos
+            self.offset_rot = self.arm_rot
             self.get_logger().info(
                 f'{reason}: re-aimed onto the arm: '
                 f'{np.round(self.offset_pos * 1000, 1)} mm, '
@@ -250,12 +264,20 @@ def parse_args():
                              'to re-aim the stream after the arm is parked')
     parser.add_argument('--arm-status-timeout', type=float, default=0.5,
                         help='maximum age in seconds of arm feedback used for a rebase')
-    parser.add_argument('--max-position-jump', type=float, default=0.08,
-                        help='raw position step in metres that triggers a safe rebase; '
-                             'zero disables the check')
-    parser.add_argument('--max-angle-jump-deg', type=float, default=45.0,
-                        help='raw orientation step in degrees that triggers a safe rebase; '
-                             'zero disables the check')
+    parser.add_argument('--max-position-jump', type=float, default=0.0,
+                        help='raw position step in metres that triggers a safe rebase. Off '
+                             'by default: a rebase moves the anchor, so every trip of this '
+                             'check changes where the VR origin puts the arm, and a headset '
+                             'that stutters silently walks the mapping away from the ready '
+                             'pose. Set it to a positive value, 0.08 was the old default, to '
+                             'have a large jump re-aimed rather than followed')
+    parser.add_argument('--max-angle-jump-deg', type=float, default=0.0,
+                        help='raw orientation step in degrees that triggers a safe rebase. Off '
+                             'by default, for the same reason as --max-position-jump: a rebase '
+                             'moves the anchor, and the headset\'s origin then stops meaning '
+                             'the ready pose. Turning a wrist through 58 and 75 degrees tripped '
+                             'the old 45 degree default twice in one session and left A and X '
+                             'landing somewhere else for the rest of it')
     parser.add_argument('--no-rebase', dest='rebase', action='store_false',
                         help='forward poses as they come, without re-aiming them onto the '
                              'arm when a mute ends. The arm is then pulled back to wherever '
