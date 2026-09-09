@@ -66,6 +66,20 @@ shell_exec="exec $shell_type"
 
 die() { echo "Refused: $*" >&2; exit 1; }
 
+normalise_lift_height() {
+    local value=$1
+    [[ "$value" =~ ^[+-]?([0-9]+\.?[0-9]*|\.[0-9]+)([eE][+-]?[0-9]+)?$ ]] \
+        || die "LIFT_HEIGHT must be numeric and in [0, 20], got: ${value}"
+    awk -v value="$value" 'BEGIN {
+        if (value < 0.0 || value > 20.0) exit 1
+        printf "%.12f", value + 0.0
+    }' || die "LIFT_HEIGHT must be numeric and in [0, 20], got: ${value}"
+}
+
+# `ros2 param set` infers an integer from a bare value such as 15, while the
+# SDK declares fixed_height as DOUBLE. Use one validated DOUBLE literal for
+# both the ROS parameter and the collector metadata.
+
 # Checked and rewritten before anything powers up. Two ways this bites: a short
 # array leaves the arm homing to whatever the SDK makes of a partial pose, and an
 # all-integer one is rejected outright, because go_home_position is declared
@@ -89,6 +103,7 @@ normalise_pose() {
 }
 READY_POSE_L=$(normalise_pose READY_POSE_L "${READY_POSE_L}")
 READY_POSE_R=$(normalise_pose READY_POSE_R "${READY_POSE_R}")
+LIFT_HEIGHT_ROS=$(normalise_lift_height "$LIFT_HEIGHT")
 
 # Which topic each arm ends up subscribed to, and so where collect.py has to
 # publish to command a pose. Reaching an arm means publishing where it listens.
@@ -134,16 +149,23 @@ source /opt/ros/jazzy/setup.bash
 source "${LIFT_WS}/install/setup.bash"
 set -u
 height_set=false
+readback=""
 for _ in $(seq 1 20); do
-  if ros2 param set /lift fixed_height "${LIFT_HEIGHT}"; then
+  ros2 param set /lift fixed_height "${LIFT_HEIGHT_ROS}" >/dev/null 2>&1 || true
+  readback=$(ros2 param get /lift fixed_height 2>/dev/null \
+             | sed -n 's/^Double value is: //p') || readback=""
+  if [[ -n "$readback" ]] && awk -v a="$readback" -v b="${LIFT_HEIGHT_ROS}" \
+      'BEGIN { d = a - b; if (d < 0) d = -d; exit !(d < 1e-6) }'; then
     height_set=true
     break
   fi
   sleep 0.5
 done
 if [[ "${height_set}" != true ]]; then
-  die "could not set /lift fixed_height"
+  echo "Last value read back from /lift: ${readback:-<none>}" >&2
+  die "/lift did not accept fixed_height=${LIFT_HEIGHT_ROS}; verify that the patched SDK is installed and restart body"
 fi
+echo "/lift fixed_height verified at ${LIFT_HEIGHT_ROS}"
 
 # Arms. Started with ros2 run so go_home_position can be given: everything else
 # here reproduces v2_pos_control.yaml, and the node name has to be remapped
@@ -174,7 +196,7 @@ fi
 
 # Collect. --ready_pose is what turns the parking on, and --ready_pose_topics
 # tells it where the arms are actually listening.
-lift_height_q=$(printf '%q' "${LIFT_HEIGHT}")
+lift_height_q=$(printf '%q' "${LIFT_HEIGHT_ROS}")
 task_name_q=$(printf '%q' "${TASK_NAME}")
 ready_args="--ready_pose --ready_pose_topics ${ARM_POSE_L} ${ARM_POSE_R}"
 (( SKIP_FILTER )) && ready_args=""

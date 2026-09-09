@@ -30,6 +30,19 @@ def normalise_pose(pose):
     )
 
 
+def normalise_lift_height(height):
+    """Run the launcher's height validator without reaching hardware startup."""
+    text = LAUNCHER.read_text()
+    begin = text.index('die() {')
+    fragment = text[begin:text.index('\n# `ros2 param set`', begin)]
+    return subprocess.run(
+        ['bash', '-c',
+         f'set -Eeuo pipefail\n{fragment}\nnormalise_lift_height "$1"', '_', height],
+        text=True,
+        capture_output=True,
+    )
+
+
 class GoHomeMessageTests(unittest.TestCase):
     def test_joy_message_carries_both_elements(self):
         # arxJoyCB reads data[0] and data[1] without checking the length, so a
@@ -109,6 +122,23 @@ class PoseNormalisationTests(unittest.TestCase):
                 self.assertNotEqual(normalise_pose(pose).returncode, 0)
 
 
+class LiftHeightNormalisationTests(unittest.TestCase):
+    def test_integer_height_is_widened_to_double(self):
+        result = normalise_lift_height('15')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, '15.000000000000')
+
+    def test_decimal_height_is_preserved_as_double(self):
+        result = normalise_lift_height('15.5')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, '15.500000000000')
+
+    def test_non_numeric_and_out_of_range_heights_are_refused(self):
+        for height in ('not-a-number', '-0.1', '20.1', 'nan'):
+            with self.subTest(height=height):
+                self.assertNotEqual(normalise_lift_height(height).returncode, 0)
+
+
 class LauncherWiringTests(unittest.TestCase):
     def setUp(self):
         self.text = LAUNCHER.read_text()
@@ -143,6 +173,33 @@ class LauncherWiringTests(unittest.TestCase):
         baseline = (ROOT / 'tools' / '01_collect.sh').read_text()
         self.assertNotIn('go_home_position', baseline)
         self.assertNotIn('ready_pose', baseline)
+
+    def test_lift_height_is_normalized_as_double_everywhere(self):
+        # A bare value such as 15 is inferred as INTEGER by `ros2 param set`,
+        # while /lift.fixed_height is declared DOUBLE and rejects that type.
+        self.assertIn(
+            'LIFT_HEIGHT_ROS=$(normalise_lift_height "$LIFT_HEIGHT")',
+            self.text,
+        )
+        self.assertIn(
+            'ros2 param set /lift fixed_height "${LIFT_HEIGHT_ROS}"',
+            self.text,
+        )
+        self.assertIn('lift_height_q=$(printf \'%q\' "${LIFT_HEIGHT_ROS}")', self.text)
+
+    def test_fixed_height_is_verified_by_readback(self):
+        # ROS 2 CLI may return success even when an undeclared parameter was
+        # rejected. The launcher must read the DOUBLE value back before it
+        # powers up VR and arms or claims that height was fixed.
+        begin = self.text.index('# Set fixed height before VR starts')
+        block = self.text[begin:self.text.index('\n# Arms.', begin)]
+        self.assertIn('ros2 param get /lift fixed_height', block)
+        self.assertIn("sed -n 's/^Double value is: //p'", block)
+        self.assertIn(
+            'awk -v a="$readback" -v b="${LIFT_HEIGHT_ROS}"',
+            block,
+        )
+        self.assertIn('Last value read back from /lift:', block)
 
 
 class FilterRebaseTests(unittest.TestCase):
