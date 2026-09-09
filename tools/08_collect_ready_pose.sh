@@ -61,10 +61,60 @@ CAN_DIR=${CAN_DIR:-/home/arx/LIFT/ARX_CAN/arx_can}
 ACT_PYTHON=${ACT_PYTHON:-/home/arx/miniconda3/envs/act/bin/python}
 ACT_ENV=${ACT_ENV:-act}
 
+# Diagnostics. DIVE_PROBE=1 records everything that could move an arm, into one
+# directory, from before anything powers up. It only adds a read-only subscriber
+# and tees the terminals that already existed, so a normal run (the default, 0)
+# behaves exactly as it did.
+DIVE_PROBE=${DIVE_PROBE:-0}
+PROBE_DIR=${PROBE_DIR:-${repo_root}/diagnostics/dive_$(date +%Y%m%d_%H%M%S)}
+
 shell_type=${SHELL##*/}
 shell_exec="exec $shell_type"
 
 die() { echo "Refused: $*" >&2; exit 1; }
+
+# Each returns nothing unless DIVE_PROBE=1, so the command strings below are
+# unchanged on a normal run.
+probe_pre() { (( DIVE_PROBE )) && printf 'stdbuf -oL -eL '; return 0; }
+probe_py()  { (( DIVE_PROBE )) && printf -- '-u '; return 0; }
+probe_log() { (( DIVE_PROBE )) && printf ' 2>&1 | tee -a %s/%s.log' "${PROBE_DIR}" "$1"; return 0; }
+
+# What the run started from. A dive that only happens on one robot, or after one
+# commit, is answered here rather than by memory.
+#
+# Run in the background and with every ros2 call bounded: the introspection below
+# costs about six seconds, and spending that inline would push every later stage
+# of the startup back by the same amount. Timing is part of what is being
+# investigated, so the recorder must not be what changes it.
+probe_snapshot() {
+    (( DIVE_PROBE )) || return 0
+    local file="${PROBE_DIR}/snapshot_$1.txt"
+    {
+        echo "=== $1 @ $(date '+%F %T.%3N') on $(hostname -s) ==="
+        echo "ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-<unset>}"
+        echo "LIFT_HEIGHT=${LIFT_HEIGHT} -> ${LIFT_HEIGHT_ROS:-<not normalised yet>}"
+        echo "READY_POSE_L=${READY_POSE_L}"
+        echo "READY_POSE_R=${READY_POSE_R}"
+        echo "SKIP_FILTER=${SKIP_FILTER}  SMOOTH_TAU=${SMOOTH_TAU}  HOME_MUTE=${HOME_MUTE}"
+        echo "ARM_POSE_L=${ARM_POSE_L}  ARM_POSE_R=${ARM_POSE_R}"
+        echo "--- git ---"
+        git -C "${repo_root}" log --oneline -1 2>&1
+        git -C "${repo_root}" status --short 2>&1
+        echo "--- CAN links ---"
+        ip -br link show 2>&1 | grep -i can || echo "no can interfaces"
+        echo "--- ros2 nodes ---"
+        timeout 5 ros2 node list 2>&1 || true
+        echo "--- ros2 topics ---"
+        timeout 5 ros2 topic list 2>&1 || true
+        echo "--- go_home_position as the controllers actually have it ---"
+        for node in /vr_arm_l /vr_arm_r; do
+            echo -n "${node}: "; timeout 5 ros2 param get "${node}" go_home_position 2>&1 || true
+        done
+        echo "--- /lift fixed_height ---"
+        timeout 5 ros2 param get /lift fixed_height 2>&1 || true
+    } > "${file}" 2>&1 &
+    echo "  snapshot (in the background): ${file}"
+}
 
 normalise_lift_height() {
     local value=$1
@@ -130,16 +180,26 @@ else
     echo "  arms follow ${ARM_POSE_L} / ${ARM_POSE_R}, tau=${SMOOTH_TAU}s, home mute ${HOME_MUTE}s"
 fi
 
+# Probe first, so it is already listening when the arms get power. It creates
+# subscriptions and no publishers, so it cannot be what moves an arm.
+if (( DIVE_PROBE )); then
+    mkdir -p "${PROBE_DIR}"
+    echo "DIVE_PROBE=1: recording to ${PROBE_DIR}"
+    probe_snapshot 01_before_can
+    gnome-terminal --title="probe" -x $shell_type -i -c "${arm_env}; ${ACT_PYTHON} -u ${repo_root}/act/dive_probe.py --out-dir ${PROBE_DIR} --arm-cmd-topics ${ARM_POSE_L} ${ARM_POSE_R}$(probe_log probe); $shell_exec"
+    sleep 1
+fi
+
 # CAN
-gnome-terminal -t "can1" -x bash -c "cd ${CAN_DIR}; ./arx_can1.sh; exec bash;"
+gnome-terminal -t "can1" -x bash -c "cd ${CAN_DIR}; $(probe_pre)./arx_can1.sh$(probe_log can1); exec bash;"
 sleep 0.3
-gnome-terminal -t "can3" -x bash -c "cd ${CAN_DIR}; ./arx_can3.sh; exec bash;"
+gnome-terminal -t "can3" -x bash -c "cd ${CAN_DIR}; $(probe_pre)./arx_can3.sh$(probe_log can3); exec bash;"
 sleep 0.3
-gnome-terminal -t "can5" -x bash -c "cd ${CAN_DIR}; ./arx_can5.sh; exec bash;"
+gnome-terminal -t "can5" -x bash -c "cd ${CAN_DIR}; $(probe_pre)./arx_can5.sh$(probe_log can5); exec bash;"
 sleep 0.3
 
 # Body
-gnome-terminal --title="body" -x $shell_type -i -c "cd ${LIFT_WS}; source install/setup.bash; ros2 launch arx_lift_controller lift.launch.py; $shell_exec"
+gnome-terminal --title="body" -x $shell_type -i -c "cd ${LIFT_WS}; source install/setup.bash; $(probe_pre)ros2 launch arx_lift_controller lift.launch.py$(probe_log body); $shell_exec"
 sleep 1
 
 # Set fixed height before VR starts, so body never briefly follows the raw VR
@@ -172,27 +232,29 @@ echo "/lift fixed_height verified at ${LIFT_HEIGHT_ROS}"
 # because the constructor hardcodes Node("x5_controller_node"). collect.py reads
 # go_home_position back from these two node names.
 echo "WARNING: the arms power up now and walk to the ready pose. Stand clear."
-gnome-terminal --title="arm_l" -x $shell_type -i -c "${arm_env}; ros2 run arx_x5_controller X5Controller --ros-args -r __node:=vr_arm_l -p arm_can_id:=can1 -p arm_control_type:=vr_slave -p arm_end_type:=2 -p arm_pub_topic_name:=arm_l_status -p arm_sub_topic_name:=${ARM_POSE_L#/} -p go_home_position:='${READY_POSE_L}'; $shell_exec"
+gnome-terminal --title="arm_l" -x $shell_type -i -c "${arm_env}; $(probe_pre)ros2 run arx_x5_controller X5Controller --ros-args -r __node:=vr_arm_l -p arm_can_id:=can1 -p arm_control_type:=vr_slave -p arm_end_type:=2 -p arm_pub_topic_name:=arm_l_status -p arm_sub_topic_name:=${ARM_POSE_L#/} -p go_home_position:='${READY_POSE_L}'$(probe_log arm_l); $shell_exec"
 sleep 0.5
-gnome-terminal --title="arm_r" -x $shell_type -i -c "${arm_env}; ros2 run arx_x5_controller X5Controller --ros-args -r __node:=vr_arm_r -p arm_can_id:=can3 -p arm_control_type:=vr_slave -p arm_end_type:=2 -p arm_pub_topic_name:=arm_r_status -p arm_sub_topic_name:=${ARM_POSE_R#/} -p go_home_position:='${READY_POSE_R}'; $shell_exec"
+gnome-terminal --title="arm_r" -x $shell_type -i -c "${arm_env}; $(probe_pre)ros2 run arx_x5_controller X5Controller --ros-args -r __node:=vr_arm_r -p arm_can_id:=can3 -p arm_control_type:=vr_slave -p arm_end_type:=2 -p arm_pub_topic_name:=arm_r_status -p arm_sub_topic_name:=${ARM_POSE_R#/} -p go_home_position:='${READY_POSE_R}'$(probe_log arm_r); $shell_exec"
 sleep 1
+probe_snapshot 02_after_arms
 
 # Realsense
-gnome-terminal --title="realsense" -x $shell_type -i -c "cd ${repo_root}/realsense; ./realsense.sh; $shell_exec"
+gnome-terminal --title="realsense" -x $shell_type -i -c "cd ${repo_root}/realsense; $(probe_pre)./realsense.sh$(probe_log realsense); $shell_exec"
 sleep 3
 
 # VR
-gnome-terminal --title="vr" -x $shell_type -i -c "cd ${VR_WS}; ./ARX_VR.sh; $shell_exec"
+gnome-terminal --title="vr" -x $shell_type -i -c "cd ${VR_WS}; $(probe_pre)./ARX_VR.sh$(probe_log vr); $shell_exec"
 sleep 1
 
 # Pose filters, one per side. Each reads the arm on its own side, because the
 # offset it carries is that arm's, and the two arms are parked independently.
 if (( ! SKIP_FILTER )); then
-    gnome-terminal --title="filter_l" -x $shell_type -i -c "${arm_env}; ${ACT_PYTHON} ${repo_root}/act/vr_pose_filter.py --in-topic /ARX_VR_L --out-topic ${ARM_POSE_L} --node-name vr_pose_filter_l --arm-status-topic /arm_l_status_full --tau ${SMOOTH_TAU} --home-mute ${HOME_MUTE}; $shell_exec"
+    gnome-terminal --title="filter_l" -x $shell_type -i -c "${arm_env}; ${ACT_PYTHON} $(probe_py)${repo_root}/act/vr_pose_filter.py --in-topic /ARX_VR_L --out-topic ${ARM_POSE_L} --node-name vr_pose_filter_l --arm-status-topic /arm_l_status_full --tau ${SMOOTH_TAU} --home-mute ${HOME_MUTE}$(probe_log filter_l); $shell_exec"
     sleep 0.5
-    gnome-terminal --title="filter_r" -x $shell_type -i -c "${arm_env}; ${ACT_PYTHON} ${repo_root}/act/vr_pose_filter.py --in-topic /ARX_VR_R --out-topic ${ARM_POSE_R} --node-name vr_pose_filter_r --arm-status-topic /arm_r_status_full --tau ${SMOOTH_TAU} --home-mute ${HOME_MUTE}; $shell_exec"
+    gnome-terminal --title="filter_r" -x $shell_type -i -c "${arm_env}; ${ACT_PYTHON} $(probe_py)${repo_root}/act/vr_pose_filter.py --in-topic /ARX_VR_R --out-topic ${ARM_POSE_R} --node-name vr_pose_filter_r --arm-status-topic /arm_r_status_full --tau ${SMOOTH_TAU} --home-mute ${HOME_MUTE}$(probe_log filter_r); $shell_exec"
     sleep 1
 fi
+probe_snapshot 03_after_filters
 
 # Collect. --ready_pose is what turns the parking on, and --ready_pose_topics
 # tells it where the arms are actually listening.
@@ -200,4 +262,4 @@ lift_height_q=$(printf '%q' "${LIFT_HEIGHT_ROS}")
 task_name_q=$(printf '%q' "${TASK_NAME}")
 ready_args="--ready_pose --ready_pose_topics ${ARM_POSE_L} ${ARM_POSE_R}"
 (( SKIP_FILTER )) && ready_args=""
-gnome-terminal --title="collect" -x $shell_type -i -c "cd ${repo_root}/act; conda activate ${ACT_ENV}; python collect.py --episode_idx -1 ${ready_args} --poscmd-topics ${ARM_POSE_L} ${ARM_POSE_R} --height ${lift_height_q} --task ${task_name_q}; $shell_exec"
+gnome-terminal --title="collect" -x $shell_type -i -c "cd ${repo_root}/act; conda activate ${ACT_ENV}; python $(probe_py)collect.py --episode_idx -1 ${ready_args} --poscmd-topics ${ARM_POSE_L} ${ARM_POSE_R} --height ${lift_height_q} --task ${task_name_q}$(probe_log collect); $shell_exec"

@@ -147,3 +147,6 @@ AMENT_IGNORE
 **/dataset_views
 **/data_review
 **/test
+
+# Recordings made by DIVE_PROBE=1; evidence, not source.
+diagnostics/
