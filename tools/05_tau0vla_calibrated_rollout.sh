@@ -16,6 +16,7 @@ repo_root="$(cd "${script_dir}/.." && pwd)"
 : "${GRIPPER_EMA_ALPHA:=1.0}"
 : "${MAX_RESPONSE_AGE_MS:=500}"
 : "${LIFT_HEIGHT:=15.5}"
+protocol_version=arx-calibrated-v3
 
 case "${MODEL_PROFILE}" in
   blue-feedback)
@@ -38,11 +39,49 @@ case "${MODEL_PROFILE}" in
     expected_route=arx-lift2s-0907-t-joint-vr-ft
     task='Pick up the T-shaped part and place it in its designated position on the board.'
     ;;
+  all-l-feedback)
+    experiment=joint-feedback
+    protocol_version=arx-feedback-v4
+    expected_route=arx-lift2s-0908-all-joint-feedback-ft
+    task='Pick up the L-shaped part and place it in its designated position on the board.'
+    ;;
+  all-t-feedback)
+    experiment=joint-feedback
+    protocol_version=arx-feedback-v4
+    expected_route=arx-lift2s-0908-all-joint-feedback-ft
+    task='Pick up the T-shaped part and place it in its designated position on the board.'
+    ;;
+  all-banana-feedback)
+    experiment=joint-feedback
+    protocol_version=arx-feedback-v4
+    expected_route=arx-lift2s-0908-all-joint-feedback-ft
+    task='Pick up the banana and place it in its designated position on the board.'
+    ;;
+  all-red-feedback)
+    experiment=joint-feedback
+    protocol_version=arx-feedback-v4
+    expected_route=arx-lift2s-0908-all-joint-feedback-ft
+    task='Pick up the red object and place it in its designated position on the board.'
+    ;;
+  all-blue-feedback)
+    experiment=joint-feedback
+    protocol_version=arx-feedback-v4
+    expected_route=arx-lift2s-0908-all-joint-feedback-ft
+    task='Pick up the blue box and place it in its designated position on the board.'
+    ;;
+  all-circle-feedback)
+    experiment=joint-feedback
+    protocol_version=arx-feedback-v4
+    expected_route=arx-lift2s-0908-all-joint-feedback-ft
+    task='Pick up the circular part and place it in its designated position on the board.'
+    ;;
   *)
-    echo "Unknown MODEL_PROFILE=${MODEL_PROFILE}; use blue-feedback, t-feedback, blue-vr or t-vr." >&2
+    echo "Unknown MODEL_PROFILE=${MODEL_PROFILE}." >&2
+    echo "Use blue-feedback, t-feedback, blue-vr, t-vr, or all-{l,t,banana,red,blue,circle}-feedback." >&2
     exit 1
     ;;
 esac
+task=${TASK_INSTRUCTION:-${task}}
 
 case "${1:-}" in
   --execute)
@@ -66,9 +105,10 @@ health=$(curl --fail --silent --show-error --noproxy '*' --max-time 5 \
   "${MODEL_SERVER_URL}/health")
 actual_route=$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("route", ""))' <<<"${health}")
 actual_experiment=$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("experiment", ""))' <<<"${health}")
-if [[ "${actual_route}" != "${expected_route}" || "${actual_experiment}" != "${experiment}" ]]; then
-  echo "Refused: MODEL_PROFILE=${MODEL_PROFILE} expects ${expected_route}/${experiment}," >&2
-  echo "but ${MODEL_SERVER_URL} serves ${actual_route}/${actual_experiment}." >&2
+actual_protocol=$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("protocol_version", ""))' <<<"${health}")
+if [[ "${actual_route}" != "${expected_route}" || "${actual_experiment}" != "${experiment}" || "${actual_protocol}" != "${protocol_version}" ]]; then
+  echo "Refused: MODEL_PROFILE=${MODEL_PROFILE} expects ${expected_route}/${experiment}/${protocol_version}," >&2
+  echo "but ${MODEL_SERVER_URL} serves ${actual_route}/${actual_experiment}/${actual_protocol}." >&2
   exit 1
 fi
 
@@ -96,6 +136,7 @@ echo "Trace: ${trace}"
 exec python tau0vla_calibrated_client.py \
   --server-url "${MODEL_SERVER_URL}" \
   --experiment "${experiment}" \
+  --protocol-version "${protocol_version}" \
   --task-instruction "${task}" \
   --calibration-file "${calibration}" \
   --expected-height "${LIFT_HEIGHT}" \

@@ -19,6 +19,8 @@ from tau0vla_protocol import ActionEMA, recommended_replan_steps, resolve_replan
 
 
 PROTOCOL_VERSION = "arx-calibrated-v3"
+FEEDBACK_PROTOCOL_VERSION = "arx-feedback-v4"
+FEEDBACK_CALIBRATION_VERSION = "arx-feedback-open-v1"
 CLIENT_ADAPTER_VERSION = "arx-calibrated-client-v1"
 FPS = 30
 SOURCE_FPS = 60
@@ -104,6 +106,7 @@ class CalibratedHttpClient:
         experiment: str,
         calibration: CalibrationArtifact,
         robot_id: str,
+        protocol_version: str = PROTOCOL_VERSION,
         request_timeout: float = 5.0,
         max_response_age_ms: float = 500.0,
     ):
@@ -111,8 +114,20 @@ class CalibratedHttpClient:
 
         if experiment not in EXPERIMENTS:
             raise ProtocolError(f"unsupported experiment: {experiment}")
+        if protocol_version not in (PROTOCOL_VERSION, FEEDBACK_PROTOCOL_VERSION):
+            raise ProtocolError(f"unsupported calibrated protocol: {protocol_version}")
+        if protocol_version == FEEDBACK_PROTOCOL_VERSION and experiment != "joint-feedback":
+            raise ProtocolError("arx-feedback-v4 only supports joint-feedback")
         self.base_url = base_url.rstrip("/")
         self.experiment = experiment
+        self.protocol_version = protocol_version
+        self.calibration_version = (
+            CALIBRATION_VERSION
+            if protocol_version == PROTOCOL_VERSION
+            else FEEDBACK_CALIBRATION_VERSION
+        )
+        self.api_prefix = "/arx/v3" if protocol_version == PROTOCOL_VERSION else "/arx/v4"
+        self.requires_eef = protocol_version == PROTOCOL_VERSION
         self.calibration = calibration
         self.mapper = CalibratedGripperMapper(calibration, experiment)
         self.robot_id = robot_id
@@ -131,7 +146,7 @@ class CalibratedHttpClient:
         expected = {
             "status": "ok",
             "ready": True,
-            "protocol_version": PROTOCOL_VERSION,
+            "protocol_version": self.protocol_version,
             "experiment": self.experiment,
             "required_client_adapter_version": CLIENT_ADAPTER_VERSION,
         }
@@ -141,17 +156,17 @@ class CalibratedHttpClient:
         return payload
 
     def policy_contract(self) -> dict:
-        response = self.session.get(f"{self.base_url}/arx/v3/policy-contract", timeout=(1.0, 3.0))
+        response = self.session.get(
+            f"{self.base_url}{self.api_prefix}/policy-contract", timeout=(1.0, 3.0)
+        )
         response.raise_for_status()
         payload = response.json()
         expected = {
-            "protocol_version": PROTOCOL_VERSION,
-            "calibration_version": CALIBRATION_VERSION,
+            "protocol_version": self.protocol_version,
+            "calibration_version": self.calibration_version,
             "required_client_adapter_version": CLIENT_ADAPTER_VERSION,
             "experiment": self.experiment,
             "fps": FPS,
-            "source_fps": SOURCE_FPS,
-            "temporal_stride": 2,
             "camera_names": list(CAMERA_NAMES),
             "state_dim": ACTION_DIM,
             "action_dim": ACTION_DIM,
@@ -166,15 +181,31 @@ class CalibratedHttpClient:
         offsets = payload.get("component_source_offsets")
         if not isinstance(offsets, dict):
             raise ProtocolError("contract is missing component_source_offsets")
-        expected_offsets = {
-            "arm_action": 2,
-            "gripper_action": 2 if self.experiment == "joint-feedback" else 0,
-        }
+        if self.protocol_version == PROTOCOL_VERSION:
+            extra_expected = {"source_fps": SOURCE_FPS, "temporal_stride": 2}
+            expected_offsets = {
+                "arm_action": 2,
+                "gripper_action": 2 if self.experiment == "joint-feedback" else 0,
+            }
+            offset_divisor = 2
+        else:
+            extra_expected = {"offset_unit": "uploaded_30fps_frame"}
+            expected_offsets = {"arm_action": 1, "gripper_action": 1}
+            offset_divisor = 1
+        mismatches.update(
+            {
+                key: (payload.get(key), value)
+                for key, value in extra_expected.items()
+                if payload.get(key) != value
+            }
+        )
+        if mismatches:
+            raise ProtocolError(f"calibrated policy contract mismatch: {mismatches}")
         for key, expected_value in expected_offsets.items():
             if offsets.get(key) != expected_value:
                 raise ProtocolError(f"contract {key}={offsets.get(key)!r}, expected {expected_value}")
-        self.arm_offset_steps = expected_offsets["arm_action"] // 2
-        self.gripper_offset_steps = expected_offsets["gripper_action"] // 2
+        self.arm_offset_steps = expected_offsets["arm_action"] // offset_divisor
+        self.gripper_offset_steps = expected_offsets["gripper_action"] // offset_divisor
         self.model_id = str(payload.get("model_id", ""))
         if not self.model_id:
             raise ProtocolError("contract has no model_id")
@@ -184,10 +215,10 @@ class CalibratedHttpClient:
         if self.model_id is None or self.arm_offset_steps is None or self.gripper_offset_steps is None:
             raise ProtocolError("policy_contract must be called before create_session")
         response = self.session.post(
-            f"{self.base_url}/arx/v3/sessions",
+            f"{self.base_url}{self.api_prefix}/sessions",
             json={
-                "protocol_version": PROTOCOL_VERSION,
-                "calibration_version": CALIBRATION_VERSION,
+                "protocol_version": self.protocol_version,
+                "calibration_version": self.calibration_version,
                 "client_adapter_version": CLIENT_ADAPTER_VERSION,
                 "experiment": self.experiment,
                 "task_instruction": task_instruction.strip(),
@@ -201,7 +232,7 @@ class CalibratedHttpClient:
         response.raise_for_status()
         payload = response.json()
         if (
-            payload.get("protocol_version") != PROTOCOL_VERSION
+            payload.get("protocol_version") != self.protocol_version
             or payload.get("model_id") != self.model_id
             or payload.get("experiment") != self.experiment
             or payload.get("calibration_id") != self.calibration.calibration_id
@@ -225,19 +256,20 @@ class CalibratedHttpClient:
         if set(observation.images) != set(CAMERA_NAMES):
             raise ProtocolError("observation must contain exactly three calibrated cameras")
         metadata = {
-            "protocol_version": PROTOCOL_VERSION,
+            "protocol_version": self.protocol_version,
             "request_id": int(request_id),
             "sample_monotonic_ns": int(observation.sample_monotonic_ns),
             "raw_joint_feedback": qpos.tolist(),
-            "raw_eef_feedback": eef.tolist(),
         }
+        if self.requires_eef:
+            metadata["raw_eef_feedback"] = eef.tolist()
         files = {
             camera: (f"{camera}.jpg", bytes(observation.images[camera]), "image/jpeg")
             for camera in CAMERA_NAMES
         }
         started = time.monotonic()
         response = self.session.post(
-            f"{self.base_url}/arx/v3/sessions/{self.session_id}/action-chunks",
+            f"{self.base_url}{self.api_prefix}/sessions/{self.session_id}/action-chunks",
             data={"metadata": json.dumps(metadata, separators=(",", ":"))},
             files=files,
             timeout=(1.0, self.request_timeout),
@@ -256,8 +288,8 @@ class CalibratedHttpClient:
             )
         payload = response.json()
         expected = {
-            "protocol_version": PROTOCOL_VERSION,
-            "calibration_version": CALIBRATION_VERSION,
+            "protocol_version": self.protocol_version,
+            "calibration_version": self.calibration_version,
             "required_client_adapter_version": CLIENT_ADAPTER_VERSION,
             "session_id": self.session_id,
             "request_id": request_id,
@@ -440,6 +472,8 @@ __all__ = [
     "CalibratedChunkScheduler",
     "CalibratedHttpClient",
     "EXPERIMENTS",
+    "FEEDBACK_CALIBRATION_VERSION",
+    "FEEDBACK_PROTOCOL_VERSION",
     "FPS",
     "GRIPPER_INDICES",
     "JOINT_NAMES",

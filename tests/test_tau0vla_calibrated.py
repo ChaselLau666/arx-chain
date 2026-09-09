@@ -33,6 +33,8 @@ from tau0vla_calibrated_protocol import (  # noqa: E402
     CalibratedActionChunk,
     CalibratedChunkScheduler,
     CalibratedHttpClient,
+    FEEDBACK_CALIBRATION_VERSION,
+    FEEDBACK_PROTOCOL_VERSION,
     Observation,
     PROTOCOL_VERSION,
 )
@@ -280,6 +282,108 @@ def test_http_client_validates_contract_and_maps_grippers():
     result = client.infer(observation, 1)
     assert result.native_actions.shape == (30, 14)
     assert result.native_actions[0, 6] == pytest.approx(-3.39, abs=1e-5)
+
+
+def test_feedback_v4_client_uses_v4_session_path_and_omits_eef():
+    class Response:
+        status_code = 200
+        text = ""
+
+        def __init__(self, payload):
+            self.payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self.payload
+
+    class Session:
+        def __init__(self):
+            self.urls = []
+            self.action_metadata = None
+
+        def get(self, url, timeout):
+            self.urls.append(url)
+            if url.endswith("/health"):
+                return Response({
+                    "status": "ok",
+                    "ready": True,
+                    "protocol_version": FEEDBACK_PROTOCOL_VERSION,
+                    "experiment": "joint-feedback",
+                    "required_client_adapter_version": "arx-calibrated-client-v1",
+                })
+            return Response({
+                "protocol_version": FEEDBACK_PROTOCOL_VERSION,
+                "calibration_version": FEEDBACK_CALIBRATION_VERSION,
+                "required_client_adapter_version": "arx-calibrated-client-v1",
+                "experiment": "joint-feedback",
+                "fps": 30,
+                "offset_unit": "uploaded_30fps_frame",
+                "camera_names": ["head", "left_wrist", "right_wrist"],
+                "state_dim": 14,
+                "action_dim": 14,
+                "action_horizon": 30,
+                "joint_names": [
+                    *[f"left_j{i}" for i in range(6)], "left_gripper",
+                    *[f"right_j{i}" for i in range(6)], "right_gripper",
+                ],
+                "wire_action_field": "calibrated_action_chunk",
+                "wire_action_is_robot_command": False,
+                "component_source_offsets": {"state": 0, "arm_action": 1, "gripper_action": 1},
+                "model_id": "all-30k",
+            })
+
+        def post(self, url, **kwargs):
+            self.urls.append(url)
+            if url.endswith("/sessions"):
+                return Response({
+                    "protocol_version": FEEDBACK_PROTOCOL_VERSION,
+                    "session_id": "v4-session",
+                    "model_id": "all-30k",
+                    "experiment": "joint-feedback",
+                    "calibration_id": "calibration",
+                })
+            self.action_metadata = json.loads(kwargs["data"]["metadata"])
+            return Response({
+                "protocol_version": FEEDBACK_PROTOCOL_VERSION,
+                "calibration_version": FEEDBACK_CALIBRATION_VERSION,
+                "required_client_adapter_version": "arx-calibrated-client-v1",
+                "session_id": "v4-session",
+                "request_id": self.action_metadata["request_id"],
+                "sample_monotonic_ns": self.action_metadata["sample_monotonic_ns"],
+                "model_id": "all-30k",
+                "experiment": "joint-feedback",
+                "wire_action_is_robot_command": False,
+                "calibrated_action_chunk": np.zeros((30, 14)).tolist(),
+                "inference_ms": 40.0,
+            })
+
+    client = CalibratedHttpClient(
+        "http://server",
+        experiment="joint-feedback",
+        calibration=_artifact(),
+        robot_id="ark-2",
+        protocol_version=FEEDBACK_PROTOCOL_VERSION,
+    )
+    session = Session()
+    client.session = session
+    client.health()
+    client.policy_contract()
+    client.create_session("pick")
+    result = client.infer(
+        Observation(
+            qpos=np.zeros(14, dtype=np.float32),
+            eef=np.ones(14, dtype=np.float32),
+            images={name: b"jpeg" for name in ("head", "left_wrist", "right_wrist")},
+            sample_monotonic_ns=123,
+        ),
+        1,
+    )
+    assert any("/arx/v4/policy-contract" in url for url in session.urls)
+    assert any("/arx/v4/sessions/v4-session/action-chunks" in url for url in session.urls)
+    assert "raw_eef_feedback" not in session.action_metadata
+    assert (result.arm_offset_steps, result.gripper_offset_steps) == (1, 1)
 
 
 def test_ros_calibration_does_not_shadow_node_publishers_and_pre_settles():

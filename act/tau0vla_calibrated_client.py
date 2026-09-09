@@ -448,6 +448,7 @@ def run(args) -> None:
             experiment=args.experiment,
             calibration=calibration,
             robot_id=hostname,
+            protocol_version=args.protocol_version,
             request_timeout=args.request_timeout,
             max_response_age_ms=args.max_response_age_ms,
         )
@@ -466,6 +467,7 @@ def run(args) -> None:
             route=health.get("route"),
             checkpoint_sha256=health.get("checkpoint_sha256"),
             experiment=args.experiment,
+            protocol_version=args.protocol_version,
             calibration_id=calibration.calibration_id,
             calibration=calibration.to_dict(),
             execute=args.execute,
@@ -669,6 +671,11 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--server-url", default="http://192.168.50.2:8000")
     parser.add_argument("--experiment", choices=("joint-feedback", "joint-vr"), required=True)
+    parser.add_argument(
+        "--protocol-version",
+        choices=("arx-calibrated-v3", "arx-feedback-v4"),
+        default="arx-calibrated-v3",
+    )
     parser.add_argument("--task-instruction", required=True)
     parser.add_argument("--calibration-file", type=Path, required=True)
     parser.add_argument("--config", type=Path, default=ROOT / "data/config.yaml")
