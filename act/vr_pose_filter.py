@@ -53,7 +53,10 @@ def build_node(args):
             self.alpha = 1.0 - np.exp(-args.dt / max(args.tau, 1e-6))
             self.pos_prev = None
             self.rot_prev = None
+            self.raw_pos_prev = None
+            self.raw_rot_prev = None
             self.passed = 0
+            self.rejected = 0
             self.pub = self.create_publisher(PosCmd, args.out_topic, 10)
             self.create_subscription(PosCmd, args.in_topic, self.on_pose, 10)
             # Stand aside while something is driving the arms home. data[1] == 1
@@ -68,8 +71,14 @@ def build_node(args):
             # cannot know: the serial link carries nothing back to it.
             self.arm_pos = None
             self.arm_rot = None
+            self.arm_status_at = None
             self.offset_pos = np.zeros(3)
             self.offset_rot = Rotation.identity()
+            self.initial_rebase_done = not args.rebase
+            self.last_safety_warning_at = 0.0
+            self.arm_status_timeout = max(args.arm_status_timeout, 0.01)
+            self.max_position_jump = max(args.max_position_jump, 0.0)
+            self.max_angle_jump = np.radians(max(args.max_angle_jump_deg, 0.0))
             if args.rebase:
                 self.create_subscription(RobotStatus, args.arm_status_topic,
                                          self.on_arm_status, 10)
@@ -83,12 +92,26 @@ def build_node(args):
                 if time.monotonic() >= self.mute_until:
                     self.get_logger().info('/arx_joy GO_HOME: standing aside')
                 self.mute_until = time.monotonic() + args.home_mute
+                # Remember the transition even if no VR frame arrives during
+                # the mute window. The first later frame must still rebase.
+                self.muted = True
+
+        def safety_warn(self, message):
+            now = time.monotonic()
+            if now - self.last_safety_warning_at >= 1.0:
+                self.get_logger().warn(message)
+                self.last_safety_warning_at = now
 
         def on_arm_status(self, msg):
-            self.arm_pos = np.array(msg.end_pos[:3], dtype=float)
-            self.arm_rot = Rotation.from_euler('xyz', list(msg.end_pos[3:6]))
+            end_pos = np.array(msg.end_pos[:6], dtype=float)
+            if end_pos.size != 6 or not np.all(np.isfinite(end_pos)):
+                self.safety_warn(f'ignoring invalid pose on {args.arm_status_topic}')
+                return
+            self.arm_pos = end_pos[:3]
+            self.arm_rot = Rotation.from_euler('xyz', end_pos[3:6])
+            self.arm_status_at = time.monotonic()
 
-        def rebase(self):
+        def rebase(self, reason):
             """Re-aim the stream at wherever the arm has just been left.
 
             The rotation offset is applied on the right so that a rotation of
@@ -96,22 +119,51 @@ def build_node(args):
             f(X) = X * P^-1 * R, f(P) is R and f(D * X) is D * f(X). Composing
             on the left would satisfy the first and not the second.
             """
-            if self.arm_pos is None or self.pos_prev is None:
-                self.get_logger().warn(
-                    f'nothing to re-aim against ({args.arm_status_topic} silent), '
-                    f'keeping the offset as it is')
-                return
+            if self.pos_prev is None:
+                self.safety_warn('waiting for the first valid VR pose before publishing')
+                return False
+            if self.arm_pos is None or self.arm_status_at is None:
+                self.safety_warn(
+                    f'holding VR output: {args.arm_status_topic} has not published yet')
+                return False
+            age = time.monotonic() - self.arm_status_at
+            if age > self.arm_status_timeout:
+                self.safety_warn(
+                    f'holding VR output: {args.arm_status_topic} is stale ({age:.2f}s)')
+                return False
             self.offset_pos = self.arm_pos - self.pos_prev
             self.offset_rot = self.rot_prev.inv() * self.arm_rot
             self.get_logger().info(
-                f're-aimed onto the arm: {np.round(self.offset_pos * 1000, 1)} mm, '
+                f'{reason}: re-aimed onto the arm: '
+                f'{np.round(self.offset_pos * 1000, 1)} mm, '
                 f'{np.degrees(self.offset_rot.magnitude()):.1f} deg')
+            return True
 
         def on_pose(self, msg):
-            pos = np.array([msg.x, msg.y, msg.z], dtype=float)
-            rot = Rotation.from_euler('xyz', [msg.roll, msg.pitch, msg.yaw])
+            values = np.array(
+                [msg.x, msg.y, msg.z, msg.roll, msg.pitch, msg.yaw], dtype=float)
+            if not np.all(np.isfinite(values)):
+                self.rejected += 1
+                self.safety_warn('ignoring non-finite VR pose')
+                return
+            pos = values[:3]
+            rot = Rotation.from_euler('xyz', values[3:])
 
-            if self.pos_prev is None:
+            discontinuity = False
+            position_jump = 0.0
+            angle_jump = 0.0
+            if self.raw_pos_prev is not None:
+                position_jump = float(np.linalg.norm(pos - self.raw_pos_prev))
+                angle_jump = float((self.raw_rot_prev.inv() * rot).magnitude())
+                discontinuity = (
+                    (self.max_position_jump > 0.0 and
+                     position_jump > self.max_position_jump) or
+                    (self.max_angle_jump > 0.0 and angle_jump > self.max_angle_jump)
+                )
+            self.raw_pos_prev = pos.copy()
+            self.raw_rot_prev = rot
+
+            if self.pos_prev is None or discontinuity:
                 self.pos_prev, self.rot_prev = pos, rot
             else:
                 self.pos_prev = self.pos_prev + self.alpha * (pos - self.pos_prev)
@@ -134,11 +186,26 @@ def build_node(args):
             # stale pose. The mute ending is what says the arm has been left
             # somewhere new, so that is where the stream is re-aimed.
             muted = time.monotonic() < self.mute_until
+            rebase_reason = None
             if self.muted and not muted and args.rebase:
-                self.rebase()
+                rebase_reason = 'GO_HOME complete'
             self.muted = muted
             if muted:
                 return
+
+            if args.rebase and not self.initial_rebase_done:
+                rebase_reason = 'initial startup'
+            if discontinuity and args.rebase:
+                self.rejected += 1
+                self.initial_rebase_done = False
+                rebase_reason = 'VR discontinuity'
+                self.safety_warn(
+                    f'VR pose jumped {position_jump * 1000:.1f} mm / '
+                    f'{np.degrees(angle_jump):.1f} deg; rebasing before publishing')
+            if rebase_reason is not None:
+                if not self.rebase(rebase_reason):
+                    return
+                self.initial_rebase_done = True
 
             out.x, out.y, out.z = (float(v) for v in self.pos_prev + self.offset_pos)
             out.roll, out.pitch, out.yaw = (
@@ -147,7 +214,8 @@ def build_node(args):
             self.passed += 1
 
         def report(self):
-            self.get_logger().info(f'forwarded {self.passed} poses')
+            self.get_logger().info(
+                f'forwarded {self.passed} poses, rejected/rebased {self.rejected}')
 
     return rclpy, VrPoseFilter()
 
@@ -180,6 +248,14 @@ def parse_args():
     parser.add_argument('--arm-status-topic', default='/arm_l_status_full',
                         help='where the arm on this side reports its end-effector pose, read '
                              'to re-aim the stream after the arm is parked')
+    parser.add_argument('--arm-status-timeout', type=float, default=0.5,
+                        help='maximum age in seconds of arm feedback used for a rebase')
+    parser.add_argument('--max-position-jump', type=float, default=0.08,
+                        help='raw position step in metres that triggers a safe rebase; '
+                             'zero disables the check')
+    parser.add_argument('--max-angle-jump-deg', type=float, default=45.0,
+                        help='raw orientation step in degrees that triggers a safe rebase; '
+                             'zero disables the check')
     parser.add_argument('--no-rebase', dest='rebase', action='store_false',
                         help='forward poses as they come, without re-aiming them onto the '
                              'arm when a mute ends. The arm is then pulled back to wherever '
