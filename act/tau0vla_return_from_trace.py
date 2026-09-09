@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import collections
 import json
 from pathlib import Path
 import signal
@@ -11,6 +12,7 @@ import time
 import numpy as np
 import yaml
 
+from tau0vla_calibrated_client import verify_height
 from tau0vla_calibration import (
     artifact_from_dict,
     current_robot_identity,
@@ -68,10 +70,14 @@ def create_return_node(config):
         def __init__(self):
             super().__init__("tau0vla_return_from_trace")
             from arx5_arm_msg.msg import RobotStatus
+            from arm_control.msg import PosCmd
 
             self._message_type = RobotStatus
             self._lock = threading.Lock()
             self._latest = {}
+            self._height_samples = collections.deque(maxlen=2000)
+            self.create_subscription(PosCmd, config["robot_base_config"]["robot_base_topic"],
+                                     self._receive_height, 10)
             self._command_publishers = {
                 "left": self.create_publisher(
                     RobotStatus, config["arm_config"]["follow_arm_left_cmd_topic"], 10
@@ -92,6 +98,14 @@ def create_return_node(config):
                 lambda message: self._receive("right", message),
                 20,
             )
+
+        def _receive_height(self, message):
+            with self._lock:
+                self._height_samples.append((time.monotonic(), float(message.height)))
+
+        def height_samples(self):
+            with self._lock:
+                return tuple(self._height_samples)
 
         def _receive(self, side, message):
             values = np.asarray(message.joint_pos, dtype=np.float32)
@@ -176,6 +190,7 @@ def run(args):
     thread = threading.Thread(target=spin, daemon=True)
     thread.start()
     try:
+        verify_height(node, args.expected_height, .05, 2.0, 15.0)
         deadline = time.monotonic() + 5.0
         while time.monotonic() < deadline:
             try:
@@ -197,6 +212,8 @@ def run(args):
             time.sleep(max(0.0, next_tick-time.monotonic()))
         hold_until = time.monotonic() + 1.0
         while time.monotonic() < hold_until:
+            if abort.is_set():
+                raise RuntimeError("return recovery interrupted while holding; publication stopped")
             node.publish(command_target)
             time.sleep(period)
         samples = []
@@ -231,6 +248,7 @@ def parse_args():
     source.add_argument("--calibration-file", type=Path)
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--auto-confirm", action="store_true")
+    parser.add_argument("--expected-height", type=float, default=12.5)
     parser.add_argument("--max-trace-age-s", type=float, default=1800.0)
     parser.add_argument("--max-calibration-age-s", type=float, default=900.0)
     parser.add_argument("--config", type=Path, default=ROOT/"data/config.yaml")

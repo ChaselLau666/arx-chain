@@ -4,13 +4,10 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-: "${ROS_DOMAIN_ID:?Set ROS_DOMAIN_ID=63 for ark-2}"
+source "${repo_root}/tools/tau0vla_robot_profile.sh"
+load_tau0vla_robot_profile
 : "${LOG_DIR:=/home/arx/logs/tau0vla-calibrated}"
 
-if [[ "$(hostname)" != ark-2 || "${ROS_DOMAIN_ID}" != 63 ]]; then
-  echo "Refused: standalone fixed return requires ark-2 and ROS_DOMAIN_ID=63." >&2
-  exit 1
-fi
 if pgrep -f '[t]au0vla_.*client.py|[t]au0vla_calibrate_gripper.py|[p]ython.*tau0vla_return_' >/dev/null; then
   echo "Refused: policy, calibration, or another return process is still active." >&2
   exit 1
@@ -31,7 +28,7 @@ conda activate act
 set -u
 
 cd "${repo_root}/act"
-exec python tau0vla_return_from_trace.py \
+exec python tau0vla_return_from_trace.py --expected-height "${LIFT_HEIGHT}" \
   --calibration-file "${calibration}" \
   --auto-confirm \
   "$@"

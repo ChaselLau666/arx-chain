@@ -2,14 +2,16 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-: "${ROS_DOMAIN_ID:?ROS_DOMAIN_ID must identify the robot (ark-2=63)}"
+source "${repo_root}/tools/tau0vla_robot_profile.sh"
+load_tau0vla_robot_profile
 : "${MODEL_SERVER_URL:=http://192.168.50.2:8000}"
 : "${DIRECT_SERVER_IP:=192.168.50.2}"
 : "${DIRECT_INTERFACE:=enp130s0}"
 : "${DIRECT_CLIENT_IP:=192.168.50.1}"
+: "${PROTOCOL_VERSION:=arx-calibrated-v3}"
 : "${CALIBRATED_EXPERIMENT:?Set CALIBRATED_EXPERIMENT=joint-feedback or joint-vr}"
 : "${TASK_INSTRUCTION:?Set the exact checkpoint task instruction}"
-: "${LIFT_HEIGHT:=15.5}"
+: "${LIFT_HEIGHT:=12.5}"
 : "${REPLAN_STEPS:=15}"
 : "${CHUNK_BLEND_STEPS:=6}"
 : "${GRIPPER_BLEND_STEPS:=6}"
@@ -102,6 +104,7 @@ gnome-terminal --title="tau0vla-calibrated-inference" -- bash -ic \
    python tau0vla_calibrated_client.py \
      --server-url $(quote "${MODEL_SERVER_URL}") \
      --experiment $(quote "${CALIBRATED_EXPERIMENT}") \
+     --protocol-version $(quote "${PROTOCOL_VERSION}") \
      --task-instruction $(quote "${TASK_INSTRUCTION}") \
      --calibration-file $(quote "${CALIBRATION_FILE}") \
      --expected-height $(quote "${LIFT_HEIGHT}") \

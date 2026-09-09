@@ -71,7 +71,26 @@ class TeeStream:
         return self.terminal.isatty()
 
 
-def create_observation_node(config: dict, *, max_observation_age_ms: float, max_camera_skew_ms: float):
+def arm_feedback_vectors(left_message, right_message, *, requires_eef: bool):
+    """Extract only fields that the selected wire protocol actually requires."""
+    left = np.asarray(left_message.joint_pos, dtype=np.float32)
+    right = np.asarray(right_message.joint_pos, dtype=np.float32)
+    if left.shape != (7,) or right.shape != (7,):
+        raise ProtocolError("ROS joint feedback must contain seven values per arm")
+    qpos = np.concatenate((left, right))
+    if not np.isfinite(qpos).all():
+        raise ProtocolError("ROS joint feedback contains NaN or Inf")
+    eef = None
+    if requires_eef:
+        left_eef = np.asarray(getattr(left_message, "end_pos", []), dtype=np.float32)
+        right_eef = np.asarray(getattr(right_message, "end_pos", []), dtype=np.float32)
+        eef = np.concatenate((left_eef[:6], left[6:7], right_eef[:6], right[6:7]))
+        if eef.shape != (ACTION_DIM,) or not np.isfinite(eef).all():
+            raise ProtocolError("ROS EEF feedback must be a finite 14-vector for v3")
+    return qpos, eef
+
+
+def create_observation_node(config: dict, *, max_observation_age_ms: float, max_camera_skew_ms: float, requires_eef: bool = True):
     from rclpy.node import Node
 
     class ObservationNode(Node):
@@ -171,16 +190,7 @@ def create_observation_node(config: dict, *, max_observation_age_ms: float, max_
                 raise ProtocolError("camera timestamp skew exceeds configured limit")
             left_message = latest["arm:left"][0]
             right_message = latest["arm:right"][0]
-            left_joint = np.asarray(left_message.joint_pos, dtype=np.float32)
-            right_joint = np.asarray(right_message.joint_pos, dtype=np.float32)
-            left_eef = np.asarray(left_message.end_pos, dtype=np.float32)
-            right_eef = np.asarray(right_message.end_pos, dtype=np.float32)
-            qpos = np.concatenate((left_joint[:7], right_joint[:7]))
-            eef = np.concatenate((left_eef[:6], left_joint[6:7], right_eef[:6], right_joint[6:7]))
-            if qpos.shape != (ACTION_DIM,) or eef.shape != (ACTION_DIM,):
-                raise ProtocolError("ROS joint/EEF feedback has an invalid shape")
-            if not np.isfinite(qpos).all() or not np.isfinite(eef).all():
-                raise ProtocolError("ROS joint/EEF feedback contains NaN or Inf")
+            qpos, eef = arm_feedback_vectors(left_message, right_message, requires_eef=requires_eef)
             images = {
                 name: bytes(latest[f"camera:{name}"][0].data)
                 for name in ("head", "left_wrist", "right_wrist")
@@ -351,7 +361,7 @@ def verify_height(node, expected: float, tolerance: float, window: float, timeou
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         samples = node.height_samples()
-        if is_safe_and_stable(samples, float("inf"), tolerance, window):
+        if samples and time.monotonic() - samples[-1][0] <= .5 and is_safe_and_stable(samples, float("inf"), tolerance, window):
             print(f"Height verified: fixed_height={fixed:.6f}, stable_feedback={samples[-1][1]:.6f}")
             return
         time.sleep(.05)
@@ -406,6 +416,7 @@ def run(args) -> None:
         config,
         max_observation_age_ms=args.max_observation_age_ms,
         max_camera_skew_ms=args.max_camera_skew_ms,
+        requires_eef=args.protocol_version == "arx-calibrated-v3",
     )
     policy_stop = threading.Event()
     spin_stop = threading.Event()
@@ -517,21 +528,6 @@ def run(args) -> None:
             args.replan_steps, latencies, args.latency_margin_ms
         )
         print(f"Selected replan_steps={replan_steps}; measured p99 RTT={p99:.1f} ms")
-        request_id += 1
-        first = client.infer(wait_observation(node, 5.0), request_id)
-        if policy_stop.is_set():
-            raise RuntimeError("interrupted before policy execution; robot remains at fixed initial pose")
-        scheduler = CalibratedChunkScheduler(
-            replan_steps,
-            blend_steps=args.chunk_blend_steps,
-            gripper_blend_steps=args.gripper_blend_steps,
-        )
-        ema = ActionEMA(args.arm_ema_alpha, args.gripper_ema_alpha)
-        initial = node.snapshot().qpos
-        ema.reset(initial)
-        adoption = scheduler.adopt(first, initial=True, arrival_monotonic_ns=time.monotonic_ns())
-        trace.adoption(first.request_id, adoption)
-
         if args.execute:
             if args.auto_confirm:
                 print("AUTO-CONFIRM: starting calibrated Tau0VLA publication.")
@@ -541,17 +537,32 @@ def run(args) -> None:
                     "Type EXECUTE CALIBRATED TAU0VLA to publish: "
                 )
                 if confirmation != "EXECUTE CALIBRATED TAU0VLA":
-                    raise RuntimeError("execution cancelled; no action publisher was created")
+                    raise RuntimeError("execution cancelled; policy publication was not started")
             mark_consumed(args.calibration_file, session_id=session_id)
             node.enable_publishers()
             print("EXECUTE mode: calibration consumed; publishing mapped finite 14D commands.")
         else:
             print("DRY-RUN mode: no action publisher was created; calibration remains reusable.")
 
+        request_id += 1
+        first = client.infer(wait_observation(node, 5.0), request_id)
+        if policy_stop.is_set():
+            raise RuntimeError("interrupted before policy execution; robot remains at fixed initial pose")
+        scheduler = CalibratedChunkScheduler(
+            replan_steps,
+            blend_steps=args.chunk_blend_steps,
+            gripper_blend_steps=args.gripper_blend_steps,
+            max_response_age_ms=args.max_response_age_ms,
+        )
+        ema = ActionEMA(args.arm_ema_alpha, args.gripper_ema_alpha)
+        initial = node.snapshot().qpos
+        ema.reset(initial)
+        adoption = scheduler.adopt(first, initial=True, arrival_monotonic_ns=time.monotonic_ns())
+        trace.adoption(first.request_id, adoption)
+
         period = 1.0 / FPS
         deadline = time.monotonic()
         step = 0
-        starved = False
         published = 0
         publish_started = time.monotonic()
         while rclpy.ok() and not policy_stop.is_set() and step < args.max_steps:
@@ -576,18 +587,14 @@ def run(args) -> None:
                     f"intent excess={adoption.gripper_intent_saturation_max:.4f})"
                 )
                 pending = None
-                starved = False
             if scheduler.should_request(pending is not None):
                 request_id += 1
                 pending = executor.submit(client.infer, node.snapshot(), request_id)
             try:
                 scheduled = scheduler.next_action()
-            except BufferError:
-                if not starved:
-                    print("BUFFER STARVED: publication paused until a fresh action chunk arrives.")
-                    trace.starvation(time.monotonic_ns(), step)
-                    starved = True
-                continue
+            except BufferError as error:
+                trace.starvation(time.monotonic_ns(), step)
+                raise ProtocolError("BUFFER STARVED: commands stopped; restart after checking latency") from error
             command = ema.apply(scheduled.action)
             feedback = node.snapshot().qpos
             trace.tick(
@@ -684,7 +691,7 @@ def parse_args():
         type=Path,
         default=ROOT / "data/tau0vla_calibrated_ready.yaml",
     )
-    parser.add_argument("--expected-height", type=float, default=15.5)
+    parser.add_argument("--expected-height", type=float, default=12.5)
     parser.add_argument("--height-stability-tolerance", type=float, default=.05)
     parser.add_argument("--height-stability-window", type=float, default=2.0)
     parser.add_argument("--height-timeout", type=float, default=15.0)

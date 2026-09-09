@@ -284,7 +284,8 @@ def test_http_client_validates_contract_and_maps_grippers():
     assert result.native_actions[0, 6] == pytest.approx(-3.39, abs=1e-5)
 
 
-def test_feedback_v4_client_uses_v4_session_path_and_omits_eef():
+@pytest.mark.parametrize("eef", [None, np.full(14, np.nan), np.empty(0)])
+def test_feedback_v4_client_uses_v4_session_path_and_omits_eef(eef):
     class Response:
         status_code = 200
         text = ""
@@ -374,7 +375,7 @@ def test_feedback_v4_client_uses_v4_session_path_and_omits_eef():
     result = client.infer(
         Observation(
             qpos=np.zeros(14, dtype=np.float32),
-            eef=np.ones(14, dtype=np.float32),
+            eef=eef,
             images={name: b"jpeg" for name in ("head", "left_wrist", "right_wrist")},
             sample_monotonic_ns=123,
         ),
@@ -437,8 +438,9 @@ def test_one_command_rollout_orders_stack_calibration_policy_and_return():
     assert rollout.index("00_tau0vla_calibrated_up.sh") < rollout.index(
         "tau0vla_calibrate_gripper.py"
     ) < rollout.index("tau0vla_calibrated_client.py")
-    assert "expected_route=arx-lift2s-0907-blue-joint-feedback-ft" in rollout
-    assert "actual_route" in rollout
+    profiles = (ROOT / "tools/tau0vla_robot_profile.sh").read_text()
+    assert "expected_route=arx-lift2s-0907-blue-joint-feedback-ft" in profiles
+    assert rollout.index("check_tau0vla_server") < rollout.index("00_tau0vla_calibrated_up.sh")
     assert "MOVE TO FIXED INITIAL POSE" in client
     assert "RETURN TO INITIAL POSE" in client
     assert "fixed-pose verification failed" in client
@@ -447,24 +449,25 @@ def test_one_command_rollout_orders_stack_calibration_policy_and_return():
     assert "--no-return-to-initial" not in rollout
     assert '00_tau0vla_calibrated_up.sh" --auto-confirm' in rollout
     assert "tau0vla_calibrate_gripper.py --execute --auto-confirm" in rollout
-    assert ': "${LIFT_HEIGHT:=15.5}"' in rollout
+    assert ': "${LIFT_HEIGHT:=12.5}"' in rollout
     assert '--expected-height "${LIFT_HEIGHT}"' in rollout
     standalone = (ROOT / "tools/06_tau0vla_return_fixed.sh").read_text(encoding="utf-8")
     assert "--calibration-file" in standalone
     assert "--auto-confirm" in standalone
     assert "trace_" not in standalone
     assert "[t]au0vla_.*client.py" in standalone
-    assert "exec python tau0vla_calibrated_client.py" in rollout
+    assert 'exec "${TAU0VLA_PYTHON}" tau0vla_calibrated_client.py' in rollout
     assert '2>&1 | tee -a "${client_log}"' not in rollout
 
 
-def test_one_click_bringup_is_ark2_only_and_starts_cameras_in_order():
+def test_one_click_bringup_uses_profile_and_checks_reused_cameras():
     source = (ROOT / "tools/00_tau0vla_calibrated_up.sh").read_text(encoding="utf-8")
-    assert '"$(hostname)" != ark-2' in source
-    assert '"${ROS_DOMAIN_ID}" != 63' in source
-    assert source.index("camera_h:260522275257") < source.index(
-        "camera_l:260422273222"
-    ) < source.index("camera_r:260422272473")
+    assert "load_tau0vla_robot_profile" in source
+    assert source.index("camera_h:${CAMERA_H_SERIAL}") < source.index(
+        "camera_l:${CAMERA_L_SERIAL}"
+    ) < source.index("camera_r:${CAMERA_R_SERIAL}")
+    assert 'ros2 param get "/camera/${name}" serial_no' in source
+    assert source.index("check_tau0vla_server") < source.index("00_can_up.sh")
     assert "tau0vla_calibrate_gripper" not in source
     assert "--auto-confirm" in source
 
@@ -501,3 +504,184 @@ def test_return_recovery_derives_fixed_pose_from_legacy_trace_metadata(tmp_path)
     np.testing.assert_allclose(command[[7, 8, 9, 10, 11, 12]], np.arange(6, 12))
     assert command[6] == pytest.approx(-3.39)
     assert feedback[6] == pytest.approx(-3.34)
+
+
+@pytest.mark.parametrize("bad_eef", [None, [], [float("nan")] * 6])
+def test_feedback_extraction_requires_eef_only_for_v3(bad_eef):
+    from types import SimpleNamespace
+    from tau0vla_calibrated_client import arm_feedback_vectors
+    from tau0vla_calibrated_protocol import ProtocolError
+
+    fields = {"joint_pos": list(range(7))}
+    if bad_eef is not None:
+        fields["end_pos"] = bad_eef
+    left = SimpleNamespace(**fields)
+    right = SimpleNamespace(**fields)
+    joints, eef = arm_feedback_vectors(left, right, requires_eef=False)
+    assert joints.shape == (14,)
+    assert eef is None
+    with pytest.raises(ProtocolError, match="EEF"):
+        arm_feedback_vectors(left, right, requires_eef=True)
+    left.joint_pos = [0.] * 6
+    with pytest.raises(ProtocolError, match="joint feedback"):
+        arm_feedback_vectors(left, right, requires_eef=False)
+
+
+def test_v3_http_still_rejects_missing_eef():
+    from tau0vla_calibrated_protocol import ProtocolError
+
+    client = CalibratedHttpClient("http://server", experiment="joint-feedback",
+                                  calibration=_artifact(), robot_id="ark-1")
+    client.session_id, client.model_id = "session", "model"
+    observation = Observation(qpos=np.zeros(14), eef=None,
+                              images={}, sample_monotonic_ns=1)
+    with pytest.raises(ProtocolError, match="EEF"):
+        client.infer(observation, 1)
+
+
+def test_preflight_only_client_cannot_create_session_without_calibration():
+    from tau0vla_calibrated_protocol import ProtocolError
+
+    client = CalibratedHttpClient("http://server", experiment="joint-feedback",
+                                  calibration=None, robot_id="preflight")
+    with pytest.raises(ProtocolError, match="real robot calibration"):
+        client.create_session("pick")
+
+
+@pytest.mark.parametrize("mode,exit_code", [("--check", 0), ("--dry-run", 1), ("--execute", 9)])
+def test_rollout_no_motion_paths_and_failed_preflight(tmp_path, mode, exit_code):
+    import os
+    import subprocess
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    hostname = fake_bin / "hostname"
+    hostname.write_text('#!/bin/bash\necho ark-1\n')
+    hostname.chmod(0o755)
+    calls = tmp_path / "calls"
+    python = fake_bin / "python"
+    python.write_text('#!/bin/bash\nprintf "%s\\n" "$*" >> "$TEST_CALLS"\nexit "$TEST_PREFLIGHT_EXIT"\n')
+    python.chmod(0o755)
+    env = {**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}",
+           "ROS_DOMAIN_ID": "62", "TAU0VLA_PYTHON": str(python),
+           "TEST_CALLS": str(calls), "TEST_PREFLIGHT_EXIT": "9" if mode == "--execute" else "0",
+           "CALIBRATION_FILE": "", "MODEL_PROFILE": "all-blue-feedback"}
+    for key in ("CAMERA_H_SERIAL", "CAMERA_L_SERIAL", "CAMERA_R_SERIAL", "LIFT_HEIGHT"):
+        env.pop(key, None)
+    result = subprocess.run(["bash", str(ROOT / "tools/05_tau0vla_calibrated_rollout.sh"), mode],
+                             env=env, text=True, capture_output=True)
+    assert result.returncode == exit_code, result.stderr
+    assert calls.read_text().count("tau0vla_server_preflight.py") == 1
+    assert "tau0vla_calibrate_gripper.py" not in calls.read_text()
+    assert "tau0vla_calibrated_client.py" not in calls.read_text()
+    assert "/opt/ros" not in result.stderr  # These paths exit even before ROS setup.
+    if mode == "--check":
+        assert "lift=12.5" in result.stdout
+        assert "head=260522272299, left=260422271992, right=260522274175" in result.stdout
+    elif mode == "--dry-run":
+        assert "requires CALIBRATION_FILE" in result.stderr
+
+
+@pytest.mark.parametrize("host,domain,expected", [("ark-1", "62", 0), ("ark-2", "63", 0),
+                                                  ("ark-1", "63", 1), ("new-arx", "62", 1)])
+def test_robot_profile_rejects_wrong_domain_and_unknown_robot(host, domain, expected):
+    import os
+    import shlex
+    import subprocess
+
+    env = {**os.environ, "ROS_DOMAIN_ID": domain}
+    script = (f"set -eu; hostname() {{ echo {shlex.quote(host)}; }}; "
+              f"repo_root={shlex.quote(str(ROOT))}; "
+              'source "$repo_root/tools/tau0vla_robot_profile.sh"; load_tau0vla_robot_profile')
+    result = subprocess.run(["bash", "-c", script], env=env, text=True, capture_output=True)
+    assert result.returncode == expected, result.stderr
+
+
+def test_scheduler_rejects_chunk_delayed_after_fast_http_response():
+    from tau0vla_calibrated_protocol import ProtocolError
+
+    scheduler = CalibratedChunkScheduler(15, max_response_age_ms=500)
+    chunk = _chunk("joint-feedback", 40.0)
+    # A fast HTTP response may still sit in a future/UI prompt for too long.
+    with pytest.raises(ProtocolError, match="observation-to-adoption age"):
+        scheduler.adopt(chunk, arrival_monotonic_ns=chunk.sample_monotonic_ns + 501_000_000)
+    assert scheduler.remaining == 0
+    permissive = CalibratedChunkScheduler(15, max_response_age_ms=2000)
+    with pytest.raises(ProtocolError, match="no aligned future actions"):
+        permissive.adopt(chunk, arrival_monotonic_ns=chunk.sample_monotonic_ns + 1_500_000_000)
+
+
+def test_initial_action_is_requested_after_manual_confirmation_and_buffer_failure_stops():
+    source = (ROOT / "act/tau0vla_calibrated_client.py").read_text()
+    assert source.index('"Type EXECUTE CALIBRATED TAU0VLA') < source.index("first = client.infer")
+    assert 'raise ProtocolError("BUFFER STARVED:' in source
+
+
+@pytest.mark.parametrize("mutation", [None, "route", "protocol_version", "calibration_version", "camera_names", "model_id", "checkpoint_sha256", "rtc_enabled"])
+def test_server_preflight_validates_contract_without_posting(monkeypatch, mutation):
+    from tau0vla_calibrated_protocol import JOINT_NAMES, ProtocolError
+    from tau0vla_server_preflight import check_server
+    import requests
+
+    health = {"status": "ok", "ready": True, "route": "all-route", "model_id": "model",
+              "checkpoint_sha256": "sha", "protocol_version": FEEDBACK_PROTOCOL_VERSION,
+              "experiment": "joint-feedback", "required_client_adapter_version": "arx-calibrated-client-v1"}
+    contract = {**health, "calibration_version": FEEDBACK_CALIBRATION_VERSION,
+                "fps": 30, "camera_names": ["head", "left_wrist", "right_wrist"],
+                "state_dim": 14, "action_dim": 14, "action_horizon": 30,
+                "joint_names": list(JOINT_NAMES), "wire_action_field": "calibrated_action_chunk",
+                "wire_action_is_robot_command": False, "offset_unit": "uploaded_30fps_frame",
+                "component_source_offsets": {"arm_action": 1, "gripper_action": 1}, "rtc_enabled": False}
+    if mutation == "route":
+        health[mutation] = "wrong"
+    elif mutation is not None:
+        contract[mutation] = True if mutation == "rtc_enabled" else "wrong"
+    calls = []
+
+    class Response:
+        def __init__(self, value): self.value = value
+        def raise_for_status(self): pass
+        def json(self): return self.value
+
+    class Session:
+        def get(self, url, timeout):
+            calls.append(url)
+            return Response(health if url.endswith("/health") else contract)
+        def close(self): pass
+        def post(self, *args, **kwargs): pytest.fail("preflight must never create a session")
+
+    monkeypatch.setattr(requests, "Session", Session)
+    if mutation is None:
+        result = check_server("http://server", route="all-route", experiment="joint-feedback",
+                              protocol_version=FEEDBACK_PROTOCOL_VERSION)
+        assert result["health"]["route"] == "all-route"
+        assert calls == ["http://server/health", "http://server/arx/v4/policy-contract"]
+    else:
+        with pytest.raises(ProtocolError):
+            check_server("http://server", route="all-route", experiment="joint-feedback",
+                         protocol_version=FEEDBACK_PROTOCOL_VERSION)
+
+
+@pytest.mark.parametrize("guard", ["lock", "process"])
+def test_rollout_conflicting_execution_guard_precedes_hardware(tmp_path, guard):
+    import os
+    import subprocess
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    for name, content in {
+        "hostname": "echo ark-1",
+        "python": "exit 0",
+        "flock": "exit 1" if guard == "lock" else "exit 0",
+        "pgrep": "exit 0",
+    }.items():
+        path = fake_bin / name
+        path.write_text(f"#!/bin/bash\n{content}\n")
+        path.chmod(0o755)
+    env = {**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}", "ROS_DOMAIN_ID": "62",
+           "TAU0VLA_PYTHON": str(fake_bin / "python"), "MODEL_PROFILE": "all-blue-feedback"}
+    result = subprocess.run(["bash", str(ROOT / "tools/05_tau0vla_calibrated_rollout.sh"), "--execute"],
+                             env=env, text=True, capture_output=True)
+    assert result.returncode == 1
+    assert ("another rollout" if guard == "lock" else "process is still active") in result.stderr
+    assert "/opt/ros" not in result.stderr

@@ -7,7 +7,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = ROOT / "realsense/camera_serials.sh"
-ARK1 = ["260422272688", "260422274927", "260522274175"]
+ARK1 = ["260522272299", "260422271992", "260522274175"]
 ARK2 = ["260422273990", "260422273222", "260422272473"]
 
 

@@ -1,72 +1,75 @@
-# Tau0VLA calibrated-v3 on ARX LIFT2s
+# Tau0VLA feedback-v4 and calibrated-v3 on ARX LIFT2s
 
-This path is only for Blue/T `joint-feedback` and `joint-vr` checkpoints. The existing `03_tau0vla_inference.sh` remains the v1 client.
+The 0908 All checkpoint-30000 uses `arx-feedback-v4`, contract `arx-feedback-open-v1`, route `arx-lift2s-0908-all-joint-feedback-ft`. It uploads 14 joint feedback values and head/left-wrist/right-wrist JPEGs, without EEF feedback. The policy produces 30 steps at 30 Hz; both arm and gripper offsets are one uploaded frame. RTC is disabled. Legacy 0907 Blue/T feedback and VR profiles retain their v3 protocol.
 
-## Preconditions
+## This deployment
 
-- Set `ROS_DOMAIN_ID=63` on ark-2.
-- Bring up `can1/can3/can5`, `/lift` at `fixed_height=15.5`, and exactly two `v2_joint_control` arm processes.
-- Start the three RealSense cameras sequentially and verify one compressed-image publisher per camera.
-- Verify the direct route is `192.168.50.2 dev enp130s0 src 192.168.50.1`.
+The installed client directory is `/home/arx/ROS2_LIFT_Play_feedback-v4`. The connected robot is `ark-1`, `ROS_DOMAIN_ID=62`; its head/left/right camera serials are `260522272299`, `260422271992`, `260522274175`. The reviewed `ark-2`, domain `63` profile retains `260522275257`, `260422273222`, `260422272473`. Unknown hosts or mismatched ROS domains are rejected. Reused camera nodes must report the configured serials.
 
-## Mandatory calibration
+Model traffic uses `192.168.50.2 dev enp130s0 src 192.168.50.1`. Formal service port is `8000`; candidate validation uses `8001`. **The lift command defaults to `12.5`**. `LIFT_HEIGHT` is exported to hardware bring-up, target waiting, inference height checks and standalone return. The waiter/client verify `/lift fixed_height`, then require fresh stable feedback. Command and feedback coordinates have an offset and are not compared directly.
 
-Run once before every execute rollout:
+## Check without starting hardware
 
 ```bash
-export ROS_DOMAIN_ID=63
-cd /home/arx/ROS2_LIFT_Play/tools
-./02_tau0vla_calibrated_gripper.sh --execute
+cd /home/arx/ROS2_LIFT_Play_feedback-v4
+export ROS_DOMAIN_ID=62
+MODEL_PROFILE=all-blue-feedback MODEL_SERVER_URL=http://192.168.50.2:8000 \
+LIFT_HEIGHT=12.5 ./tools/05_tau0vla_calibrated_rollout.sh --check
 ```
 
-Type `CALIBRATE BOTH GRIPPERS` only with hands clear. The tool holds the six arm joints, moves one gripper at a time through `-3.39,-2.55,-1.70,-0.85,0.0`, returns both to `-3.39`, validates the feedback fit, and writes an immutable JSON artifact. A dry-run may inspect the artifact without consuming it; the first execute session marks it consumed.
+This only validates robot configuration and model health, route, protocol, contract, model identity and camera order in the contract. It creates no model session, ROS publisher, calibration or motion. It does not claim that physical cameras or the hardware stack are running. The same model preflight also runs before any hardware start in `--execute`.
 
-## Policy dry-run and execute
-
-Set the checkpoint experiment and its exact task text:
+For an observation-based dry-run, the hardware must already be running and an explicit valid calibration artifact must exist:
 
 ```bash
-export ROS_DOMAIN_ID=63
-export CALIBRATED_EXPERIMENT=joint-feedback  # or joint-vr
-export TASK_INSTRUCTION='Pick up the blue box and place it in its designated position on the board.'
-cd /home/arx/ROS2_LIFT_Play/tools
-./03_tau0vla_calibrated_inference.sh --max-steps 900
+CALIBRATION_FILE=/home/arx/logs/tau0vla-calibrated/calibration_TIMESTAMP.json \
+MODEL_PROFILE=all-blue-feedback LIFT_HEIGHT=12.5 \
+./tools/05_tau0vla_calibrated_rollout.sh --dry-run
 ```
 
-For T use `Pick up the T-shaped part and place it in its designated position on the board.`. After dry-run succeeds, reuse the same still-valid calibration once:
+Dry-run does not start CAN/lift/arms/cameras, calibrate grippers, move to a pose, publish robot commands or return. Missing/invalid calibration, unavailable or stale observations, wrong height, camera skew or invalid protocol responses cause an explicit failure. Real observations are sent to the model and a client trace plus server NPZ records are created. Calibration identity, age and current full-open feedback are checked, but the artifact is not consumed.
+
+## Execute on site
+
+Clear the workspace and keep the emergency stop reachable before running:
 
 ```bash
-./03_tau0vla_calibrated_inference.sh --execute --max-steps 3600
-```
-
-Type `EXECUTE CALIBRATED TAU0VLA` only after confirming the model ID, calibration ID, clear workspace, and reachable emergency stop. Arm actions are not clipped; invalid intent, calibration, mapping, response age, session ordering, or finite-value checks stop publication.
-
-For `joint-feedback`, a flow sample may fall slightly beyond a demonstrated gripper endpoint. The client accepts at most `0.10` command units of endpoint error and saturates it to the measured command endpoint; the extrapolated command is never published. This covers the measured T-feedback right-gripper endpoint-noise maximum of `0.07739` while retaining a hard guard. For `joint-vr`, intent in `[-0.05,1.05]` is likewise saturated to the semantic `[0,1]` endpoints; a 30-request repeated real-observation probe measured maxima of `0.00366` (left) and `0.01413` (right). Larger errors still terminate the session. Command-coordinate and intent-coordinate saturation counts and maxima are recorded separately in the response log and trace summary. Arm actions are never clipped.
-
-Logs, immutable calibration artifacts, JSONL traces, summaries and plots are written under `/home/arx/logs/tau0vla-calibrated/`.
-
-## One-command workflow
-
-After deployment, the same command is used for every rollout. It idempotently starts or reuses the direct network, CAN, lift, v2 arms and sequential cameras; performs a new full calibration; moves both arms to the fixed pose used at the beginning of the 0907 training demonstrations; runs the selected policy; and offers a guarded return to that same fixed pose:
-
-```bash
-export ROS_DOMAIN_ID=63
-cd /home/arx/ROS2_LIFT_Play/tools
-MODEL_PROFILE=blue-feedback \
+cd /home/arx/ROS2_LIFT_Play_feedback-v4
+export ROS_DOMAIN_ID=62
+MODEL_PROFILE=all-blue-feedback \
 MODEL_SERVER_URL=http://192.168.50.2:8000 \
-./05_tau0vla_calibrated_rollout.sh --execute
+LIFT_HEIGHT=12.5 \
+./tools/05_tau0vla_calibrated_rollout.sh --execute
 ```
 
-During validation use candidate port `8001`. Profiles are `blue-feedback`, `t-feedback`, `blue-vr`, and `t-vr`. Before inference, `MOVE TO FIXED INITIAL POSE` is required and arrival is checked against `act/data/tau0vla_calibrated_ready.yaml`. Grippers remain at the full-open feedback measured by the current calibration, with their commands obtained through the fitted inverse rather than by treating feedback as command coordinates.
+This command starts/reuses CAN, lift, both v2 arms and three cameras in sequence; performs fresh full two-gripper calibration; moves to the fixed training initial pose and verifies arrival; benchmarks the model with three warmups and 30 requests; then publishes policy commands. These motion transitions are non-interactive. Each execute rollout requires a new one-use calibration. A per-robot lock prevents overlapping rollouts, and both execute/dry-run reject existing policy, calibration or return processes before starting hardware or creating a model session.
 
-The one-command execute path is non-interactive: it starts/reuses the hardware stack, performs the full two-gripper calibration, moves to the fixed training pose, starts policy publication, and returns to the fixed pose when either the operator presses `Ctrl-C` once or `MAX_STEPS` is reached. It prints `AUTO-CONFIRM` at each movement transition instead of reading confirmation text. The workspace must therefore be clear and the emergency stop reachable before the command is launched. A second `Ctrl-C` during return aborts movement.
+Available v4 profiles and exact training text:
 
-The lift defaults to the training height `15.5`. Set `LIFT_HEIGHT` on the one-command launcher to change it; the same value is applied to `/lift fixed_height` and passed to the policy client's stability check. Small changes should be tested first because lift height changes camera and arm-to-table geometry, for example `LIFT_HEIGHT=15.0`.
+| Profile | Task instruction |
+|---|---|
+| `all-l-feedback` | Pick up the L-shaped part and place it in its designated position on the board. |
+| `all-t-feedback` | Pick up the T-shaped part and place it in its designated position on the board. |
+| `all-banana-feedback` | Pick up the banana and place it in its designated position on the board. |
+| `all-red-feedback` | Pick up the red object and place it in its designated position on the board. |
+| `all-blue-feedback` | Pick up the blue box and place it in its designated position on the board. |
+| `all-circle-feedback` | Pick up the circular part and place it in its designated position on the board. |
 
-Protocol, calibration, sensor, mapping, response-age, and other unexpected errors remain fail-stop and never trigger automatic movement. After such an error, or if the policy process is externally killed, use the independent return command below. It locates the newest calibration from the current boot, rejects changed controller identities or an artifact older than 15 minutes, and does not require the rollout trace or model server:
+V3 profiles are `blue-feedback`, `t-feedback`, `blue-vr`, `t-vr`; choose the matching deployed route. The legacy low-level launcher accepts `PROTOCOL_VERSION=arx-feedback-v4` when supplying experiment and task text manually.
+
+Defaults: replan every 15 steps, blend 6 arm/gripper steps, arm EMA `0.6`, gripper EMA `1.0`, maximum response age `500 ms`. Joint actions are never clipped. Existing measured gripper endpoint saturation limits remain enforced and recorded. Invalid mapping, stale observations/responses, session ordering errors or buffer exhaustion stop publication. Calibration artifacts, logs and JSONL traces live in `/home/arx/logs/tau0vla-calibrated/`; trace metadata identifies model, session, calibration and height for matching server NPZ records.
+
+## Stop and return
+
+Press `Ctrl-C` once during normal policy execution to stop policy commands and run the guarded return to the fixed initial pose; reaching `MAX_STEPS` does the same. Press `Ctrl-C` again during a return to abort further motion. Unexpected protocol, calibration or sensor failures stop commands and do not automatically move the robot.
+
+For a separate return after the policy process has stopped:
 
 ```bash
-./06_tau0vla_return_fixed.sh --execute
+cd /home/arx/ROS2_LIFT_Play_feedback-v4
+ROS_DOMAIN_ID=62 LIFT_HEIGHT=12.5 ./tools/06_tau0vla_return_fixed.sh --execute
 ```
 
-The standalone command is also non-interactive and begins the fixed-pose move immediately after all identity and age checks pass. After a verified return, rerun the rollout command; it creates a fresh one-use calibration.
+This checks the robot/domain, calibration age and boot/controller identity, expected lift parameter and fresh stable height before moving. It uses the newest calibration without requiring the model server or trace. For an artifact/target inspection without movement, omit `--execute`. After return, start the one-command rollout again to create fresh calibration.
+
+Hardware shutdown, when needed, remains `./tools/04_safe_shutdown.sh`; inspect its existing on-site procedure before use. This deployment does not certify closed-loop performance: real observation quality, gripper calibration and task execution must be checked at the first attended rollout.

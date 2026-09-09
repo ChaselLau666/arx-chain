@@ -12,8 +12,8 @@ load_camera_serials() {
   camera_host=$(hostname -s) || return
   case "$camera_host" in
     ark-1)
-      head_serial=260422272688
-      left_serial=260422274927
+      head_serial=260522272299
+      left_serial=260422271992
       right_serial=260522274175
       ;;
     # This robot reports its hostname as "arx", not ark-N, and carries a third

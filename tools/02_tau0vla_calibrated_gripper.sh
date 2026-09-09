@@ -2,7 +2,8 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-: "${ROS_DOMAIN_ID:?ROS_DOMAIN_ID must identify the robot (ark-2=63)}"
+source "${repo_root}/tools/tau0vla_robot_profile.sh"
+load_tau0vla_robot_profile
 : "${LOG_DIR:=/home/arx/logs/tau0vla-calibrated}"
 
 set +u

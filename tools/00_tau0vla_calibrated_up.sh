@@ -1,25 +1,20 @@
 #!/bin/bash
-# One-command, idempotent ARX2 hardware bring-up for calibrated Tau0VLA.
+# One-command, idempotent profiled ARX hardware bring-up for calibrated Tau0VLA.
 # It never starts policy or calibration publishers. The calibrated rollout can
 # opt into the reviewed non-interactive sequence with --auto-confirm.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-: "${ROS_DOMAIN_ID:?Set ROS_DOMAIN_ID=63 for ark-2}"
-: "${MODEL_SERVER_URL:=http://192.168.50.2:8001}"
+source "${repo_root}/tools/tau0vla_robot_profile.sh"
+load_tau0vla_robot_profile
+: "${MODEL_SERVER_URL:=http://192.168.50.2:8000}"
 : "${DIRECT_INTERFACE:=enp130s0}"
 : "${DIRECT_CLIENT_IP:=192.168.50.1}"
-: "${LIFT_HEIGHT:=15.5}"
+: "${LIFT_HEIGHT:=12.5}"
 
-if [[ "$(hostname)" != ark-2 || "${ROS_DOMAIN_ID}" != 63 ]]; then
-  echo "Refused: calibrated one-click bring-up requires ark-2 and ROS_DOMAIN_ID=63." >&2
-  exit 1
-fi
-
-set +u
-source /opt/ros/jazzy/setup.bash
-source /home/arx/LIFT/body/ROS2/install/setup.bash
-set -u
+load_tau0vla_model_profile
+check_tau0vla_server
+source_tau0vla_ros
 
 publisher_count() {
   ros2 topic info "$1" 2>/dev/null | awk '/^Publisher count:/{print $3; found=1} END{if (!found) print 0}'
@@ -111,7 +106,7 @@ if [[ "${height_set}" != true ]]; then
   echo "Refused: could not set /lift fixed_height; use safe shutdown." >&2
   exit 1
 fi
-/home/arx/miniconda3/envs/act/bin/python "${repo_root}/act/tau0vla_wait_height.py" \
+"${TAU0VLA_PYTHON}" "${repo_root}/act/tau0vla_wait_height.py" \
   --target "${LIFT_HEIGHT}"
 
 arm_count=$(pgrep -fc '/arx_x5_controller/[X]5Controller' || true)
@@ -132,9 +127,9 @@ wait_topic /arm_slave_r_status
 camera_count=$(pgrep -fc '/realsense2_camera/[r]ealsense2_camera_node' || true)
 if [[ ${camera_count} -eq 0 ]]; then
   cameras=(
-    "camera_h:260522275257:/camera/camera_h/color/image_rect_raw/compressed"
-    "camera_l:260422273222:/camera/camera_l/color/image_rect_raw/compressed"
-    "camera_r:260422272473:/camera/camera_r/color/image_rect_raw/compressed"
+    "camera_h:${CAMERA_H_SERIAL}:/camera/camera_h/color/image_rect_raw/compressed"
+    "camera_l:${CAMERA_L_SERIAL}:/camera/camera_l/color/image_rect_raw/compressed"
+    "camera_r:${CAMERA_R_SERIAL}:/camera/camera_r/color/image_rect_raw/compressed"
   )
   for entry in "${cameras[@]}"; do
     IFS=: read -r name serial topic <<<"${entry}"
@@ -155,6 +150,18 @@ for topic in \
   /camera/camera_r/color/image_rect_raw/compressed
 do
   wait_topic "${topic}"
+done
+
+# Reused cameras must have the same identity as freshly started cameras.
+for entry in "camera_h:${CAMERA_H_SERIAL}" "camera_l:${CAMERA_L_SERIAL}" "camera_r:${CAMERA_R_SERIAL}"; do
+  IFS=: read -r name expected_serial <<<"${entry}"
+  actual_serial=$(ros2 param get "/camera/${name}" serial_no 2>/dev/null || true)
+  actual_serial=${actual_serial##*: }
+  actual_serial=${actual_serial#_}
+  if [[ "${actual_serial}" != "${expected_serial}" ]]; then
+    echo "Refused: ${name} serial ${actual_serial} does not match ${expected_serial}." >&2
+    exit 1
+  fi
 done
 
 echo "CALIBRATED_STACK_READY"

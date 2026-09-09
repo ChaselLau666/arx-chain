@@ -45,7 +45,7 @@ class ProtocolError(RuntimeError):
 @dataclass(frozen=True)
 class Observation:
     qpos: np.ndarray
-    eef: np.ndarray
+    eef: np.ndarray | None
     images: Mapping[str, bytes]
     sample_monotonic_ns: int
 
@@ -104,7 +104,7 @@ class CalibratedHttpClient:
         base_url: str,
         *,
         experiment: str,
-        calibration: CalibrationArtifact,
+        calibration: CalibrationArtifact | None,
         robot_id: str,
         protocol_version: str = PROTOCOL_VERSION,
         request_timeout: float = 5.0,
@@ -129,11 +129,12 @@ class CalibratedHttpClient:
         self.api_prefix = "/arx/v3" if protocol_version == PROTOCOL_VERSION else "/arx/v4"
         self.requires_eef = protocol_version == PROTOCOL_VERSION
         self.calibration = calibration
-        self.mapper = CalibratedGripperMapper(calibration, experiment)
+        self.mapper = CalibratedGripperMapper(calibration, experiment) if calibration is not None else None
         self.robot_id = robot_id
         self.request_timeout = float(request_timeout)
         self.max_response_age_ms = float(max_response_age_ms)
         self.session = requests.Session()
+        self.session.trust_env = False
         self.session_id: str | None = None
         self.model_id: str | None = None
         self.arm_offset_steps: int | None = None
@@ -212,6 +213,8 @@ class CalibratedHttpClient:
         return payload
 
     def create_session(self, task_instruction: str) -> dict:
+        if self.calibration is None or self.mapper is None:
+            raise ProtocolError("a real robot calibration is required to create a session")
         if self.model_id is None or self.arm_offset_steps is None or self.gripper_offset_steps is None:
             raise ProtocolError("policy_contract must be called before create_session")
         response = self.session.post(
@@ -248,11 +251,12 @@ class CalibratedHttpClient:
         if self.session_id is None or self.model_id is None:
             raise ProtocolError("create_session must be called before infer")
         qpos = np.asarray(observation.qpos, dtype=np.float32)
-        eef = np.asarray(observation.eef, dtype=np.float32)
-        if qpos.shape != (ACTION_DIM,) or eef.shape != (ACTION_DIM,):
-            raise ProtocolError("joint and EEF feedback must be 14-vectors")
-        if not np.isfinite(qpos).all() or not np.isfinite(eef).all():
-            raise ProtocolError("joint and EEF feedback must be finite")
+        if qpos.shape != (ACTION_DIM,) or not np.isfinite(qpos).all():
+            raise ProtocolError("joint feedback must be a finite 14-vector")
+        if self.requires_eef:
+            eef = np.asarray(observation.eef, dtype=np.float32)
+            if eef.shape != (ACTION_DIM,) or not np.isfinite(eef).all():
+                raise ProtocolError("EEF feedback must be a finite 14-vector for v3")
         if set(observation.images) != set(CAMERA_NAMES):
             raise ProtocolError("observation must contain exactly three calibrated cameras")
         metadata = {
@@ -334,11 +338,14 @@ class CalibratedHttpClient:
 
 
 class CalibratedChunkScheduler:
-    def __init__(self, replan_steps: int, *, blend_steps: int = 6, gripper_blend_steps: int = 6):
+    def __init__(self, replan_steps: int, *, blend_steps: int = 6, gripper_blend_steps: int = 6, max_response_age_ms: float = 500.0):
         if not 1 <= replan_steps < ACTION_HORIZON:
             raise ValueError("replan_steps must be in [1,29]")
         if not 0 <= blend_steps < ACTION_HORIZON or not 0 <= gripper_blend_steps < ACTION_HORIZON:
             raise ValueError("blend steps must be in [0,29]")
+        if not math.isfinite(max_response_age_ms) or max_response_age_ms <= 0:
+            raise ValueError("max_response_age_ms must be finite and positive")
+        self.max_response_age_ms = float(max_response_age_ms)
         self.replan_steps = int(replan_steps)
         self.blend_steps = int(blend_steps)
         self.gripper_blend_steps = int(gripper_blend_steps)
@@ -360,7 +367,7 @@ class CalibratedChunkScheduler:
 
     @staticmethod
     def _skip(age_frames: float, offset_steps: int) -> int:
-        return max(0, min(ACTION_HORIZON - 1, int(math.ceil(age_frames - offset_steps - 1e-9))))
+        return max(0, int(math.ceil(age_frames - offset_steps - 1e-9)))
 
     def adopt(
         self,
@@ -373,6 +380,8 @@ class CalibratedChunkScheduler:
             age_ms = chunk.round_trip_ms
         else:
             age_ms = max(0.0, (arrival_monotonic_ns - chunk.sample_monotonic_ns) / 1e6)
+        if not math.isfinite(age_ms) or age_ms > self.max_response_age_ms:
+            raise ProtocolError(f"observation-to-adoption age {age_ms:.1f} ms exceeds {self.max_response_age_ms:.1f} ms")
         age_frames = age_ms * FPS / 1000.0
         arm_skip = self._skip(age_frames, chunk.arm_offset_steps)
         grip_skip = self._skip(age_frames, chunk.gripper_offset_steps)
