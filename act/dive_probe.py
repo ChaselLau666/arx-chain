@@ -23,8 +23,15 @@ The lift is watched too (`/body_information`), because "the robot dived" reads
 the same to an operator whether the column dropped or the arms did.
 
 Output goes to one directory: events.log is the human-readable timeline, and
-the CSVs hold every message for exact analysis afterwards. Everything is
-flushed on write, so a kill -9 loses nothing.
+the CSVs hold every message for exact analysis afterwards.
+
+Everything is forced onto the disk rather than merely written. This robot has
+been power-cycling mid-run, and a flush only hands the bytes to the kernel: a
+run on 2026-09-09 left twelve files of exactly zero bytes because the machine
+went down before the page cache was written back. So events.log is fsynced line
+by line, the CSVs on a short timer, and os.sync() on a slower one carries the
+terminal logs the launcher tees alongside these files. What is on disk then
+lags what happened by the sync period at worst, instead of by the whole run.
 """
 
 import os
@@ -69,6 +76,8 @@ def build_node(args):
             self.out = out
 
             self.events = open(out / 'events.log', 'a', buffering=1)
+            self.handles = [self.events]
+            self.last_global_sync = time.monotonic()
             self.cmd_csv, self.cmd_rows = self._csv(
                 'commands.csv',
                 ['wall', 'mono', 'topic', 'publishers'] + list(POS_CMD_FIELDS))
@@ -107,6 +116,7 @@ def build_node(args):
                 PosCmd, args.body_topic,
                 lambda msg: self.on_body(msg), 20)
 
+            self.create_timer(args.sync_period, self.sync_everything)
             self.create_timer(args.publisher_poll, self.poll_publishers)
             self.create_timer(args.report_period, self.report)
 
@@ -123,10 +133,31 @@ def build_node(args):
             path = self.out / name
             fresh = not path.exists() or path.stat().st_size == 0
             handle = open(path, 'a', newline='', buffering=1)
+            self.handles.append(handle)
             writer = csv.writer(handle)
             if fresh:
                 writer.writerow(header)
+                self.fsync_own()
             return handle, writer
+
+        def fsync_own(self):
+            """Put this probe's own files on the disk, not just in the cache."""
+            for handle in self.handles:
+                try:
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                except (OSError, ValueError):
+                    pass
+
+        def sync_everything(self):
+            self.fsync_own()
+            now = time.monotonic()
+            if now - self.last_global_sync < args.global_sync_period:
+                return
+            self.last_global_sync = now
+            # Carries the launcher's teed terminal logs down with us. They are
+            # written by tee, which this process cannot fsync directly.
+            os.sync()
 
         def _watch_pos_cmd(self, topic, kind):
             from arm_control.msg import PosCmd
@@ -140,6 +171,11 @@ def build_node(args):
         def log(self, tag, message):
             line = f'{stamp()}  [{tag}] {message}'
             self.events.write(line + '\n')
+            self.events.flush()
+            try:
+                os.fsync(self.events.fileno())
+            except (OSError, ValueError):
+                pass
             print(line, flush=True)
 
         def publishers_of(self, topic):
@@ -272,12 +308,17 @@ def build_node(args):
 def main(args):
     setup_loader(ROOT)
     rclpy, node = build_node(args)
+    from rclpy.executors import ExternalShutdownException
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
+        # Ctrl-C and SIGTERM are how this is meant to end. Letting either print
+        # a traceback in the probe's own terminal reads as a crash.
         pass
     finally:
         node.log('probe', 'probe stopping')
+        node.fsync_own()
+        os.sync()
         node.destroy_node()
         # A signal-driven stop has already shut the context down, and shutting
         # it down twice raises over the top of the real exit.
@@ -315,6 +356,12 @@ def parse_args():
                         help='messages kept per topic for a dive dump')
     parser.add_argument('--dump', type=int, default=25,
                         help='messages printed per topic when a dive is seen')
+    parser.add_argument('--sync-period', type=float, default=0.25,
+                        help='seconds between fsyncs of this probe\'s own files; the '
+                             'most that a power cut can take off the CSVs')
+    parser.add_argument('--global-sync-period', type=float, default=2.0,
+                        help='seconds between full os.sync() calls, which is what puts '
+                             'the terminal logs the launcher tees onto the disk')
     parser.add_argument('--publisher-poll', type=float, default=0.5)
     parser.add_argument('--report-period', type=float, default=5.0)
 
