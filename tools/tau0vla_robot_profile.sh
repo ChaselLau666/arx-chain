@@ -32,7 +32,15 @@ source_tau0vla_ros() {
 
 load_tau0vla_model_profile() {
   : "${MODEL_PROFILE:=all-blue-feedback}"
+  : "${MODEL_VARIANT:=0908}"
   : "${MODEL_SERVER_URL:=http://192.168.50.2:8000}"
+  case "${MODEL_VARIANT}" in
+    0908|0909) ;;
+    *)
+      echo "Unknown MODEL_VARIANT=${MODEL_VARIANT}; use 0908 or 0909." >&2
+      return 1
+      ;;
+  esac
   protocol_version=arx-calibrated-v3
 
   case "${MODEL_PROFILE}" in
@@ -98,7 +106,16 @@ load_tau0vla_model_profile() {
       return 1
       ;;
   esac
+  if [[ "${MODEL_VARIANT}" == 0909 ]]; then
+    if [[ "${protocol_version}" != arx-feedback-v4 ]]; then
+      echo "MODEL_VARIANT=0909 requires an all-{l,t,banana,red,blue,circle}-feedback profile." >&2
+      return 1
+    fi
+    expected_route=arx-lift2s-0909-all-joint-feedback-64g50k-ft
+  fi
   task=${TASK_INSTRUCTION:-${task}}
+  # Stack bring-up runs in a child shell and repeats the same route preflight.
+  export MODEL_VARIANT
 
 }
 
