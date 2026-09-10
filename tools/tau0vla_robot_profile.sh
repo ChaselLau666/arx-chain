@@ -95,20 +95,38 @@ load_tau0vla_model_profile() {
       task='Pick up the blue box and place it in its designated position on the board.'
       ;;
     all-circle-feedback)
+      if [[ "${MODEL_VARIANT}" == 0909 ]]; then
+        echo "MODEL_VARIANT=0909 has no circular-part task; choose all-cylinder-upper-feedback or all-cylinder-lower-feedback." >&2
+        return 1
+      fi
       experiment=joint-feedback
       protocol_version=arx-feedback-v4
       expected_route=arx-lift2s-0908-all-joint-feedback-ft
       task='Pick up the circular part and place it in its designated position on the board.'
       ;;
+    all-cylinder-upper-feedback|all-cylinder-lower-feedback)
+      if [[ "${MODEL_VARIANT}" != 0909 ]]; then
+        echo "${MODEL_PROFILE} requires MODEL_VARIANT=0909." >&2
+        return 1
+      fi
+      experiment=joint-feedback
+      protocol_version=arx-feedback-v4
+      expected_route=arx-lift2s-0909-all-joint-feedback-64g50k-ft
+      if [[ "${MODEL_PROFILE}" == all-cylinder-upper-feedback ]]; then
+        task='Pick up the cylindrical part and place it in the upper hole on the board.'
+      else
+        task='Pick up the cylindrical part and place it in the lower hole on the board.'
+      fi
+      ;;
     *)
       echo "Unknown MODEL_PROFILE=${MODEL_PROFILE}." >&2
-      echo "Use blue-feedback, t-feedback, blue-vr, t-vr, or all-{l,t,banana,red,blue,circle}-feedback." >&2
+      echo "Use blue-feedback, t-feedback, blue-vr, t-vr, or all-{l,t,banana,red,blue,circle,cylinder-upper,cylinder-lower}-feedback." >&2
       return 1
       ;;
   esac
   if [[ "${MODEL_VARIANT}" == 0909 ]]; then
     if [[ "${protocol_version}" != arx-feedback-v4 ]]; then
-      echo "MODEL_VARIANT=0909 requires an all-{l,t,banana,red,blue,circle}-feedback profile." >&2
+      echo "MODEL_VARIANT=0909 requires an all-{l,t,banana,red,blue,cylinder-upper,cylinder-lower}-feedback profile." >&2
       return 1
     fi
     expected_route=arx-lift2s-0909-all-joint-feedback-64g50k-ft

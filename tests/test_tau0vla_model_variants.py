@@ -43,12 +43,35 @@ def load_profile(profile, variant=None, task=None):
 @pytest.mark.parametrize("variant", [None, "0908", "0909"])
 def test_all_profiles_preserve_task_and_contract(task, variant):
     result = load_profile(f"all-{task}-feedback", variant)
+    if task == "circle" and variant == "0909":
+        assert result.returncode != 0
+        assert "choose all-cylinder-upper-feedback or all-cylinder-lower-feedback" in result.stderr
+        assert not result.stdout
+        return
     assert result.returncode == 0, result.stderr
     selected = variant or "0908"
     route = ("arx-lift2s-0909-all-joint-feedback-64g50k-ft" if selected == "0909"
              else "arx-lift2s-0908-all-joint-feedback-ft")
     assert result.stdout.splitlines() == [
         selected, route, "arx-feedback-v4", "joint-feedback", ALL_TASKS[task], selected,
+    ]
+
+
+@pytest.mark.parametrize("position", ["upper", "lower"])
+@pytest.mark.parametrize("variant", [None, "0908", "0909"])
+def test_cylinder_tasks_are_exact_and_only_supported_for_0909(position, variant):
+    result = load_profile(f"all-cylinder-{position}-feedback", variant)
+    if variant != "0909":
+        assert result.returncode != 0
+        assert "requires MODEL_VARIANT=0909" in result.stderr
+        assert not result.stdout
+        return
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [
+        "0909", "arx-lift2s-0909-all-joint-feedback-64g50k-ft", "arx-feedback-v4",
+        "joint-feedback",
+        f"Pick up the cylindrical part and place it in the {position} hole on the board.",
+        "0909",
     ]
 
 
@@ -81,5 +104,17 @@ def test_unknown_variant_is_refused(variant):
 
 def test_prompt_override_remains_explicit():
     result = load_profile("all-t-feedback", "0909", "Operator-provided task.")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines()[4] == "Operator-provided task."
+
+
+def test_explicit_task_override_does_not_bypass_variant_mismatch():
+    result = load_profile("all-circle-feedback", "0909", "Operator-provided task.")
+    assert result.returncode != 0
+    assert "no circular-part task" in result.stderr
+
+
+def test_cylinder_prompt_override_remains_explicit():
+    result = load_profile("all-cylinder-upper-feedback", "0909", "Operator-provided task.")
     assert result.returncode == 0, result.stderr
     assert result.stdout.splitlines()[4] == "Operator-provided task."
