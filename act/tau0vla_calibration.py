@@ -22,6 +22,12 @@ COMMAND_MARGIN = 0.05
 # never publish the extrapolated value. The hard limit remains close enough to
 # the measured range to catch a wrong route, baseline, or mapping immediately.
 COMMAND_SOFT_TOLERANCE = 0.10
+# The two ends of the gripper envelope are not physically symmetric. Commands
+# past the CLOSED end (upper, 0.0) only add grip force on a held object -- the
+# 0908 model does this routinely (rollout max excess 0.045, a DAgger episode hit
+# 0.118 mid-grasp), and the mapper clips before publishing. Commands past the
+# OPEN end (lower, -3.39) have no such reading and keep the strict tolerance.
+COMMAND_CLOSE_SOFT_TOLERANCE = 0.20
 VR_INTENT_SOFT_TOLERANCE = 0.05
 GRIPPER_INDICES = (6, 13)
 ARM_INDICES = (0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12)
@@ -36,8 +42,37 @@ def current_boot_id() -> str:
     return Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
 
 
-def current_controller_identity() -> dict[str, dict[str, int]]:
-    result: dict[str, dict[str, int]] = {}
+# Each arm stack names its X5Controller nodes differently. The rollout uses
+# v2_joint_control.yaml with arm_slave_l/r; Human DAgger passes parameters
+# directly and names its nodes human_dagger_arm_left/right. What actually
+# guarantees "the arms have not restarted since calibration" is the
+# (pid, start_ticks) pair plus boot_id -- the naming is only how a process is
+# located, so recognising both layouts does not weaken the check.
+ARM_STACKS: dict[str, dict[str, str]] = {
+    "rollout": {
+        "marker": "v2_joint_control.yaml",
+        "left": "__node:=arm_slave_l",
+        "right": "__node:=arm_slave_r",
+    },
+    "dagger": {
+        "marker": "arm_pub_topic_name:=/human_dagger/arm/",
+        "left": "__node:=human_dagger_arm_left",
+        "right": "__node:=human_dagger_arm_right",
+    },
+}
+
+
+def current_controller_identity(stack: str | None = None) -> dict[str, dict[str, int]]:
+    """Locate the live X5Controller process per side.
+
+    stack selects an expected layout from ARM_STACKS; None auto-detects and
+    requires exactly one layout to be present, so a half-torn-down rollout
+    stack overlapping a dagger stack is an error rather than a coin flip.
+    """
+    if stack is not None and stack not in ARM_STACKS:
+        raise CalibrationError(f"unknown arm stack: {stack}")
+    candidates = {stack: ARM_STACKS[stack]} if stack else dict(ARM_STACKS)
+    found: dict[str, dict[str, dict[str, int]]] = {name: {} for name in candidates}
     for entry in Path("/proc").iterdir():
         if not entry.name.isdigit():
             continue
@@ -46,19 +81,32 @@ def current_controller_identity() -> dict[str, dict[str, int]]:
             stat = (entry / "stat").read_text(encoding="utf-8")
         except (FileNotFoundError, PermissionError, UnicodeDecodeError):
             continue
-        if "X5Controller" not in command or "v2_joint_control.yaml" not in command:
+        if "X5Controller" not in command:
             continue
-        side = next((name for name in SIDES if f"__node:=arm_slave_{name[0]}" in command), None)
-        if side is None:
-            continue
-        fields = stat[stat.rfind(")") + 2 :].split()
-        result[side] = {"pid": int(entry.name), "start_ticks": int(fields[19])}
-    if set(result) != set(SIDES):
-        raise CalibrationError("expected exactly one live v2_joint_control process per side")
-    return result
+        for name, patterns in candidates.items():
+            if patterns["marker"] not in command:
+                continue
+            side = next((s for s in SIDES if patterns[s] in command), None)
+            if side is None:
+                continue
+            fields = stat[stat.rfind(")") + 2 :].split()
+            found[name][side] = {"pid": int(entry.name), "start_ticks": int(fields[19])}
+    complete = {name: sides for name, sides in found.items() if set(sides) == set(SIDES)}
+    if not complete:
+        expected = stack or " or ".join(sorted(ARM_STACKS))
+        raise CalibrationError(
+            f"expected exactly one live X5Controller per side for the {expected} arm stack"
+        )
+    if len(complete) > 1:
+        raise CalibrationError(
+            f"multiple arm stacks are live ({sorted(complete)}); stop one before calibrating"
+        )
+    return next(iter(complete.values()))
 
 
-def current_robot_identity() -> tuple[str, int, str, dict[str, dict[str, int]]]:
+def current_robot_identity(
+    stack: str | None = None,
+) -> tuple[str, int, str, dict[str, dict[str, int]]]:
     raw_domain = os.environ.get("ROS_DOMAIN_ID")
     if raw_domain is None:
         raise CalibrationError("ROS_DOMAIN_ID is not set")
@@ -66,7 +114,7 @@ def current_robot_identity() -> tuple[str, int, str, dict[str, dict[str, int]]]:
         socket.gethostname(),
         int(raw_domain),
         current_boot_id(),
-        current_controller_identity(),
+        current_controller_identity(stack),
     )
 
 
@@ -334,13 +382,14 @@ class CalibratedGripperMapper:
             lower = min(fit.command_points)
             upper = max(fit.command_points)
             hard_lower = lower - COMMAND_SOFT_TOLERANCE
-            hard_upper = upper + COMMAND_SOFT_TOLERANCE
+            hard_upper = upper + COMMAND_CLOSE_SOFT_TOLERANCE
             if np.any(raw_command < hard_lower) or np.any(raw_command > hard_upper):
                 raise CalibrationError(
                     f"{side} mapped gripper command range "
                     f"[{float(np.min(raw_command)):.6f}, {float(np.max(raw_command)):.6f}] "
                     f"exceeds calibrated endpoints [{lower:.2f}, {upper:.2f}] plus "
-                    f"soft tolerance {COMMAND_SOFT_TOLERANCE:.3f}"
+                    f"soft tolerances (open {COMMAND_SOFT_TOLERANCE:.3f} / "
+                    f"close {COMMAND_CLOSE_SOFT_TOLERANCE:.3f})"
                 )
             command = np.clip(raw_command, lower, upper)
             excess = np.abs(raw_command - command)
@@ -436,6 +485,7 @@ __all__ = [
     "CALIBRATION_VERSION",
     "COMMAND_MARGIN",
     "COMMAND_POINTS",
+    "COMMAND_CLOSE_SOFT_TOLERANCE",
     "COMMAND_SOFT_TOLERANCE",
     "VR_INTENT_SOFT_TOLERANCE",
     "CalibrationArtifact",

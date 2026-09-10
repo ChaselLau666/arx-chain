@@ -203,7 +203,16 @@ def _timeline_event_records(
         # Accepted into the candidate buffer is not the same as published.
         # A takeover processed later in this tick can invalidate that candidate.
         # Keep its original epoch/time, but do not bind it to the new-epoch frame.
-        if (event_name == "POLICY_ACTION_ACCEPTED" and frame_epoch is not None
+        #
+        # READY_MOVE_DONE has the same shape: the core emits it and then calls
+        # _begin_policy_handoff_locked in the SAME tick, which bumps the epoch,
+        # so its frame is the first frame of the new epoch while its own epoch is
+        # the old one. Unbinding is deliberately per-event rather than a general
+        # "epoch < frame_epoch" rule -- CONTROL_GATE and HUMAN_ACTIVE must keep
+        # their frame binding even when their epoch is older
+        # (test_only_superseded_policy_acceptance_is_unbound pins that).
+        if (event_name in {"POLICY_ACTION_ACCEPTED", "READY_MOVE_DONE"}
+                and frame_epoch is not None
                 and event.control_epoch < frame_epoch):
             raw_record["frame"] = -1
         if event_name == "CONTROL_GATE":
@@ -881,9 +890,9 @@ def _run_ros_control(
     last_graph_check_ns = 0
     cached_graph_error: str | None = "waiting for ROS graph discovery"
 
-    if getattr(args, "policy_backend", "act") == "tau0vla":
+    if getattr(args, "policy_backend", "act") in ("tau0vla", "calibrated"):
         # Remote model: record the server URL; there is no local file to hash.
-        checkpoint_path = f"tau0vla:{args.model_server_url}"
+        checkpoint_path = f"{args.policy_backend}:{args.model_server_url}"
         checkpoint_sha = "0" * 64
     else:
         checkpoint_path = Path(args.ckpt_dir) / args.ckpt_name
@@ -1750,6 +1759,50 @@ def run_supervisor(args: argparse.Namespace, runtime_config: dict[str, Any]) -> 
                 policy_status_queue,
             ),
         )
+    elif args.policy_backend == "calibrated":
+        from human_dagger_calibrated_policy import (
+            CalibratedWorkerConfig,
+            calibrated_policy_worker_main,
+        )
+
+        calibrated_config = CalibratedWorkerConfig(
+            server_url=args.model_server_url,
+            task_instruction=args.task_instruction,
+            calibration_file=args.calibration_file,
+            experiment=args.experiment,
+            protocol_version=args.protocol_version,
+            replan_steps=str(args.replan_steps),
+            chunk_blend_steps=args.chunk_blend_steps,
+            # The calibrated mapper needs a real blend width; the tau0vla
+            # default of None means "same as the arm" only in the old scheduler.
+            gripper_blend_steps=(
+                6 if args.gripper_blend_steps is None else args.gripper_blend_steps
+            ),
+            arm_ema_alpha=args.arm_ema_alpha,
+            gripper_ema_alpha=args.gripper_ema_alpha,
+            max_response_age_ms=args.max_response_age_ms,
+            calibration_max_age_s=args.calibration_max_age_s,
+            calibration_wait_s=args.calibration_wait_s,
+            arm_stack=args.arm_stack,
+            consume_calibration=not args.keep_calibration,
+            # Kept coupled to the core's policy_timeout_ns on purpose, the
+            # same way the ACT worker's staleness window is.
+            max_observation_age_ns=int(
+                float(runtime_config.get("control", {}).get("policy_timeout_ms", 250.0))
+                * 1_000_000
+            ),
+        )
+        policy_process = context.Process(
+            name="human-dagger-policy-calibrated",
+            target=calibrated_policy_worker_main,
+            args=(
+                calibrated_config,
+                policy_control_queue,
+                policy_observation_queue,
+                policy_result_queue,
+                policy_status_queue,
+            ),
+        )
     else:
         worker_config = PolicyWorkerConfig(
             ckpt_dir=args.ckpt_dir,
@@ -1908,7 +1961,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dagger-round", type=int, default=0)
     parser.add_argument("--max-timesteps", type=int, default=800)
     parser.add_argument("--frame-rate", type=float, default=60.0)
-    parser.add_argument("--policy-backend", choices=("act", "tau0vla"), default="act")
+    parser.add_argument(
+        "--policy-backend", choices=("act", "tau0vla", "calibrated"), default="act"
+    )
     parser.add_argument("--ckpt-dir", default="")
     parser.add_argument("--ckpt-name", default="policy_best.ckpt")
     parser.add_argument("--stats-name", default="dataset_stats.pkl")
@@ -1927,6 +1982,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--gripper-high-value", type=float, default=0.0)
     parser.add_argument("--arm-ema-alpha", type=float, default=1.0)
     parser.add_argument("--gripper-ema-alpha", type=float, default=1.0)
+    # calibrated backend only
+    parser.add_argument("--calibration-file", default="")
+    parser.add_argument("--experiment", choices=("joint-feedback", "joint-vr"), default="joint-feedback")
+    parser.add_argument("--protocol-version", default="arx-feedback-v4")
+    parser.add_argument("--max-response-age-ms", type=float, default=500.0)
+    parser.add_argument("--calibration-max-age-s", type=float, default=900.0)
+    parser.add_argument("--calibration-wait-s", type=float, default=180.0)
+    parser.add_argument("--arm-stack", choices=("rollout", "dagger"), default="dagger")
+    parser.add_argument(
+        "--keep-calibration",
+        action="store_true",
+        help="do not mark the calibration artifact consumed (diagnostics only)",
+    )
     parser.add_argument(
         "--trigger-device",
         default="",
@@ -1948,11 +2016,24 @@ def validate_startup_args(args: argparse.Namespace) -> None:
         raise ValueError("--height must be within [0, 20]")
     if args.frame_rate <= 0 or args.max_timesteps < 2:
         raise ValueError("frame rate must be positive and max timesteps must be at least 2")
-    if args.policy_backend == "tau0vla":
+    if args.policy_backend in ("tau0vla", "calibrated"):
         if not args.model_server_url:
-            raise ValueError("--model-server-url is required for the tau0vla backend")
+            raise ValueError(
+                f"--model-server-url is required for the {args.policy_backend} backend"
+            )
         if not args.task_instruction.strip():
-            raise ValueError("--task-instruction is required for the tau0vla backend")
+            raise ValueError(
+                f"--task-instruction is required for the {args.policy_backend} backend"
+            )
+        if args.policy_backend == "calibrated":
+            # The file itself is not required yet: the launcher writes it after
+            # it has started this session's arms, which happens after the
+            # frontend (and this validation) is already running. The worker
+            # waits for it and fails with a clear timeout if it never lands.
+            if not args.calibration_file:
+                raise ValueError("--calibration-file is required for the calibrated backend")
+            if args.calibration_wait_s < 0:
+                raise ValueError("--calibration-wait-s must not be negative")
     elif not args.mock_policy:
         if not args.ckpt_dir:
             raise ValueError("--ckpt-dir is required for the act backend")

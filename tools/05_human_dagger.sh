@@ -26,8 +26,15 @@ case "$POLICY_BACKEND" in
     : "${MODEL_SERVER_URL:?Set MODEL_SERVER_URL for the tau0vla backend}"
     : "${TASK_INSTRUCTION:?Set TASK_INSTRUCTION for the tau0vla backend}"
     ;;
+  calibrated)
+    : "${MODEL_SERVER_URL:?Set MODEL_SERVER_URL for the calibrated backend}"
+    : "${TASK_INSTRUCTION:?Set TASK_INSTRUCTION for the calibrated backend}"
+    # CALIBRATION_FILE is not required from the caller: this launcher produces
+    # the artifact after its own arms are up, because the fit is bound to their
+    # PIDs. Its default needs session_dir, so it is assigned further down.
+    ;;
   *)
-    echo "Unknown POLICY_BACKEND: ${POLICY_BACKEND} (expected act or tau0vla)" >&2
+    echo "Unknown POLICY_BACKEND: ${POLICY_BACKEND} (expected act, tau0vla or calibrated)" >&2
     exit 1
     ;;
 esac
@@ -45,7 +52,16 @@ MIN_FREE_GIB=${HUMAN_DAGGER_MIN_FREE_GIB:-5}
 lift_ws=/home/arx/LIFT/body/ROS2
 x5_ws=/home/arx/LIFT/ARX_X5/ROS2/X5_ws
 vr_ws=/home/arx/LIFT/ARX_VR_SDK/ROS2
-realsense_ws="${repo_root}/realsense"
+# realsense/install/ is gitignored, so a linked worktree only carries src/. The
+# build products live in whichever checkout was colcon-built -- the same one the
+# rollout bring-up sources. Prefer this repo's own build when it exists, so a
+# fully built checkout stays self-contained, and fall back to the primary one.
+realsense_ws=${REALSENSE_WS:-"${repo_root}/realsense"}
+if [[ ! -f "${realsense_ws}/install/setup.bash" \
+  && -f /home/arx/ROS2_LIFT_Play/realsense/install/setup.bash ]]; then
+  realsense_ws=/home/arx/ROS2_LIFT_Play/realsense
+  echo "realsense: this worktree has no build; using ${realsense_ws}"
+fi
 
 runtime_root=${HUMAN_DAGGER_RUNTIME_DIR:-"${XDG_RUNTIME_DIR:-/tmp}/human_dagger-${UID}"}
 active_manifest="${runtime_root}/active.manifest"
@@ -53,6 +69,10 @@ session_id="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 session_dir="${runtime_root}/${session_id}"
 manifest="${session_dir}/pids.tsv"
 log_dir="${session_dir}/logs"
+# The calibrated backend calibrates against this session's own arms, so the
+# artifact belongs to the session directory rather than the caller.
+CALIBRATION_FILE=${CALIBRATION_FILE:-"${session_dir}/gripper_calibration.json"}
+CALIBRATION_CONFIG=${CALIBRATION_CONFIG:-"${repo_root}/act/data/tau0vla_calibrated_dagger.yaml"}
 session_active=false
 frontend_pid=''
 frontend_ticks=''
@@ -193,8 +213,16 @@ if [[ "$POLICY_BACKEND" == act ]]; then
   require_file "${ckpt_dir_abs}/${CKPT_NAME}"
   require_file "${ckpt_dir_abs}/${STATS_NAME}"
 else
-  require_file "${repo_root}/act/human_dagger_tau0vla_policy.py"
-  require_file "${repo_root}/act/tau0vla_protocol.py"
+  if [[ "$POLICY_BACKEND" == calibrated ]]; then
+    require_file "${repo_root}/act/human_dagger_calibrated_policy.py"
+    require_file "${repo_root}/act/tau0vla_calibrated_protocol.py"
+    require_file "${repo_root}/act/tau0vla_calibration.py"
+    require_file "${repo_root}/act/tau0vla_calibrate_gripper.py"
+    require_file "$CALIBRATION_CONFIG"
+  else
+    require_file "${repo_root}/act/human_dagger_tau0vla_policy.py"
+    require_file "${repo_root}/act/tau0vla_protocol.py"
+  fi
 
   # Same direct-link gating as 03_tau0vla_inference.sh: the reviewed model
   # server lives on a dedicated Ethernet segment; Wi-Fi is a diagnostic
@@ -306,6 +334,17 @@ if [[ "$POLICY_BACKEND" == act ]]; then
     --stats-name "$STATS_NAME"; then
     die "policy preflight failed; no CAN/body/arm component was started"
   fi
+elif [[ "$POLICY_BACKEND" == calibrated ]]; then
+  echo "Validating the calibrated arx-feedback-v4 contract before hardware startup..."
+  if ! "$ACT_PYTHON" "${repo_root}/act/human_dagger_calibrated_policy.py" \
+    --preflight \
+    --server-url "$MODEL_SERVER_URL" \
+    --task-instruction "$TASK_INSTRUCTION" \
+    --calibration-file "$CALIBRATION_FILE" \
+    --experiment "${EXPERIMENT:-joint-feedback}" \
+    --protocol-version "${PROTOCOL_VERSION:-arx-feedback-v4}"; then
+    die "calibrated preflight failed; no CAN/body/arm component was started"
+  fi
 else
   echo "Validating the Tau0VLA server contract before hardware startup..."
   if ! "$ACT_PYTHON" "${repo_root}/act/human_dagger_tau0vla_policy.py" \
@@ -411,6 +450,23 @@ start_frontend() {
       --ckpt-dir "$ckpt_dir_abs"
       --ckpt-name "$CKPT_NAME"
       --stats-name "$STATS_NAME"
+    )
+  elif [[ "$POLICY_BACKEND" == calibrated ]]; then
+    backend_args=(
+      --policy-backend calibrated
+      --model-server-url "$MODEL_SERVER_URL"
+      --task-instruction "$TASK_INSTRUCTION"
+      --calibration-file "$CALIBRATION_FILE"
+      --calibration-wait-s "${CALIBRATION_WAIT_S:-180}"
+      --arm-stack dagger
+      --experiment "${EXPERIMENT:-joint-feedback}"
+      --protocol-version "${PROTOCOL_VERSION:-arx-feedback-v4}"
+      --replan-steps "${REPLAN_STEPS:-15}"
+      --chunk-blend-steps "${CHUNK_BLEND_STEPS:-6}"
+      --gripper-blend-steps "${GRIPPER_BLEND_STEPS:-6}"
+      --arm-ema-alpha "${ARM_EMA_ALPHA:-0.6}"
+      --gripper-ema-alpha "${GRIPPER_EMA_ALPHA:-1.0}"
+      --max-response-age-ms "${MAX_RESPONSE_AGE_MS:-500}"
     )
   else
     backend_args=(
@@ -550,6 +606,59 @@ start_component vr_serial \
 
 wait_for_topic /human_dagger/arm/left/status 20
 wait_for_topic /human_dagger/arm/right/status 20
+
+# The calibrated policy worker inside the frontend is blocked waiting for this
+# artifact. It has to be created here, not earlier: the fit is bound to the
+# (pid, start_ticks) of the arms started above, and those did not exist when
+# the frontend launched. The grippers move during this step.
+if [[ "$POLICY_BACKEND" == calibrated ]]; then
+  echo "Calibrating both grippers against this session's arms; they will move."
+  # The frontend keeps publishing a measured HOLD at 60 Hz throughout, so every
+  # settle window competes with a command built from the previous tick's
+  # feedback. That lag showed up as open_drift ~0.005 under DAgger versus
+  # ~0.00003 for the rollout, and a 0.005 baseline shift is enough to push the
+  # mapped command past COMMAND_SOFT_TOLERANCE. Longer settle windows give the
+  # lag time to decay; the script enforces the reviewed minimums as a floor.
+  if ! "$ACT_PYTHON" "${repo_root}/act/tau0vla_calibrate_gripper.py" \
+    --execute --auto-confirm \
+    --config "$CALIBRATION_CONFIG" \
+    --command-message RobotCmd \
+    --settle-s "${CALIBRATION_SETTLE_S:-4.0}" \
+    --open-settle-s "${CALIBRATION_OPEN_SETTLE_S:-5.0}" \
+    --pre-settle-s "${CALIBRATION_PRE_SETTLE_S:-1.5}" \
+    --output "$CALIBRATION_FILE" 2>&1 | tee -a "${log_dir}/gripper_calibration.log"; then
+    die "gripper calibration failed; the frontend is still holding the arms"
+  fi
+  require_file "$CALIBRATION_FILE"
+  echo "Calibration artifact: ${CALIBRATION_FILE}"
+  # Report open_drift before the policy sees the artifact. A drifted open
+  # baseline shifts the whole gripper mapping, and the failure would otherwise
+  # surface much later as a mid-episode ProtocolError from the mapper.
+  "$ACT_PYTHON" - "$CALIBRATION_FILE" "${CALIBRATION_MAX_DRIFT:-0.002}" <<'PYDRIFT'
+import json
+import sys
+
+path, limit = sys.argv[1], float(sys.argv[2])
+with open(path, encoding="utf-8") as stream:
+    artifact = json.load(stream)
+drifts = {side: abs(float(artifact[side]["open_drift"])) for side in ("left", "right")}
+for side, drift in drifts.items():
+    print(f"  {side} open_drift={drift:.6f}")
+worst = max(drifts.values())
+if worst > limit:
+    print(
+        f"WARNING: open_drift {worst:.6f} exceeds {limit:.6f}. The mapped gripper "
+        "command may exceed the calibrated envelope once the policy runs.",
+        file=sys.stderr,
+    )
+    print(
+        "Raise CALIBRATION_SETTLE_S / CALIBRATION_OPEN_SETTLE_S and recalibrate, "
+        "or set CALIBRATION_MAX_DRIFT to accept this.",
+        file=sys.stderr,
+    )
+PYDRIFT
+fi
+
 wait_for_topic /camera/camera_h/color/image_rect_raw/compressed 30
 wait_for_topic /camera/camera_l/color/image_rect_raw/compressed 30
 wait_for_topic /camera/camera_r/color/image_rect_raw/compressed 30

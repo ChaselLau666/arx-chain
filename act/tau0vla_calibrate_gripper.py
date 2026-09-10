@@ -29,25 +29,38 @@ ROOT = Path(__file__).resolve().parent
 GRIPPER = 6
 
 
-def create_node(config: dict):
+def create_node(config: dict, command_message: str = "RobotStatus"):
+    """Calibration node.
+
+    command_message selects the command wire type. The rollout stack's
+    v2_joint_control arms are driven with RobotStatus on /arm_master_*_status,
+    where joint_pos is a 7-vector whose index 6 is the gripper. Human DAgger
+    runs its own X5Controller pair on /human_dagger/arm/*/command, which takes
+    RobotCmd instead: joint_pos is 6 arm joints and the gripper is a separate
+    scalar, plus a mode field the external "normal" controller requires.
+    """
     from rclpy.node import Node
+
+    if command_message not in ("RobotStatus", "RobotCmd"):
+        raise CalibrationError(f"unsupported command message: {command_message}")
 
     class CalibrationNode(Node):
         def __init__(self):
             super().__init__("tau0vla_calibrated_gripper")
-            from arx5_arm_msg.msg import RobotStatus
+            from arx5_arm_msg.msg import RobotCmd, RobotStatus
 
-            self._message_type = RobotStatus
+            self._command_message = command_message
+            self._message_type = RobotStatus if command_message == "RobotStatus" else RobotCmd
             self._lock = threading.Lock()
             self._feedback = {"left": deque(maxlen=4000), "right": deque(maxlen=4000)}
             # Do not shadow rclpy.Node._publishers; destroy_node() owns that
             # internal list and expects integer indexing.
             self._command_publishers = {
                 "left": self.create_publisher(
-                    RobotStatus, config["arm_config"]["follow_arm_left_cmd_topic"], 10
+                    self._message_type, config["arm_config"]["follow_arm_left_cmd_topic"], 10
                 ),
                 "right": self.create_publisher(
-                    RobotStatus, config["arm_config"]["follow_arm_right_cmd_topic"], 10
+                    self._message_type, config["arm_config"]["follow_arm_right_cmd_topic"], 10
                 ),
             }
             self.create_subscription(
@@ -88,7 +101,17 @@ def create_node(config: dict):
         def publish(self, targets: dict[str, np.ndarray]) -> None:
             for side in ("left", "right"):
                 message = self._message_type()
-                message.joint_pos[:7] = [float(value) for value in targets[side]]
+                values = [float(value) for value in targets[side]]
+                if self._command_message == "RobotStatus":
+                    message.joint_pos[:7] = values
+                else:
+                    # RobotCmd splits the gripper out of joint_pos and needs an
+                    # explicit mode; 5 is POSITION_CONTROL for the normal
+                    # controller, the same mode the dagger frontend holds with.
+                    message.header.stamp = self.get_clock().now().to_msg()
+                    message.joint_pos[:6] = values[:6]
+                    message.gripper = values[GRIPPER]
+                    message.mode = 5
                 self._command_publishers[side].publish(message)
 
     return CalibrationNode()
@@ -155,7 +178,7 @@ def run(args) -> Path:
         config = yaml.safe_load(stream)
     hostname, ros_domain_id, boot_id, controllers = current_robot_identity()
     rclpy.init()
-    node = create_node(config)
+    node = create_node(config, args.command_message)
     stop = threading.Event()
     spin = threading.Thread(target=spin_node, args=(node, stop), daemon=True)
     spin.start()
@@ -242,6 +265,12 @@ def parse_args():
     parser.add_argument("--pre-settle-s", type=float, default=.5)
     parser.add_argument("--open-settle-s", type=float, default=2.0)
     parser.add_argument("--config", type=Path, default=ROOT / "data/config.yaml")
+    parser.add_argument(
+        "--command-message",
+        choices=("RobotStatus", "RobotCmd"),
+        default="RobotStatus",
+        help="RobotStatus for the v2_joint_control rollout stack, RobotCmd for Human DAgger arms",
+    )
     parser.add_argument(
         "--output",
         type=Path,

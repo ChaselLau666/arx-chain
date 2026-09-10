@@ -1,0 +1,12 @@
+# Gripper-calibration topic map for the Human DAgger stack.
+#
+# 05_human_dagger.sh runs its own X5Controller pair under an isolated
+# namespace (-p arm_pub_topic_name/arm_sub_topic_name), so the global
+# /arm_master_*_status and /arm_slave_*_status topics that data/config.yaml
+# points at do not exist during a dagger session. The command side also takes
+# RobotCmd rather than RobotStatus -- pass --command-message RobotCmd.
+arm_config:
+  follow_arm_left_cmd_topic: "/human_dagger/arm/left/command"
+  follow_arm_right_cmd_topic: "/human_dagger/arm/right/command"
+  follow_arm_left_feedback_topic: "/human_dagger/arm/left/status"
+  follow_arm_right_feedback_topic: "/human_dagger/arm/right/status"
